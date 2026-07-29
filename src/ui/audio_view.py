@@ -20,6 +20,7 @@ from audio_manager import database as db
 from audio_manager import scanner as audio_scanner
 from resource_manager import config
 from ui.flow_layout import FlowLayout
+from ui.tag_widgets import TagButton, TagChip, TagSelectorDialog, parse_tags
 
 
 # ---- 配色（3D 黏土风 / 轻拟物新拟态） ----
@@ -211,6 +212,7 @@ class PlaylistBrowser(QWidget):
         self._filtered_cache = []  # 当前筛选/排序后的歌单缓存
         self._page_size = 30  # 每页歌单数
         self._current_page = 0  # 当前页码（0-based）
+        self._active_tags: set = set()  # 当前活动的标签过滤
         self._search_timer = QTimer()  # 搜索防抖
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(300)
@@ -222,7 +224,6 @@ class PlaylistBrowser(QWidget):
 
         # ---- 导航栏 ----
         nav_bar = QFrame()
-        nav_bar.setFixedHeight(40)
         nav_bar.setStyleSheet(f"background-color: {BG_SIDEBAR}; border: none;")
         nav_layout = QHBoxLayout(nav_bar)
         nav_layout.setContentsMargins(8, 4, 8, 4)
@@ -240,7 +241,18 @@ class PlaylistBrowser(QWidget):
         self._breadcrumb_layout = QHBoxLayout(self._breadcrumb_widget)
         self._breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
         self._breadcrumb_layout.setSpacing(2)
-        nav_layout.addWidget(self._breadcrumb_widget, 1)
+        nav_layout.addWidget(self._breadcrumb_widget)
+
+        # 标签芯片（水平排列，无弹性）
+        self._tag_bar = QWidget()
+        self._tag_bar_layout = QHBoxLayout(self._tag_bar)
+        self._tag_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self._tag_bar_layout.setSpacing(4)
+        self._tag_bar.setVisible(False)
+        nav_layout.addWidget(self._tag_bar)
+
+        # 弹性间隔（始终存在，确保右侧控件位置固定）
+        nav_layout.addStretch(1)
 
         # 搜索框
         self.search_box = QLineEdit()
@@ -256,6 +268,22 @@ class PlaylistBrowser(QWidget):
         """)
         self.search_box.textChanged.connect(self._on_search_changed)
         nav_layout.addWidget(self.search_box)
+
+        # 标签选择器按钮
+        self.tag_selector_btn = QPushButton("+")
+        self.tag_selector_btn.setFixedSize(26, 26)
+        self.tag_selector_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tag_selector_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT}; color: #fff;
+                border: none; border-radius: 13px;
+                font-size: 16px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background-color: #48B8BC; }}
+        """)
+        self.tag_selector_btn.setToolTip("按标签筛选")
+        self.tag_selector_btn.clicked.connect(self._open_tag_selector)
+        nav_layout.addWidget(self.tag_selector_btn)
 
         # 排序
         sort_label = QLabel("排序:")
@@ -430,12 +458,14 @@ class PlaylistBrowser(QWidget):
     def refresh(self):
         """刷新当前层级"""
         self.search_box.clear()
+        self.clear_tags()
         self._load_current()
 
     def reset(self):
         """回到根目录"""
         self._path_stack = [""]
         self.search_box.clear()
+        self.clear_tags()
         self._load_current()
 
     def _load_current(self):
@@ -453,12 +483,16 @@ class PlaylistBrowser(QWidget):
         self._search_timer.start()  # 每次变化重启300ms定时器
 
     def _apply_filter(self):
-        """根据搜索框文本过滤并按名称排序后渲染歌单"""
+        """根据搜索框文本 / 活动标签过滤并按排序后渲染歌单"""
         text = self.search_box.text().strip().lower() if hasattr(self, 'search_box') else ""
         if text:
             filtered = [pl for pl in self._all_playlists if text in pl["name"].lower()]
         else:
             filtered = self._all_playlists
+
+        # 标签过滤（与搜索框互斥，使用标签时搜索框自动隐藏）
+        if self._active_tags:
+            filtered = [pl for pl in filtered if self._playlist_matches_tags(pl)]
 
         # 排序
         idx = self.sort_selector.currentIndex() if hasattr(self, 'sort_selector') else 0
@@ -476,7 +510,9 @@ class PlaylistBrowser(QWidget):
 
         total = len(self._all_playlists)
         shown = len(self._filtered_cache)
-        if text:
+        if self._active_tags:
+            self.count_label.setText(f"共 {shown} 个歌单" if shown else "")
+        elif text:
             self.count_label.setText(f"搜索: {shown}/{total} 个歌单")
         else:
             self.count_label.setText(f"共 {shown} 个歌单" if shown else "")
@@ -550,6 +586,72 @@ class PlaylistBrowser(QWidget):
             else:
                 self._path_stack = [path]
         self._load_current()
+
+    # ── 标签过滤 ──
+
+    def filter_by_tags(self, tags: set):
+        """批量设置标签过滤并刷新"""
+        self._active_tags = set(tags)
+        self._sync_tag_ui()
+        self._apply_filter()
+
+    def filter_by_tag(self, tag: str):
+        """添加单个标签过滤并刷新"""
+        self.filter_by_tags(self._active_tags | {tag})
+
+    def _on_tag_removed(self, tag):
+        """移除单个标签过滤"""
+        self._active_tags.discard(tag)
+        if not self._active_tags:
+            self.search_box.clear()
+        self._sync_tag_ui()
+        self._apply_filter()
+
+    def clear_tags(self):
+        """清除所有标签过滤"""
+        self._active_tags.clear()
+        self.search_box.setVisible(True)
+        self.search_box.clear()
+        self._sync_tag_ui()
+        self._apply_filter()
+
+    def _open_tag_selector(self):
+        """打开标签选择器窗口"""
+        all_tags = db.get_all_tags()
+        if not all_tags:
+            return
+        dialog = TagSelectorDialog(all_tags, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = dialog.get_selected_tags()
+            if selected:
+                self.filter_by_tags(set(selected))
+
+    def _sync_tag_ui(self):
+        """同步标签芯片 UI 与 _active_tags 状态"""
+        # 清除旧芯片
+        while self._tag_bar_layout.count():
+            item = self._tag_bar_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+
+        if self._active_tags:
+            for tag in sorted(self._active_tags, key=str.lower):
+                chip = TagChip(tag)
+                chip.removed.connect(self._on_tag_removed)
+                self._tag_bar_layout.addWidget(chip)
+            self._tag_bar_layout.addStretch()
+            self._tag_bar.setVisible(True)
+        else:
+            self._tag_bar.setVisible(False)
+
+        self.search_box.setVisible(not bool(self._active_tags))
+
+    def _playlist_matches_tags(self, pl):
+        """检查歌单是否匹配所有活动标签（AND 逻辑）"""
+        if not self._active_tags:
+            return True
+        pl_tags = set(parse_tags(pl.get("tags", "") or ""))
+        return all(tag in pl_tags for tag in self._active_tags)
 
     # ── 渲染 ──
 
@@ -883,6 +985,13 @@ class AudioMainWindow(QMainWindow):
         self.playlist_tags.setWordWrap(True)
         self.playlist_tags.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
         info_col.addWidget(self.playlist_tags)
+        # 可点击的标签按钮容器（替代纯文本显示）
+        self._tag_buttons_container = QWidget()
+        self._tag_buttons_layout = FlowLayout(self._tag_buttons_container, margin=0, h_spacing=6, v_spacing=4)
+        self._tag_buttons_container.setContentsMargins(0, 0, 0, 4)
+        self._tag_buttons_container.setLayout(self._tag_buttons_layout)
+        self._tag_buttons_container.setVisible(False)
+        info_col.addWidget(self._tag_buttons_container)
         self.playlist_count = QLabel()
         self.playlist_count.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
         info_col.addWidget(self.playlist_count)
@@ -1115,8 +1224,8 @@ class AudioMainWindow(QMainWindow):
 
         # 标签和封面：子歌单使用主歌单的，主歌单用自己的
         main_pl = db.get_playlist(self._detail_history[0]) if len(self._detail_history) > 1 else pl
-        tags = main_pl.get("tags", "") or ""
-        self.playlist_tags.setText(f"标签: {tags}" if tags else "")
+        tags_str = main_pl.get("tags", "") or ""
+        self._rebuild_tag_buttons(tags_str)
 
         cover_path = main_pl.get("cover")
         if not (cover_path and os.path.exists(cover_path)):
@@ -1185,6 +1294,31 @@ class AudioMainWindow(QMainWindow):
             self.sub_scroll.setVisible(False)
 
         self._page_stack.setCurrentIndex(1)
+
+    def _rebuild_tag_buttons(self, tags_str):
+        """根据标签字符串重建可点击标签按钮"""
+        # 清除旧按钮
+        while self._tag_buttons_layout.count():
+            item = self._tag_buttons_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+
+        tags = parse_tags(tags_str)
+        if tags:
+            self.playlist_tags.setVisible(False)
+            self._tag_buttons_container.setVisible(True)
+            for tag in tags:
+                btn = TagButton(tag)
+                btn.tagClicked.connect(self._on_tag_clicked)
+                self._tag_buttons_layout.addWidget(btn)
+        else:
+            self.playlist_tags.setVisible(False)
+            self._tag_buttons_container.setVisible(False)
+
+    def _on_tag_clicked(self, tag):
+        """点击标签按钮 → 返回歌单浏览器并追加标签过滤（与已有标签叠加 AND 逻辑）"""
+        self._page_stack.setCurrentIndex(0)
+        self.browser.filter_by_tag(tag)
 
     def _rebuild_sub_playlists(self, pl_id):
         """重建详情页中的子歌单卡片。递归收集所有后代歌单（非仅直接子歌单）。"""
