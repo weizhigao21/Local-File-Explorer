@@ -6,6 +6,7 @@ import os
 import threading
 
 from PyQt6.QtWidgets import (
+    QApplication,
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QLabel,
     QScrollArea, QFrame, QSlider, QSizePolicy, QMessageBox,
@@ -75,6 +76,7 @@ class PlaylistCard(QFrame):
         super().__init__(parent)
         self.pl_id = pl["id"]
         self._pl_path = pl["path"]
+        self._pl_name = pl["name"]
         self._has_children = has_children
         self.setFixedSize(180, 240)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -149,6 +151,9 @@ class PlaylistCard(QFrame):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        copy_action = menu.addAction("复制歌单名称")
+        copy_action.triggered.connect(lambda: QApplication.clipboard().setText(self._pl_name))
+        menu.addSeparator()
         action = menu.addAction("打开所在文件夹")
         action.triggered.connect(lambda: os.startfile(self._pl_path))
         menu.exec(event.globalPos())
@@ -715,6 +720,7 @@ class PlaylistBrowser(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, pl["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, has_children)
             item.setData(Qt.ItemDataRole.UserRole + 2, pl["path"])
+            item.setData(Qt.ItemDataRole.UserRole + 3, pl["name"])
             self.list_widget.addItem(item)
 
     def _go_page(self, delta):
@@ -749,9 +755,13 @@ class PlaylistBrowser(QWidget):
         if item is None:
             return
         pl_path = item.data(Qt.ItemDataRole.UserRole + 2)
+        pl_name = item.data(Qt.ItemDataRole.UserRole + 3) or ""
         if not pl_path:
             return
         menu = QMenu(self)
+        copy_action = menu.addAction("复制歌单名称")
+        copy_action.triggered.connect(lambda: QApplication.clipboard().setText(pl_name))
+        menu.addSeparator()
         action = menu.addAction("打开所在文件夹")
         action.triggered.connect(lambda: os.startfile(pl_path))
         menu.exec(self.list_widget.viewport().mapToGlobal(pos))
