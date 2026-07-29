@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+dist/
+
+# Data files (databases, thumbnails, fingerprints)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE / Tools
+.workbuddy/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+*.spec.bak
