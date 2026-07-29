@@ -130,18 +130,22 @@ class PlaylistCard(QFrame):
         layout.addStretch()
 
         # 加载封面
-        cover_path = pl.get("cover")
-        if cover_path and os.path.exists(cover_path):
-            pix = QPixmap(cover_path)
+        self._cover_path = pl.get("cover")
+        if self._cover_path:
+            QTimer.singleShot(1, self._load_cover)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.pl_id)
+
+    def _load_cover(self):
+        if self._cover_path and os.path.exists(self._cover_path):
+            pix = QPixmap(self._cover_path)
             if not pix.isNull():
                 scaled = pix.scaled(160, 140, Qt.AspectRatioMode.KeepAspectRatio,
                                     Qt.TransformationMode.SmoothTransformation)
                 self.cover_label.setPixmap(scaled)
                 self.cover_label.setText("")
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.pl_id)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -183,7 +187,7 @@ class SubPlaylistCard(QFrame):
         name_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
         layout.addWidget(name_label)
 
-        cnt = QLabel(f"{len(db.list_tracks(pl['id']))} 首")
+        cnt = QLabel(f"{pl['track_count']} 首")
         cnt.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
         layout.addWidget(cnt)
 
@@ -437,6 +441,9 @@ class PlaylistBrowser(QWidget):
 
     def _switch_view(self, index):
         self._view_stack.setCurrentIndex(index)
+        # 视图切换时重新渲染（当前只渲染了之前的可见视图）
+        if self._filtered_cache:
+            self._render(self._filtered_cache)
 
     # ── 导航 ──
 
@@ -501,9 +508,16 @@ class PlaylistBrowser(QWidget):
             reverse = idx == 1
             self._filtered_cache = sorted(filtered, key=lambda pl: pl["name"].lower(), reverse=reverse)
         else:
-            # 时间排序（按文件夹修改时间）
+            # 时间排序（按文件夹修改时间，优先用数据库缓存，mtime=0 时惰性迁移）
             reverse = idx == 2  # 新→旧: reverse=True
-            self._filtered_cache = sorted(filtered, key=lambda pl: os.path.getmtime(pl["path"]), reverse=reverse)
+            def _get_mtime(pl):
+                m = pl.get("mtime", 0)
+                if m == 0:
+                    m = os.path.getmtime(pl["path"])
+                    pl["mtime"] = m
+                    db.update_playlist(pl["id"], mtime=m)
+                return m
+            self._filtered_cache = sorted(filtered, key=_get_mtime, reverse=reverse)
 
         self._current_page = 0
         self._render(self._filtered_cache)
@@ -656,7 +670,7 @@ class PlaylistBrowser(QWidget):
     # ── 渲染 ──
 
     def _render(self, all_playlists):
-        """渲染歌单列表到两种视图（按当前页码分页）"""
+        """按当前页码分页，仅渲染当前可见视图"""
         total_pages = max(1, (len(all_playlists) + self._page_size - 1) // self._page_size)
         if self._current_page >= total_pages:
             self._current_page = total_pages - 1
@@ -664,40 +678,44 @@ class PlaylistBrowser(QWidget):
         start = self._current_page * self._page_size
         playlists = all_playlists[start:start + self._page_size]
 
-        # 清除网格
+        # 批量查询子歌单数量（一次查询替代 N 次 get_child_count）
+        child_counts = db.get_child_counts_batch([pl["path"] for pl in playlists])
+
+        if self._view_stack.currentIndex() == 0:
+            self._render_grid(playlists, child_counts)
+        else:
+            self._render_list(playlists, child_counts)
+
+        # 更新分页控件
+        self._update_pagination(len(all_playlists))
+
+    def _render_grid(self, playlists, child_counts):
+        """仅渲染网格视图"""
         while self.flow.count():
             item = self.flow.takeAt(0)
             if item and item.widget():
                 item.widget().deleteLater()
 
         for pl in playlists:
-            child_cnt = db.get_child_count(pl["path"])
-            card = PlaylistCard(pl, has_children=(child_cnt > 0))
+            has_children = child_counts.get(pl["path"], 0) > 0
+            card = PlaylistCard(pl, has_children=has_children)
             card.clicked.connect(self._on_card_click)
             self.flow.addWidget(card)
 
         self._grid_page.update()
 
-        # 列表视图
+    def _render_list(self, playlists, child_counts):
+        """仅渲染列表视图（不加载封面图标，避免翻页 IO 卡顿）"""
         self.list_widget.clear()
         for pl in playlists:
-            child_cnt = db.get_child_count(pl["path"])
-            suffix = " 📁" if child_cnt > 0 else ""
+            has_children = child_counts.get(pl["path"], 0) > 0
+            suffix = " 📁" if has_children else ""
             text = f"{pl['name']}    {pl['track_count']} 首曲目{suffix}"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, pl["id"])
-            item.setData(Qt.ItemDataRole.UserRole + 1, child_cnt > 0)
+            item.setData(Qt.ItemDataRole.UserRole + 1, has_children)
             item.setData(Qt.ItemDataRole.UserRole + 2, pl["path"])
-            if pl.get("cover") and os.path.exists(pl["cover"]):
-                pix = QPixmap(pl["cover"])
-                if not pix.isNull():
-                    icon_pix = pix.scaled(40, 40, Qt.AspectRatioMode.KeepAspectRatio,
-                                          Qt.TransformationMode.SmoothTransformation)
-                    item.setIcon(QIcon(icon_pix))
             self.list_widget.addItem(item)
-
-        # 更新分页控件
-        self._update_pagination(len(all_playlists))
 
     def _go_page(self, delta):
         """翻页：delta 为 -1（上一页）或 1（下一页）"""
@@ -1174,28 +1192,27 @@ class AudioMainWindow(QMainWindow):
 
     @staticmethod
     def _collect_tracks_recursive(pl_id):
-        """递归收集歌单及其所有子歌单的所有曲目"""
-        result = []
+        """收集歌单及其所有后代歌单的全部曲目（一次CTE + 一次批量查询替代递归N+1）"""
         pl = db.get_playlist(pl_id)
         if not pl:
-            return result
-        result.extend(db.list_tracks(pl_id))
-        for child in db.list_playlists_by_parent(pl["path"]):
-            result.extend(AudioMainWindow._collect_tracks_recursive(child["id"]))
-        return result
+            return []
+        descendants = db.get_descendant_playlists(pl["path"])
+        if not descendants:
+            return db.list_tracks(pl_id)
+        all_ids = [pl_id] + [d["id"] for d in descendants]
+        return db.list_tracks_by_playlist_ids(all_ids)
 
     @staticmethod
     def _find_first_cover(pl):
-        """递归查找歌单或其子歌单的第一个可用封面"""
+        """查找歌单或其子歌单的第一个可用封面（CTE后代查询替代递归N+1）"""
         cover = pl.get("cover")
         if cover and os.path.exists(cover):
             return cover
-        for child in db.list_playlists_by_parent(pl["path"]):
-            child_pl = db.get_playlist(child["id"])
-            if child_pl:
-                found = AudioMainWindow._find_first_cover(child_pl)
-                if found:
-                    return found
+        descendants = db.get_descendant_playlists(pl["path"])
+        for child in descendants:
+            cover = child.get("cover")
+            if cover and os.path.exists(cover):
+                return cover
         return None
 
     def _open_playlist(self, pl_id):
@@ -1349,13 +1366,8 @@ class AudioMainWindow(QMainWindow):
             self.sub_vbox.addWidget(card)
 
     def _collect_descendant_playlists(self, path):
-        """递归收集指定路径下的所有后代歌单（深度优先平铺）"""
-        result = []
-        children = db.list_playlists_by_parent(path)
-        for child in children:
-            result.append(child)
-            result.extend(self._collect_descendant_playlists(child["path"]))
-        return result
+        """收集指定路径下的所有后代歌单（递归CTE，一次SQL查询）"""
+        return db.get_descendant_playlists(path)
 
     def _open_sub_playlist(self, pl_id):
         """点击详情页内的子歌单卡片"""

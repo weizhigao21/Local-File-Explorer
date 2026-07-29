@@ -70,7 +70,8 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
         pid = existing[norm_folder]
         db.update_playlist(pid, cover=cover, tags=tags,
                            track_count=len(tracks),
-                           name=name, parent_path=parent_path)
+                           name=name, parent_path=parent_path,
+                           mtime=os.path.getmtime(norm_folder))
         # 增量同步曲目
         current_paths = {t[1] for t in tracks}
         existing_tracks = {t["path"] for t in db.list_tracks(pid)}
@@ -85,7 +86,8 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
         stats["skipped"] += 1
     else:
         pid = db.add_playlist(name, norm_folder, cover=cover,
-                              tags=tags, parent_path=parent_path)
+                              tags=tags, parent_path=parent_path,
+                              mtime=os.path.getmtime(norm_folder))
         if pid and tracks:
             db.add_tracks(pid, tracks)
             db.update_playlist(pid, track_count=len(tracks))

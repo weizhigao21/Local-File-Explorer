@@ -86,6 +86,7 @@ def init_db():
         for stmt in [
             "ALTER TABLE playlists ADD COLUMN parent_path TEXT DEFAULT ''",
             "CREATE INDEX IF NOT EXISTS idx_playlists_parent ON playlists(parent_path)",
+            "ALTER TABLE playlists ADD COLUMN mtime REAL DEFAULT 0",
         ]:
             try:
                 conn.execute(stmt)
@@ -99,7 +100,7 @@ def list_playlists():
     """返回所有歌单"""
     with _active_conn() as conn:
         rows = conn.execute(
-            "SELECT id, name, path, parent_path, cover, tags, track_count "
+            "SELECT id, name, path, parent_path, cover, tags, track_count, mtime "
             "FROM playlists ORDER BY name"
         ).fetchall()
         return [dict(row) for row in rows]
@@ -109,7 +110,7 @@ def list_playlists_by_parent(parent_path=""):
     """返回指定父路径下的歌单"""
     with _active_conn() as conn:
         rows = conn.execute(
-            "SELECT id, name, path, parent_path, cover, tags, track_count "
+            "SELECT id, name, path, parent_path, cover, tags, track_count, mtime "
             "FROM playlists WHERE parent_path = ? ORDER BY name",
             (parent_path,),
         ).fetchall()
@@ -144,7 +145,7 @@ def get_playlist(playlist_id):
     """获取单个歌单"""
     with _active_conn() as conn:
         row = conn.execute(
-            "SELECT id, name, path, parent_path, cover, tags, track_count "
+            "SELECT id, name, path, parent_path, cover, tags, track_count, mtime "
             "FROM playlists WHERE id = ?",
             (playlist_id,),
         ).fetchone()
@@ -155,7 +156,7 @@ def get_playlist_by_path(path):
     """按路径获取歌单"""
     with _active_conn() as conn:
         row = conn.execute(
-            "SELECT id, name, path, parent_path, cover, tags, track_count "
+            "SELECT id, name, path, parent_path, cover, tags, track_count, mtime "
             "FROM playlists WHERE path = ?",
             (path,),
         ).fetchone()
@@ -170,15 +171,34 @@ def playlist_has_children(playlist_id):
     return get_child_count(pl["path"]) > 0
 
 
+def get_descendant_playlists(parent_path):
+    """获取指定路径下所有后代歌单（递归CTE，一次SQL查询替代N+1递归）"""
+    if not parent_path:
+        return []
+    with _active_conn() as conn:
+        rows = conn.execute("""
+            WITH RECURSIVE descendants AS (
+                SELECT id, name, path, parent_path, cover, tags, track_count, mtime
+                FROM playlists WHERE parent_path = ?
+                UNION ALL
+                SELECT p.id, p.name, p.path, p.parent_path, p.cover, p.tags, p.track_count, p.mtime
+                FROM playlists p
+                JOIN descendants d ON p.parent_path = d.path
+            )
+            SELECT * FROM descendants
+        """, (parent_path,)).fetchall()
+        return [dict(row) for row in rows]
+
+
 # ── 歌单 CRUD ──
 
-def add_playlist(name, path, cover=None, tags="", parent_path=""):
+def add_playlist(name, path, cover=None, tags="", parent_path="", mtime=0):
     """添加歌单，返回 id"""
     with _active_conn() as conn:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO playlists (name, path, parent_path, cover, tags) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (name, path, parent_path, cover, tags),
+            "INSERT OR IGNORE INTO playlists (name, path, parent_path, cover, tags, mtime) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (name, path, parent_path, cover, tags, mtime),
         )
         if cur.lastrowid:
             return cur.lastrowid
@@ -189,7 +209,7 @@ def add_playlist(name, path, cover=None, tags="", parent_path=""):
 
 
 def update_playlist(playlist_id, cover=None, tags=None, track_count=None,
-                    name=None, parent_path=None):
+                    name=None, parent_path=None, mtime=None):
     """更新歌单信息"""
     sets = []
     params = []
@@ -208,6 +228,9 @@ def update_playlist(playlist_id, cover=None, tags=None, track_count=None,
     if parent_path is not None:
         sets.append("parent_path = ?")
         params.append(parent_path)
+    if mtime is not None:
+        sets.append("mtime = ?")
+        params.append(mtime)
     if not sets:
         return
     params.append(playlist_id)
@@ -218,16 +241,25 @@ def update_playlist(playlist_id, cover=None, tags=None, track_count=None,
 
 
 def delete_playlist(playlist_id):
-    """删除歌单及所有子歌单、曲目"""
+    """删除歌单及所有子歌单、曲目（递归CTE批量删除，替代逐层递归N+1）"""
     pl = get_playlist(playlist_id)
-    if pl:
-        # 先递归删除子歌单
-        children = list_playlists_by_parent(pl["path"])
-        for child in children:
-            delete_playlist(child["id"])
+    if not pl:
+        return
     with _active_conn() as conn:
-        conn.execute("DELETE FROM tracks WHERE playlist_id = ?", (playlist_id,))
-        conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("""
+            DELETE FROM playlists WHERE id IN (
+                WITH RECURSIVE descendants(id) AS (
+                    SELECT id FROM playlists WHERE id = ?
+                    UNION ALL
+                    SELECT p.id FROM playlists p
+                    JOIN descendants d ON p.parent_path = (
+                        SELECT path FROM playlists WHERE id = d.id
+                    )
+                )
+                SELECT id FROM descendants
+            )
+        """, (playlist_id,))
 
 
 # ── 曲目 CRUD ──
@@ -239,6 +271,23 @@ def list_tracks(playlist_id):
             "SELECT id, playlist_id, title, path, duration, track_number "
             "FROM tracks WHERE playlist_id = ? ORDER BY track_number, title",
             (playlist_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_tracks_by_playlist_ids(playlist_ids):
+    """批量获取多个歌单的曲目（临时表方案，突破SQLite 999参数上限）"""
+    if not playlist_ids:
+        return []
+    with _active_conn() as conn:
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _batch_pids (id INTEGER)")
+        conn.execute("DELETE FROM _batch_pids")
+        conn.executemany("INSERT INTO _batch_pids VALUES (?)",
+                         [(pid,) for pid in playlist_ids])
+        rows = conn.execute(
+            "SELECT id, playlist_id, title, path, duration, track_number "
+            "FROM tracks WHERE playlist_id IN (SELECT id FROM _batch_pids) "
+            "ORDER BY playlist_id, track_number, title"
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -258,14 +307,18 @@ def add_tracks(playlist_id, tracks):
 
 
 def delete_tracks_not_in(playlist_id, valid_paths):
-    """删除歌单中不在 valid_paths 中的曲目"""
+    """删除歌单中不在 valid_paths 中的曲目（临时表方案，突破SQLite 999参数上限）"""
     if not valid_paths:
         return
-    placeholders = ",".join("?" * len(valid_paths))
     with _active_conn() as conn:
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _valid_paths (path TEXT)")
+        conn.execute("DELETE FROM _valid_paths")
+        conn.executemany("INSERT INTO _valid_paths VALUES (?)",
+                         [(p,) for p in valid_paths])
         conn.execute(
-            f"DELETE FROM tracks WHERE playlist_id = ? AND path NOT IN ({placeholders})",
-            (playlist_id, *valid_paths),
+            "DELETE FROM tracks WHERE playlist_id = ? "
+            "AND path NOT IN (SELECT path FROM _valid_paths)",
+            (playlist_id,),
         )
 
 
