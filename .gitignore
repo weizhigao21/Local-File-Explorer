@@ -15,6 +15,7 @@ __pycache__/
 .workbuddy/
 .vscode/
 .idea/
+.trae/
 
 # OS
 .DS_Store

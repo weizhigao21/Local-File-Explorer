@@ -1,17 +1,9 @@
 import os
-import re
 import sqlite3
 from contextlib import contextmanager
 
 import resource_manager.config as config
-
-
-def _natural_key(s: str):
-    """自然排序 key：将字符串中的数字部分按整数比较
-    例：'10.jpg' -> ['', 10, '.jpg']
-    使 '1.jpg, 2.jpg, ..., 10.jpg' 按数字顺序而非字符串顺序排列
-    """
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+from resource_manager.utils import natural_key
 
 
 @contextmanager
@@ -207,7 +199,7 @@ def get_images_by_work(work_id):
         ).fetchall()
         images = [dict(row) for row in rows]
     # 自然排序：1.jpg, 2.jpg, ..., 10.jpg（而非 1, 10, 11, ..., 2）
-    images.sort(key=lambda x: _natural_key(x["path"]))
+    images.sort(key=lambda x: natural_key(x["path"]))
     return images
 
 

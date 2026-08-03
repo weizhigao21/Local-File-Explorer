@@ -10,6 +10,7 @@ import pytest
 
 from audio_manager import database as adb
 from audio_manager import scanner as ascanner
+from resource_manager import fingerprint_cache as fp
 
 
 @pytest.fixture
@@ -225,3 +226,83 @@ def test_root_playlist_aggregates_top_level(temp_audio_db, monkeypatch):
     assert _get_track_count(db, root) == 9
     assert _get_track_count(db, top1) == 5
     assert _get_track_count(db, top2) == 3
+
+
+# ==================== dir level 指纹扫描集成测试 ====================
+
+@pytest.fixture
+def temp_audio_env(tmp_path, monkeypatch):
+    """临时音频扫描环境：真实音频根目录 + 隔离 DB + 隔离指纹缓存"""
+    audio_root = tmp_path / "audio_root"
+    audio_root.mkdir()
+    db_path = str(tmp_path / "test_audio.db")
+    monkeypatch.setattr(adb, "DB_PATH", db_path)
+    adb.end_persistent()
+    adb.init_db()
+    cache_path = str(tmp_path / ".scan_fingerprint.json")
+    monkeypatch.setattr(fp, "_FINGERPRINT_PATH", cache_path)
+    monkeypatch.setattr(ascanner, "AUDIO_ROOT", str(audio_root))
+    yield str(audio_root)
+    adb.end_persistent()
+
+
+def _make_audio_file(root, relpath, content=b"fake"):
+    """在临时音频根目录下创建一个假音频文件"""
+    path = os.path.join(root, relpath)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+    return path
+
+
+def _bump_dir_mtime(path, delta=10):
+    """显式 bump 目录 mtime，避免文件系统精度导致测试不稳定"""
+    st = os.stat(path)
+    os.utime(path, (st.st_mtime + delta, st.st_mtime + delta))
+
+
+def test_scan_unchanged_with_dir_level(temp_audio_env):
+    """dir level: 建立指纹后再次扫描应返回 unchanged 且跳过"""
+    root = temp_audio_env
+    _make_audio_file(root, "歌单1/01.mp3")
+    _make_audio_file(root, "歌单2/01.flac")
+
+    # 第一次扫描：同步 DB + 建立 dir 指纹
+    stats = ascanner.scan(audio_root=root)
+    assert not stats.get("unchanged")
+    assert stats["added_playlists"] == 2
+
+    # 第二次扫描：dir 指纹未变，应跳过
+    stats2 = ascanner.scan(audio_root=root)
+    assert stats2.get("unchanged") is True
+    assert stats2.get("skipped_all") is True
+
+
+def test_scan_changed_after_adding_audio_file(temp_audio_env):
+    """dir level: 建立指纹后新增音频文件，scan 应检测到变化并同步 DB"""
+    root = temp_audio_env
+    _make_audio_file(root, "歌单1/01.mp3")
+    ascanner.scan(audio_root=root)  # 建立指纹
+
+    # 新增音频文件 + bump 父目录 mtime 确保指纹变化
+    _make_audio_file(root, "歌单1/02.mp3")
+    _bump_dir_mtime(os.path.join(root, "歌单1"))
+
+    stats = ascanner.scan(audio_root=root)
+    assert not stats.get("unchanged")
+    assert stats["added_tracks"] == 1  # 新增 1 首
+
+
+def test_scan_changed_after_adding_playlist_folder(temp_audio_env):
+    """dir level: 建立指纹后新增歌单文件夹，scan 应检测到并创建歌单"""
+    root = temp_audio_env
+    _make_audio_file(root, "歌单1/01.mp3")
+    ascanner.scan(audio_root=root)  # 建立指纹
+
+    # 新增一个歌单文件夹（含音频）
+    _make_audio_file(root, "歌单2/01.mp3")
+    _bump_dir_mtime(root)  # root 下新增子目录，bump root mtime
+
+    stats = ascanner.scan(audio_root=root)
+    assert not stats.get("unchanged")
+    assert stats["added_playlists"] == 1

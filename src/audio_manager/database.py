@@ -322,11 +322,47 @@ def delete_tracks_not_in(playlist_id, valid_paths):
         )
 
 
+def count_tracks_by_playlist():
+    """返回 {playlist_id: 直接曲目数}（一次 GROUP BY 查询替代逐个 COUNT）"""
+    with _active_conn() as conn:
+        rows = conn.execute(
+            "SELECT playlist_id, COUNT(*) AS cnt FROM tracks GROUP BY playlist_id"
+        ).fetchall()
+        return {row["playlist_id"]: row["cnt"] for row in rows}
+
+
 def get_playlist_paths():
     """返回 {path: id}"""
     with _active_conn() as conn:
         rows = conn.execute("SELECT id, path FROM playlists").fetchall()
         return {row["path"]: row["id"] for row in rows}
+
+
+def list_playlists_missing_mtime():
+    """返回 mtime=0 的歌单 [(id, path), ...]
+
+    使用独立短连接（而非 _active_conn），避免后台迁移线程与扫描期间的
+    持久连接争用同一 sqlite3 连接对象。
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, path FROM playlists WHERE mtime = 0 OR mtime IS NULL"
+        ).fetchall()
+        return [(row["id"], row["path"]) for row in rows]
+
+
+def update_mtimes_batch(updates):
+    """批量更新 mtime
+    updates: [(id, mtime), ...]
+    使用独立短连接，理由同 list_playlists_missing_mtime。
+    """
+    if not updates:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            "UPDATE playlists SET mtime = ? WHERE id = ?",
+            [(m, pid) for pid, m in updates],
+        )
 
 
 def clear_all():

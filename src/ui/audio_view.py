@@ -4,6 +4,7 @@
 """
 import os
 import threading
+import traceback
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -155,8 +156,14 @@ class PlaylistCard(QFrame):
         copy_action.triggered.connect(lambda: QApplication.clipboard().setText(self._pl_name))
         menu.addSeparator()
         action = menu.addAction("打开所在文件夹")
-        action.triggered.connect(lambda: os.startfile(self._pl_path))
+        action.triggered.connect(self._open_folder)
         menu.exec(event.globalPos())
+
+    def _open_folder(self):
+        try:
+            os.startfile(self._pl_path)
+        except OSError as e:
+            QMessageBox.warning(self, "打开失败", f"无法打开文件夹:\n{e}")
 
 
 # =============================================================
@@ -473,6 +480,14 @@ class PlaylistBrowser(QWidget):
         self.clear_tags()
         self._load_current()
 
+    def reload_current(self):
+        """重新加载当前层级数据（保留导航/搜索/标签状态）
+
+        供后台 mtime 迁移完成后静默刷新用，避免重置用户已导航的位置。
+        """
+        self._all_playlists = db.list_playlists_by_parent(self.current_path)
+        self._apply_filter()
+
     def reset(self):
         """回到根目录"""
         self._path_stack = [""]
@@ -513,16 +528,12 @@ class PlaylistBrowser(QWidget):
             reverse = idx == 1
             self._filtered_cache = sorted(filtered, key=lambda pl: pl["name"].lower(), reverse=reverse)
         else:
-            # 时间排序（按文件夹修改时间，优先用数据库缓存，mtime=0 时惰性迁移）
+            # 时间排序（按文件夹修改时间，仅使用数据库已缓存的 mtime）
+            # mtime=0 的旧数据由 MtimeMigrationThread 后台迁移，避免 UI 线程执行文件 IO
             reverse = idx == 2  # 新→旧: reverse=True
-            def _get_mtime(pl):
-                m = pl.get("mtime", 0)
-                if m == 0:
-                    m = os.path.getmtime(pl["path"])
-                    pl["mtime"] = m
-                    db.update_playlist(pl["id"], mtime=m)
-                return m
-            self._filtered_cache = sorted(filtered, key=_get_mtime, reverse=reverse)
+            self._filtered_cache = sorted(
+                filtered, key=lambda pl: pl.get("mtime", 0), reverse=reverse
+            )
 
         self._current_page = 0
         self._render(self._filtered_cache)
@@ -763,7 +774,14 @@ class PlaylistBrowser(QWidget):
         copy_action.triggered.connect(lambda: QApplication.clipboard().setText(pl_name))
         menu.addSeparator()
         action = menu.addAction("打开所在文件夹")
-        action.triggered.connect(lambda: os.startfile(pl_path))
+
+        def _open_folder():
+            try:
+                os.startfile(pl_path)
+            except OSError as e:
+                QMessageBox.warning(self, "打开失败", f"无法打开文件夹:\n{e}")
+
+        action.triggered.connect(_open_folder)
         menu.exec(self.list_widget.viewport().mapToGlobal(pos))
 
 
@@ -885,6 +903,36 @@ class AudioScanThread(QThread):
 
 
 # =============================================================
+#  Mtime 迁移线程 — 后台批量补全旧歌单的 mtime
+#  避免 UI 线程在时间排序时执行文件 IO 和数据库写入
+# =============================================================
+class MtimeMigrationThread(QThread):
+    migrated = pyqtSignal(int)  # 实际迁移的条目数
+
+    def run(self):
+        try:
+            pending = db.list_playlists_missing_mtime()
+            if not pending:
+                self.migrated.emit(0)
+                return
+            updates = []
+            for pid, path in pending:
+                try:
+                    m = os.path.getmtime(path)
+                    updates.append((pid, m))
+                except OSError:
+                    # 路径不存在（已删除等），保留 mtime=0
+                    continue
+            if updates:
+                db.update_mtimes_batch(updates)
+            self.migrated.emit(len(updates))
+        except Exception as e:
+            print(f"[音频] mtime 迁移失败: {e}")
+            traceback.print_exc()
+            self.migrated.emit(0)
+
+
+# =============================================================
 #  AudioMainWindow — 音频主窗口
 # =============================================================
 class AudioMainWindow(QMainWindow):
@@ -898,7 +946,7 @@ class AudioMainWindow(QMainWindow):
         self._current_track_index = -1
         self._detail_history = []  # 详情页导航栈
         self._tracks_data = []
-        self._seeking = False  # 是否正在手动拖动进度条
+        self._mtime_thread = None  # 后台 mtime 迁移线程
 
         db.init_db()
 
@@ -1286,7 +1334,6 @@ class AudioMainWindow(QMainWindow):
 
         # 收集后代歌单，决定显示策略
         descendants = self._collect_descendant_playlists(pl["path"])
-        single_child = len(descendants) == 1 and not direct_tracks
         multi_child = len(descendants) >= 2
 
         if multi_child:
@@ -1481,10 +1528,14 @@ class AudioMainWindow(QMainWindow):
     def start_scan(self):
         if getattr(self, "scan_thread", None) and self.scan_thread.isRunning():
             return
-        self._scan_bar.setVisible(True)
+        auto = getattr(self, "_auto_scanning", False)
+        # auto 模式延迟显示扫描条：仅当检测到真实进度（current<total）时才显示；
+        # unchanged 时扫描条从头到尾不出现，用户无感。manual 模式立即显示。
         self.scan_progress.setValue(0)
         self.scan_label.setText("准备扫描...")
         self.scan_cancel.setEnabled(True)
+        if not auto:
+            self._scan_bar.setVisible(True)
 
         self.scan_thread = AudioScanThread(config.AUDIO_ROOT)
         self.scan_thread.finished.connect(self._on_scan_finished)
@@ -1497,9 +1548,19 @@ class AudioMainWindow(QMainWindow):
             self.scan_thread.cancel()
             self.scan_cancel.setEnabled(False)
             self.scan_label.setText("正在取消...")
+            self._scan_cancelling = True
+            # 等待扫描线程真正结束，期间"正在取消..."文本保持可见
+            self.scan_thread.wait(3000)
         self._scan_bar.setVisible(False)
 
     def _on_scan_progress(self, current, total, msg):
+        auto = getattr(self, "_auto_scanning", False)
+        # auto 模式且扫描条未显示：仅真实进度（current<total）才弹出扫描条；
+        # unchanged 收尾信号 (1,1) 等无效信号直接吞掉，保持静默。
+        if auto and not self._scan_bar.isVisible():
+            if total <= 0 or current >= total:
+                return
+            self._scan_bar.setVisible(True)
         if total > 0:
             self.scan_progress.setValue(int(current / total * 100))
         # 截断过长的文件/文件夹名称，保持标签宽度稳定
@@ -1510,18 +1571,27 @@ class AudioMainWindow(QMainWindow):
     def _on_scan_finished(self, stats):
         auto = getattr(self, "_auto_scanning", False)
         self._auto_scanning = False
+        cancelling = getattr(self, "_scan_cancelling", False)
+        self._scan_cancelling = False
 
         # 指纹未变化，跳过扫描
         if stats.get("unchanged"):
-            self.scan_progress.setValue(100)
-            self.scan_label.setText("目录无变化，已跳过扫描")
-            QTimer.singleShot(2000, self._scan_bar.hide)
+            if auto:
+                # auto 模式：扫描条从未显示，保持隐藏，完全静默
+                pass
+            else:
+                # manual 模式：扫描条已可见，显示"目录无变化"2秒后隐藏
+                self.scan_progress.setValue(100)
+                self.scan_label.setText("目录无变化，已跳过扫描")
+                QTimer.singleShot(2000, self._scan_bar.hide)
+            self._start_mtime_migration()
             return
 
         self._scan_bar.setVisible(False)
         self._refresh_playlists()
-        if auto:
-            return  # 自动扫描有变化时也静默完成
+        self._start_mtime_migration()
+        if auto or cancelling:
+            return  # 自动扫描或用户取消，静默完成
         msg_parts = []
         for k, v in [("added_playlists", "新增歌单"), ("removed_playlists", "删除歌单"),
                      ("added_tracks", "新增曲目"), ("removed_tracks", "删除曲目")]:
@@ -1538,6 +1608,20 @@ class AudioMainWindow(QMainWindow):
             return  # 自动扫描，静默处理错误
         QMessageBox.critical(self, "扫描失败", msg)
 
+    # ==================== mtime 后台迁移 ====================
+    def _start_mtime_migration(self):
+        """启动后台 mtime 迁移线程（若已在运行则跳过）"""
+        if self._mtime_thread and self._mtime_thread.isRunning():
+            return
+        self._mtime_thread = MtimeMigrationThread()
+        self._mtime_thread.migrated.connect(self._on_mtime_migrated)
+        self._mtime_thread.start()
+
+    def _on_mtime_migrated(self, count):
+        """mtime 迁移完成后静默刷新当前视图（仅当有迁移发生时）"""
+        if count > 0:
+            self.browser.reload_current()
+
     # ==================== 设置 / 返回 ====================
     def open_settings(self):
         AudioSettingsDialog(self).exec()
@@ -1548,6 +1632,9 @@ class AudioMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.player.stop()
+        # 等待后台 mtime 迁移线程结束，避免向已删除的窗口发射信号
+        if self._mtime_thread and self._mtime_thread.isRunning():
+            self._mtime_thread.wait(2000)
         super().closeEvent(event)
         if self._on_back_to_launcher:
             cb = self._on_back_to_launcher

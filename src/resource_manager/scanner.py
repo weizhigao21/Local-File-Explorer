@@ -1,5 +1,4 @@
 import os
-import re
 import hashlib
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +9,7 @@ from PIL import Image
 from resource_manager import config
 from resource_manager import database as db
 from resource_manager import fingerprint_cache as fp
+from resource_manager.utils import natural_key
 
 
 # 并行生成缩略图的线程数（IO 密集 + CPU 解码 JPEG）
@@ -47,13 +47,8 @@ def _collect_images_with_mtime(work_path):
         except OSError:
             continue
     # 自然排序
-    images.sort(key=lambda x: _natural_key_path(x[0]))
+    images.sort(key=lambda x: natural_key(x[0]))
     return images
-
-
-def _natural_key_path(s: str):
-    """自然排序 key（与 database._natural_key 一致）"""
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
 
 def _thumbnail_path(work_path):
@@ -235,8 +230,10 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
         raise FileNotFoundError(f"写真目录不存在: {config.PHOTO_ROOT}")
 
     # 指纹预检：目录未变化则跳过整个扫描流程
+    # 使用目录级指纹（level="dir"）：只 stat 目录 mtime，捕获作品/图片增删，
+    # 速度远快于文件级指纹。漏检"图片内容被替换"——用户场景不涉及，可接受。
     if check_fingerprint:
-        unchanged, _ = fp.is_unchanged(config.PHOTO_ROOT)
+        unchanged, _ = fp.is_unchanged(config.PHOTO_ROOT, level="dir")
         if unchanged:
             print("[扫描] 目录指纹未变化，跳过扫描")
             return {"unchanged": True, "skipped_all": True}
@@ -309,8 +306,8 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
     if progress_callback:
         progress_callback("done", "", None, 0, author_count, total_authors)
 
-    # 扫描完成后更新目录指纹缓存
-    fp.update(config.PHOTO_ROOT)
+    # 扫描完成后更新目录指纹缓存（与预检使用相同的 level）
+    fp.update(config.PHOTO_ROOT, level="dir")
 
     print(
         f"扫描完成: 新增 {stats['added']} 张, 更新 {stats['updated']} 张, "

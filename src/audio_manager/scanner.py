@@ -4,20 +4,14 @@
 支持嵌套目录结构，根目录中的音频也会被收录
 """
 import os
-import re
+import traceback
 
 from audio_manager import database as db
 from resource_manager import fingerprint_cache as fp
 from resource_manager.config import AUDIO_ROOT
+from resource_manager.utils import natural_key
 
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".aac", ".ogg", ".wma", ".m4a"}
-
-
-def _natural_key(s: str):
-    """自然排序 key：将字符串中的数字部分按整数比较
-    使 '10.mp3' 排在 '2.mp3' 之后，而非字典序
-    """
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
 # 根目录歌单名称
 ROOT_PLAYLIST_NAME = "音频根目录"
@@ -56,7 +50,7 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
 
     # 收集音频文件
     tracks = []
-    for fname in sorted(os.listdir(norm_folder), key=_natural_key):
+    for fname in sorted(os.listdir(norm_folder), key=natural_key):
         fpath = os.path.normpath(os.path.join(norm_folder, fname))
         if os.path.isfile(fpath) and _is_audio(fpath):
             title = os.path.splitext(fname)[0]
@@ -114,7 +108,7 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
     subdirs = []
     audio_files = []
 
-    for name in sorted(os.listdir(current_dir), key=_natural_key):
+    for name in sorted(os.listdir(current_dir), key=natural_key):
         if cancel_event and cancel_event.is_set():
             return
         path = os.path.normpath(os.path.join(current_dir, name))
@@ -134,10 +128,14 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
             pl_name = os.path.basename(current_dir)
 
         counter["idx"] += 1
-        _sync_playlist(
-            current_dir, pl_name, parent_path, existing, stats,
-            progress_callback, counter["idx"], counter["total"],
-        )
+        try:
+            _sync_playlist(
+                current_dir, pl_name, parent_path, existing, stats,
+                progress_callback, counter["idx"], counter["total"],
+            )
+        except Exception as e:
+            print(f"[音频扫描] 同步歌单失败 {current_dir}: {e}")
+            traceback.print_exc()
 
     # 更新 total（每次发现新子目录就增加 progress 总数）
     for sname, spath in subdirs:
@@ -150,8 +148,12 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
             return
         disk_paths.add(spath)
         child_parent = "" if current_dir == root else current_dir
-        _scan_dir(root, spath, child_parent, existing, disk_paths, stats,
-                  progress_callback, cancel_event, counter)
+        try:
+            _scan_dir(root, spath, child_parent, existing, disk_paths, stats,
+                      progress_callback, cancel_event, counter)
+        except Exception as e:
+            print(f"[音频扫描] 递归子目录失败 {spath}: {e}")
+            traceback.print_exc()
 
     # 递归完成后：本级无音频但有子歌单 → 创建容器歌单
     if not has_audio:
@@ -163,11 +165,15 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
                 pl_name = os.path.basename(current_dir)
             counter["idx"] += 1
             counter["total"] += 1
-            _sync_playlist(
-                current_dir, pl_name, parent_path, existing, stats,
-                progress_callback, counter["idx"], counter["total"],
-                allow_empty=True,
-            )
+            try:
+                _sync_playlist(
+                    current_dir, pl_name, parent_path, existing, stats,
+                    progress_callback, counter["idx"], counter["total"],
+                    allow_empty=True,
+                )
+            except Exception as e:
+                print(f"[音频扫描] 同步容器歌单失败 {current_dir}: {e}")
+                traceback.print_exc()
 
 
 def _update_all_container_track_counts():
@@ -191,13 +197,7 @@ def _update_all_container_track_counts():
         children_map[pp].append(path)
 
     # 一次性查询每个歌单的直接曲目数（从 tracks 表，避免依赖 track_count 是否已被刷新）
-    direct_counts = {}
-    with db._active_conn() as conn:
-        rows = conn.execute(
-            "SELECT playlist_id, COUNT(*) AS cnt FROM tracks GROUP BY playlist_id"
-        ).fetchall()
-        for row in rows:
-            direct_counts[row["playlist_id"]] = row["cnt"]
+    direct_counts = db.count_tracks_by_playlist()
 
     audio_root_norm = os.path.normpath(AUDIO_ROOT)
 
@@ -252,10 +252,10 @@ def scan(audio_root=None, progress_callback=None, cancel_event=None,
         raise FileNotFoundError(f"音频目录不存在: {root}")
 
     # 指纹预检：目录未变化则跳过整个扫描流程
-    # 需要追踪封面图(.jpg/.png)和标签(.txt)，确保这些文���变更也能触发重新扫描
-    _FP_EXTENSIONS = AUDIO_EXTENSIONS | {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".txt"}
+    # 使用目录级指纹（level="dir"）：只 stat 目录 mtime，捕获文件夹/音频增删，
+    # 速度远快于文件级指纹。漏检"封面/标签文件内容被替换"——用户场景不涉及，可接受。
     if check_fingerprint:
-        unchanged, _ = fp.is_unchanged(root, extensions=_FP_EXTENSIONS)
+        unchanged, _ = fp.is_unchanged(root, level="dir")
         if unchanged:
             # 即使目录指纹未变，如果数据库为空（被手动删除等），仍需重新扫描
             existing_playlists = db.list_playlists()
@@ -313,8 +313,8 @@ def scan(audio_root=None, progress_callback=None, cancel_event=None,
     # 聚合容器歌单（仅有子歌单、无直接音频文件的歌单）的曲目数
     _update_all_container_track_counts()
 
-    # 扫描完成后更新目录指纹缓存（需与预检使用相同的扩展名集合）
-    fp.update(root, extensions=_FP_EXTENSIONS)
+    # 扫描完成后更新目录指纹缓存（与预检使用相同的 level）
+    fp.update(root, level="dir")
 
     print(
         f"音频扫描完成: 新增 {stats['added_playlists']} 个歌单, "

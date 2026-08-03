@@ -694,11 +694,15 @@ class MainWindow(QMainWindow):
         if getattr(self, "scan_thread", None) and self.scan_thread.isRunning():
             return
 
+        auto = getattr(self, "_auto_scanning", False)
         total = scanner.count_authors()
-        self.scan_status_bar.setVisible(True)
+        # auto 模式延迟显示扫描条：仅当检测到真实进度时才显示；
+        # unchanged 时扫描条从头到尾不出现，用户无感。manual 模式立即显示。
         self.scan_progress.setValue(0)
         self.scan_label.setText("准备扫描...")
         self.scan_cancel_btn.setEnabled(True)
+        if not auto:
+            self.scan_status_bar.setVisible(True)
 
         self.scan_thread = ScanThread(total_authors=total)
         self.scan_thread.finished.connect(self.on_scan_finished)
@@ -716,6 +720,10 @@ class MainWindow(QMainWindow):
         self._hide_scan_status_bar()
 
     def on_scan_progress(self, stage, author, work, count, current, total):
+        auto = getattr(self, "_auto_scanning", False)
+        # auto 模式且扫描条未显示：收到真实进度信号（非 unchanged）才显示
+        if auto and not self.scan_status_bar.isVisible():
+            self.scan_status_bar.setVisible(True)
         if stage == "author":
             if total > 0:
                 pct = int(current / total * 100)
@@ -747,10 +755,14 @@ class MainWindow(QMainWindow):
 
         # 指纹未变化，跳过扫描
         if stats.get("unchanged"):
-            self.scan_progress.setValue(100)
-            self.scan_label.setText("目录无变化，已跳过扫描")
-            # 延迟 1.5 秒后自动隐藏状态条
-            QTimer.singleShot(1500, self._hide_scan_status_bar)
+            if auto:
+                # auto 模式：扫描条从未显示，保持隐藏，完全静默
+                pass
+            else:
+                # manual 模式：扫描条已可见，显示"目录无变化"1.5秒后隐藏
+                self.scan_progress.setValue(100)
+                self.scan_label.setText("目录无变化，已跳过扫描")
+                QTimer.singleShot(1500, self._hide_scan_status_bar)
             return
 
         self._hide_scan_status_bar()

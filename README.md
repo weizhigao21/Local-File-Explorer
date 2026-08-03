@@ -1,4 +1,4 @@
-# 本地资源管理器 <sub>v1.1.3</sub>
+# 本地资源管理器 <sub>v1.1.4</sub>
 
 基于 PyQt6 的 Windows 本地资源管理工具，采用多模块架构。通过主启动器统一入口，按模块分类管理各类本地资源。
 
@@ -16,8 +16,9 @@
 
 ### 写真模块
 - **自动扫描** - 递归扫描 `E:\hhh\写真` 目录，识别 `作者/作品/图片` 三级结构
-- **指纹预检** - 扫描前基于文件 mtime + size 生成目录指纹，无变化时跳过扫描，几乎零耗时
+- **目录级指纹** - (2026-08-03) 扫描预检改用目录级指纹，只 stat 目录 mtime，unchanged 判断从全量文件 stat 降为目录 stat
 - **增量扫描** - 基于 mtime 对比，仅同步变化的图片/作品/作者，避免全量重建数据库
+- **静默扫描** - (2026-08-03) 进入程序时若目录无变化，扫描条不再出现，用户无感
 - **自然排序** - 图片按数字顺序排列（1, 2, 10 而非 1, 10, 2），符合阅读习惯
 - **作者筛选** - 左侧作者列表快速切换，支持"全部作者"视图
 - **作品搜索** - 按作品名称关键词搜索
@@ -49,6 +50,8 @@
 - **进度控制** - 可拖动/点击进度条跳转，显示当前/总时长
 - **音量调节** - 独立音量滑块（0-100%）
 - **背景扫描** - 扫描在后台线程执行，底部状态栏显示进度，扫描期间可正常使用
+- **目录级指纹** - (2026-08-03) 扫描预检改用目录级指纹，只 stat 目录 mtime，unchanged 判断从十几秒降到 1-2 秒
+- **静默扫描** - (2026-08-03) 进入程序时若目录无变化，扫描条不再出现，用户无感
 - **复制歌单名称** - (2026-07-29) 右键歌单卡片或列表项可复制歌单名称到剪贴板
 
 ## 安装
@@ -152,12 +155,12 @@ python src/main.py
     ├── resource_manager/       # 写真模块后端
     │   ├── config.py           # 配置管理（常量 + config.json 读写）
     │   ├── database.py         # SQLite 操作（长连接、WAL、增量同步）
-    │   ├── fingerprint_cache.py# 目录指纹缓存（mtime + size 预检）
+    │   ├── fingerprint_cache.py# 目录指纹缓存（文件级 + 目录级预检）
     │   ├── gpu_decoder.py      # GPU 加速检测与配置
-    │   └── scanner.py          # 目录扫描、缩略图生成（指纹预检、增量、自然排序）
+    │   └── scanner.py          # 目录扫描、缩略图生成（目录级指纹预检、增量、自然排序）
     ├── audio_manager/          # 音频模块后端
     │   ├── database.py         # 音频歌单数据库（层级结构、曲目管理）
-    │   └── scanner.py          # 音频目录递归扫描（容器歌单、增量同步、自然排序）
+    │   └── scanner.py          # 音频目录递归扫描（目录级指纹、容器歌单、增量同步）
     ├── ui/                     # 前端 UI 层
     │   ├── launcher.py         # 主入口启动器（模块卡片网格、模块切换、UI缩放）
     │   ├── flow_layout.py      # 自适应换行布局（heightForWidth）
@@ -171,7 +174,9 @@ python src/main.py
     └── tests/                  # 单元测试
         ├── test_natural_key.py
         ├── test_database.py
-        └── test_fingerprint_cache.py
+        ├── test_fingerprint_cache.py
+        ├── test_photo_scanner.py
+        └── test_audio_scanner.py
 ```
 
 ## 配置
@@ -211,13 +216,15 @@ python src/main.py
 - **SQLite 数据库** - `data/resource_manager.db`（写真模块）和 `data/audio_manager.db`（音频模块），WAL 模式 + 64MB cache
 - **作品缩略图** - `data/thumbnails/` 目录，每个作品首图生成 240px 缩略图
 - **单图缩略图缓存** - `data/thumbnails/img/` 目录，按 `MD5(path)_WxH.jpg` 命名，仅 ≤512px 的缩略图写盘
-- **扫描指纹缓存** - `data/.scan_fingerprint.json`，记录各资源目录的 mtime+size 指纹
+- **扫描指纹缓存** - `data/.scan_fingerprint.json`，记录各资源目录指纹（写真模块和音频模块均使用目录级 mtime）
 
 删除 `data/` 下的数据库文件和 `thumbnails/` 目录可清空索引与缓存；删除 `.scan_fingerprint.json` 可让下次扫描强制重新同步。
 
 ## 性能优化
 
-- **指纹预检** - 扫描前用 mtime + size 生成目录指纹，无变化时跳过整个扫描流程，数万张图只需毫秒级
+- **指纹预检** - 扫描前生成目录指纹，无变化时跳过整个扫描流程，数万张图只需毫秒级
+- **目录级指纹预检** - (2026-08-03) 写真模块和音频模块预检均改用目录级指纹（只 stat 目录 mtime，不 stat 文件），800+ 文件夹 unchanged 判断从十几秒降到 1-2 秒
+- **自动扫描静默化** - (2026-08-03) 进入写真/音频模块时若目录无变化，扫描条不再出现，仅检测到真实变化才显示进度
 - **增量扫描** - 通过 mtime 字段对比，仅同步变化的图片，扫描 20000+ 张仅需 0.3s
 - **缩略图懒加载** - 仅加载可见区域内的卡片，视口检测触发
 - **LRU 内存缓存** - OrderedDict 实现，64 像素对齐标准化键，避免窗口 resize 时缓存失效
@@ -258,7 +265,9 @@ python -m pytest tests/ -q
 测试覆盖：
 - `test_natural_key.py` - 自然排序逻辑（纯数字、混合、中文、多段、边界等 7 个场景）
 - `test_database.py` - 数据库 schema、CRUD、增量同步、级联删除、长连接（17 个场景）
-- `test_fingerprint_cache.py` - 目录指纹生成、缓存、变化检测（10 个场景）
+- `test_fingerprint_cache.py` - 目录指纹生成、缓存、变化检测、目录级指纹、v1→v2 迁移（27 个场景）
+- `test_photo_scanner.py` - 写真模块目录级指纹扫描集成、unchanged 跳过、目录变化触发同步（5 个场景）
+- `test_audio_scanner.py` - 容器歌单曲目数聚合、目录级指纹扫描集成（11 个场景）
 
 ## 资源目录结构要求
 
