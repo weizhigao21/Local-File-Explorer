@@ -7,7 +7,7 @@ import os
 from PyQt6.QtWidgets import (
     QApplication,
     QHBoxLayout, QVBoxLayout,
-    QLabel, QFrame, QPushButton, QLineEdit,
+    QLabel, QFrame, QPushButton, QListWidget,
     QDialog, QMessageBox, QFileDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
@@ -176,36 +176,45 @@ class AudioSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("音频设置")
-        self.setFixedSize(480, 320)
+        self.setFixedSize(540, 430)
         self.setStyleSheet(f"AudioSettingsDialog {{ background-color: #FDF9F2; color: {TEXT_PRIMARY}; }}")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(16)
+        layout.setSpacing(12)
 
-        section = QLabel("音频目录")
+        section = QLabel("音频目录（支持多个）")
         section.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 16px; font-weight: bold;")
         layout.addWidget(section)
 
-        path_row = QHBoxLayout()
-        path_row.setSpacing(8)
-        self.path_edit = QLineEdit(config.AUDIO_ROOT)
-        self.path_edit.setStyleSheet(
-            f"background-color: {INPUT_BG}; color: {TEXT_PRIMARY}; padding: 6px; "
-            f"border: 1px solid {BORDER_COLOR}; border-radius: 4px;"
-        )
-        path_row.addWidget(self.path_edit, 1)
+        self.path_list = QListWidget()
+        self.path_list.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {INPUT_BG}; color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR}; border-radius: 4px;
+                padding: 4px;
+            }}
+        """)
+        for p in config.AUDIO_ROOTS:
+            self.path_list.addItem(p)
+        layout.addWidget(self.path_list, 1)
 
-        browse_btn = QPushButton("浏览")
-        browse_btn.setStyleSheet(f"background-color: {BORDER_COLOR}; color: {TEXT_PRIMARY}; padding: 6px 12px; border-radius: 4px;")
-        browse_btn.clicked.connect(self._browse)
-        path_row.addWidget(browse_btn)
-        layout.addLayout(path_row)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        add_btn = QPushButton("添加目录")
+        add_btn.setStyleSheet(f"background-color: {ACCENT}; color: #fff; padding: 6px 14px; border-radius: 4px;")
+        add_btn.clicked.connect(self._add_path)
+        btn_row.addWidget(add_btn)
+        remove_btn = QPushButton("移除选中")
+        remove_btn.setStyleSheet(f"background-color: {BORDER_COLOR}; color: {TEXT_PRIMARY}; padding: 6px 14px; border-radius: 4px;")
+        remove_btn.clicked.connect(self._remove_path)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
 
-        desc = QLabel("音频资源的根目录路径，每个子文件夹作为一个歌单。\n修改后需要重启程序生效。")
+        desc = QLabel("每个音频根目录独立扫描，子文件夹作为一个歌单。\n修改后需要重启程序生效。")
         desc.setWordWrap(True)
         desc.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(desc)
-        layout.addStretch()
 
         btn_layout = QHBoxLayout()
         delete_btn = QPushButton("删除当前数据库")
@@ -239,17 +248,34 @@ class AudioSettingsDialog(QDialog):
         db.clear_all()
         QMessageBox.information(self, "提示", "数据库已清空。\n请重新扫描以重建歌单。")
 
-    def _browse(self):
-        path = QFileDialog.getExistingDirectory(self, "选择音频根目录", self.path_edit.text())
-        if path:
-            self.path_edit.setText(path)
+    def _add_path(self):
+        path = QFileDialog.getExistingDirectory(self, "选择音频根目录",
+                                                config.AUDIO_ROOT)
+        if not path:
+            return
+        path = path.strip()
+        existing = [self.path_list.item(i).text() for i in range(self.path_list.count())]
+        if path in existing:
+            return
+        self.path_list.addItem(path)
+
+    def _remove_path(self):
+        row = self.path_list.currentRow()
+        if row >= 0:
+            self.path_list.takeItem(row)
 
     def on_save(self):
-        new_path = self.path_edit.text().strip()
-        if not os.path.isdir(new_path):
-            QMessageBox.warning(self, "路径无效", f"目录不存在: {new_path}")
+        paths = [self.path_list.item(i).text().strip()
+                 for i in range(self.path_list.count())]
+        paths = [p for p in paths if p]
+        if not paths:
+            QMessageBox.warning(self, "路径无效", "请至少保留一个音频目录。")
             return
-        config.set_user_config("AUDIO_ROOT", new_path)
+        for p in paths:
+            if not os.path.isdir(p):
+                QMessageBox.warning(self, "路径无效", f"目录不存在: {p}")
+                return
+        config.set_user_config("AUDIO_ROOTS", paths)
         config.save_user_config()
         self.accept()
         QMessageBox.information(self, "提示", "设置已保存，重启程序后生效。")

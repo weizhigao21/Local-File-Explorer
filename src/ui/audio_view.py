@@ -366,7 +366,7 @@ class AudioMainWindow(QMainWindow):
         if not auto:
             self._scan_bar.setVisible(True)
 
-        self.scan_thread = AudioScanThread(config.AUDIO_ROOT)
+        self.scan_thread = AudioScanThread(config.AUDIO_ROOTS)
         self.scan_thread.finished.connect(self._on_scan_finished)
         self.scan_thread.error.connect(self._on_scan_error)
         self.scan_thread.progress.connect(self._on_scan_progress)

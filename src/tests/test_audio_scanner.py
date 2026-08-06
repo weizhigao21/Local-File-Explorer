@@ -306,3 +306,90 @@ def test_scan_changed_after_adding_playlist_folder(temp_audio_env):
     stats = ascanner.scan(audio_root=root)
     assert not stats.get("unchanged")
     assert stats["added_playlists"] == 1
+
+
+# ==================== 多根目录支持 ====================
+
+def test_scan_multiple_roots_both_indexed(temp_audio_env, tmp_path):
+    """多根目录：两个根目录的歌单都入库，混合显示在顶层"""
+    root1 = temp_audio_env
+    root2 = tmp_path / "audio_root2"
+    root2.mkdir()
+    _make_audio_file(root1, "歌单A/01.mp3")
+    _make_audio_file(root2, "歌单B/01.flac")
+
+    stats = ascanner.scan(audio_roots=[root1, str(root2)])
+    assert not stats.get("unchanged")
+    assert stats["added_playlists"] == 2
+    paths = {pl["path"]: pl for pl in adb.list_playlists()}
+    pl_a = os.path.normpath(os.path.join(root1, "歌单A"))
+    pl_b = os.path.normpath(os.path.join(str(root2), "歌单B"))
+    assert pl_a in paths
+    assert pl_b in paths
+    # 歌单直接平铺在顶层，根目录自身不产生入口
+    top = {pl["path"] for pl in adb.list_playlists_by_parent("")}
+    assert pl_a in top
+    assert pl_b in top
+    assert os.path.normpath(root1) not in top
+    assert os.path.normpath(str(root2)) not in top
+
+    # 两个根目录都建立了指纹，再次扫描全部跳过
+    stats2 = ascanner.scan(audio_roots=[root1, str(root2)])
+    assert stats2.get("unchanged") is True
+
+
+def test_scan_nested_root_flat_mixed(temp_audio_env):
+    """新增根目录位于现有根目录内部时：所有歌单混合平铺在顶层"""
+    root = temp_audio_env
+    os.makedirs(os.path.join(root, "新增目录"))
+    _make_audio_file(root, "歌单A/01.mp3")
+    _make_audio_file(os.path.join(root, "新增目录"), "子歌单B/01.mp3")
+
+    inner = os.path.join(root, "新增目录")
+    ascanner.scan(audio_roots=[root, inner])
+
+    top = {pl["path"] for pl in adb.list_playlists_by_parent("")}
+    assert os.path.normpath(os.path.join(root, "歌单A")) in top
+    assert os.path.normpath(os.path.join(inner, "子歌单B")) in top
+    # 子歌单B 平铺在顶层（不是嵌套在新增目录下）
+    for pl in adb.list_playlists():
+        if pl["path"].endswith("子歌单B"):
+            assert pl["parent_path"] == ""
+
+
+def test_scan_multiple_roots_cleanup_isolated(temp_audio_env, tmp_path):
+    """多根目录：删除根1的歌单不影响根2的歌单（清理按根目录隔离）"""
+    root1 = temp_audio_env
+    root2 = tmp_path / "audio_root2"
+    root2.mkdir()
+    _make_audio_file(root1, "歌单A/01.mp3")
+    _make_audio_file(root2, "歌单B/01.flac")
+
+    ascanner.scan(audio_roots=[root1, str(root2)])
+
+    # 删除根1下的歌单A文件夹，只 bump 根1的 mtime
+    import shutil
+    shutil.rmtree(os.path.join(root1, "歌单A"))
+    _bump_dir_mtime(root1)
+
+    stats = ascanner.scan(audio_roots=[root1, str(root2)])
+    assert stats["removed_playlists"] == 1
+    remaining = {pl["path"] for pl in adb.list_playlists()}
+    assert os.path.normpath(os.path.join(str(root2), "歌单B")) in remaining
+    assert os.path.normpath(os.path.join(root1, "歌单A")) not in remaining
+
+
+def test_scan_multiple_roots_root_playlist_names(temp_audio_env, tmp_path):
+    """多根目录：根目录有直接音频时，根歌单以目录名命名，避免重名"""
+    root1 = temp_audio_env
+    root2 = tmp_path / "audio_root2"
+    root2.mkdir()
+    _make_audio_file(root1, "01.mp3")
+    _make_audio_file(str(root2), "01.flac")
+
+    stats = ascanner.scan(audio_roots=[root1, str(root2)])
+    assert stats["added_playlists"] == 2
+    names = {pl["name"] for pl in adb.list_playlists()}
+    assert os.path.basename(root1) in names
+    assert os.path.basename(str(root2)) in names
+    assert len(names) == 2  # 不再出现重名的"音频根目录"

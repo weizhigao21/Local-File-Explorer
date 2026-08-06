@@ -17,9 +17,9 @@ class AudioScanThread(QThread):
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int, str)
 
-    def __init__(self, audio_root):
+    def __init__(self, audio_roots):
         super().__init__()
-        self.audio_root = audio_root
+        self.audio_roots = audio_roots if isinstance(audio_roots, (list, tuple)) else [audio_roots]
         self.cancel_event = threading.Event()
 
     def cancel(self):
@@ -28,7 +28,7 @@ class AudioScanThread(QThread):
     def run(self):
         try:
             stats = audio_scanner.scan(
-                audio_root=self.audio_root,
+                audio_roots=self.audio_roots,
                 progress_callback=self._emit_progress,
                 cancel_event=self.cancel_event,
             )

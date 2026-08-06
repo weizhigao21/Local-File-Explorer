@@ -8,17 +8,31 @@ import traceback
 
 from audio_manager import database as db
 from resource_manager import fingerprint_cache as fp
-from resource_manager.config import AUDIO_ROOT
+from resource_manager.config import AUDIO_ROOT, AUDIO_ROOTS
 from resource_manager.utils import natural_key
 
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".aac", ".ogg", ".wma", ".m4a"}
 
-# 根目录歌单名称
+# 根目录歌单名称（兜底：根目录名称为空时使用）
 ROOT_PLAYLIST_NAME = "音频根目录"
+
+# 最近一次 scan() 的根目录集合（供聚合逻辑识别"根歌单"的特殊层级规则）
+_SCANNED_ROOTS = set()
 
 
 def _is_audio(path):
     return os.path.splitext(path)[1].lower() in AUDIO_EXTENSIONS
+
+
+def _root_playlist_name(root):
+    """根目录歌单的名称：取根目录文件夹名（多根目录时避免全部叫"音频根目录"）"""
+    name = os.path.basename(os.path.normpath(root).rstrip("\\/"))
+    return name or ROOT_PLAYLIST_NAME
+
+
+def _is_within(path, root):
+    """判断 path 是否位于 root 目录树内（含 root 自身）"""
+    return path == root or path.startswith(root + os.sep) or path.startswith(root + "/")
 
 
 def _read_tags_file(tags_path):
@@ -79,6 +93,16 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
             stats["removed_tracks"] += removed
         stats["skipped"] += 1
     else:
+        # existing 是扫描开始前的快照：同一轮扫描中其他根目录可能已创建该歌单，
+        # 此时 add_playlist 的 INSERT OR IGNORE 不会更新层级归属，需补更新
+        row = db.get_playlist_by_path(norm_folder)
+        if row:
+            db.update_playlist(row["id"], parent_path=parent_path, name=name,
+                               cover=cover, tags=tags,
+                               mtime=os.path.getmtime(norm_folder))
+            existing[norm_folder] = row["id"]
+            stats["skipped"] += 1
+            return
         pid = db.add_playlist(name, norm_folder, cover=cover,
                               tags=tags, parent_path=parent_path,
                               mtime=os.path.getmtime(norm_folder))
@@ -90,7 +114,7 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
 
 
 def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
-              progress_callback, cancel_event, counter):
+              progress_callback, cancel_event, counter, nested=False, skip_dirs=None):
     """
     递归扫描目录
     root: 音频根目录
@@ -123,7 +147,7 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
     if has_audio:
         # 判断是否是根目录
         if current_dir == root:
-            pl_name = ROOT_PLAYLIST_NAME
+            pl_name = _root_playlist_name(root)
         else:
             pl_name = os.path.basename(current_dir)
 
@@ -142,7 +166,7 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
         counter["total"] += 1
 
     # 递归子目录
-    # parent_path 规则：root 的直接子目录用 ""（根层级），深层子目录用当前目录路径
+    # parent_path 规则：根的直接子目录用 ""（顶层平铺），深层子目录用当前目录路径
     for sname, spath in subdirs:
         if cancel_event and cancel_event.is_set():
             return
@@ -160,7 +184,7 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
         child_playlists = db.list_playlists_by_parent(current_dir)
         if child_playlists:
             if current_dir == root:
-                pl_name = ROOT_PLAYLIST_NAME
+                pl_name = _root_playlist_name(root)
             else:
                 pl_name = os.path.basename(current_dir)
             counter["idx"] += 1
@@ -201,7 +225,8 @@ def _update_all_container_track_counts():
     # 一次性查询每个歌单的直接曲目数（从 tracks 表，避免依赖 track_count 是否已被刷新）
     direct_counts = db.count_tracks_by_playlist()
 
-    audio_root_norm = os.path.normpath(AUDIO_ROOT)
+    # 根目录集合：优先用最近一次 scan() 传入的根目录，其次读配置（兼容测试直接调用）
+    roots = _SCANNED_ROOTS or {os.path.normpath(r) for r in (AUDIO_ROOTS or [AUDIO_ROOT])}
 
     # 按深度排序(深->浅)，从叶子向根处理
     # 对两种路径分隔符都计数，兼容 Windows/Unix 风格的路径字符串
@@ -219,10 +244,10 @@ def _update_all_container_track_counts():
         own_count = direct_counts.get(pl["id"], 0)
 
         # 获取直接子歌单路径
-        # 根目录特殊处理：根的直接子歌单 parent_path=""，但根本身也是 parent_path=""，
-        # 需要把根本身从 children_map[""] 中排除，避免自引用
-        if path == audio_root_norm:
-            child_paths = [p for p in children_map.get("", []) if p != path]
+        # 根目录特殊处理：根的直接子歌单 parent_path=""，但根自身的 parent_path 也是 ""，
+        # 需把根本身和其余根目录从 children_map[""] 中排除，避免自引用/串根聚合
+        if path in roots:
+            child_paths = [p for p in children_map.get("", []) if p != path and p not in roots]
         else:
             child_paths = children_map.get(path, [])
 
@@ -241,89 +266,119 @@ def _update_all_container_track_counts():
         db.update_track_counts_batch(pending_updates)
 
 
-def scan(audio_root=None, progress_callback=None, cancel_event=None,
-         check_fingerprint=True):
+def scan(audio_root=None, audio_roots=None, progress_callback=None,
+         cancel_event=None, check_fingerprint=True):
     """
-    递归扫描音频目录
+    递归扫描一个或多个音频根目录
     每层文件夹（含音频）都是一个歌单，支持层级嵌套
-    
+
     Args:
+        audio_root: 单个音频根目录（兼容旧调用，优先使用 audio_roots）
+        audio_roots: 音频根目录列表，支持多个路径；每个根目录独立指纹预检与清理
         check_fingerprint: 为 True 时先对比目录指纹，无变化则直接跳过扫描
     """
-    root = os.path.normpath(audio_root or AUDIO_ROOT)
+    global _SCANNED_ROOTS
+    if audio_roots:
+        roots = list(audio_roots)
+    elif audio_root:
+        roots = [audio_root]
+    else:
+        roots = list(AUDIO_ROOTS or [AUDIO_ROOT])
+    if isinstance(roots, str):
+        roots = [roots]
+    roots = [os.path.normpath(r) for r in roots if isinstance(r, str) and r.strip()]
+
     db.init_db()
 
-    if not os.path.isdir(root):
-        raise FileNotFoundError(f"音频目录不存在: {root}")
+    for r in roots:
+        if not os.path.isdir(r):
+            raise FileNotFoundError(f"音频目录不存在: {r}")
 
-    # 指纹预检：目录未变化则跳过整个扫描流程
+    _SCANNED_ROOTS = set(roots)
+
+    # 浅→深排序：嵌套根目录（在另一个根目录内部）最晚扫描，其层级规则最后写入，
+    # 保证所有根目录的歌单最终都平铺在顶层
+    roots = sorted(roots, key=lambda r: r.count(os.sep) + r.count('/'))
+
+    # 指纹预检（逐根目录）：目录未变化则跳过该根目录
     # 使用目录级指纹（level="dir"）：只 stat 目录 mtime，捕获文件夹/音频增删，
     # 速度远快于文件级指纹。漏检"封面/标签文件内容被替换"——用户场景不涉及，可接受。
-    if check_fingerprint:
-        unchanged, _ = fp.is_unchanged(root, level="dir")
-        if unchanged:
-            # 即使目录指纹未变，如果数据库为空（被手动删除等），仍需重新扫描
-            existing_playlists = db.list_playlists()
-            if len(existing_playlists) > 0:
-                print("[音频扫描] 目录指纹未变化，跳过扫描")
-                # 即使跳过扫描，仍需运行容器歌单聚合，确保 track_count 与代码逻辑一致
-                _update_all_container_track_counts()
-                if progress_callback:
-                    progress_callback(1, 1, "目录无变化，已跳过扫描")
-                return {"unchanged": True, "skipped_all": True}
-            else:
-                print("[音频扫描] 目录指纹未变化，但数据库为空，强制执行扫描")
+    existing_count = len(db.get_playlist_paths())
+    scan_roots = []
+    for r in roots:
+        unchanged = False
+        if check_fingerprint:
+            unchanged, _ = fp.is_unchanged(r, level="dir")
+        # 未变化且数据库非空 → 跳过该根目录；数据库为空（被手动删除等）则强制扫描
+        if unchanged and existing_count > 0:
+            print(f"[音频扫描] 目录指纹未变化，跳过扫描: {r}")
+        else:
+            scan_roots.append(r)
+
+    if not scan_roots:
+        # 即使跳过扫描，仍需运行容器歌单聚合，确保 track_count 与代码逻辑一致
+        _update_all_container_track_counts()
+        if progress_callback:
+            progress_callback(1, 1, "目录无变化，已跳过扫描")
+        return {"unchanged": True, "skipped_all": True}
 
     stats = {"added_playlists": 0, "removed_playlists": 0,
              "added_tracks": 0, "removed_tracks": 0, "skipped": 0}
 
     existing_raw = db.get_playlist_paths()
     existing = {os.path.normpath(k): v for k, v in existing_raw.items()}
-    disk_paths = set()
 
     # 开启持久连接，扫描期间所有 DB 操作复用同一连接
     db.begin_persistent()
     try:
-        # 先粗算总数：根直接子目录作为初始 total
-        initial_total = sum(
-            1 for name in os.listdir(root)
-            if os.path.isdir(os.path.join(root, name))
-        )
-        # 如果根目录本身可能有音频，也需要占位
-        root_has_audio = any(
-            _is_audio(os.path.join(root, f))
-            for f in os.listdir(root)
-            if os.path.isfile(os.path.join(root, f))
-        )
-        if root_has_audio:
-            initial_total += 1
+        for root in scan_roots:
+            if cancel_event and cancel_event.is_set():
+                break
+            # 仅处理/清理当前根目录树内的歌单，避免误删其他根目录的数据
+            root_existing = {p: pid for p, pid in existing.items() if _is_within(p, root)}
+            disk_paths = set()
 
-        counter = {"idx": 0, "total": max(initial_total, 1)}
+            # 先粗算总数：根直接子目录作为初始 total
+            initial_total = sum(
+                1 for name in os.listdir(root)
+                if os.path.isdir(os.path.join(root, name))
+            )
+            # 如果根目录本身可能有音频，也需要占位
+            root_has_audio = any(
+                _is_audio(os.path.join(root, f))
+                for f in os.listdir(root)
+                if os.path.isfile(os.path.join(root, f))
+            )
+            if root_has_audio:
+                initial_total += 1
 
-        # 递归扫描所有目录
-        _scan_dir(root, root, "", existing, disk_paths, stats,
-                  progress_callback, cancel_event, counter)
+            counter = {"idx": 0, "total": max(initial_total, 1)}
 
-        # 删除不存在的歌单（包含子歌单递归删除）
-        for path, pid in existing.items():
-            if path not in disk_paths:
-                db.delete_playlist(pid)
-                stats["removed_playlists"] += 1
+            # 递归扫描该根目录
+            _scan_dir(root, root, "", root_existing, disk_paths, stats,
+                      progress_callback, cancel_event, counter)
+
+            # 删除该根目录下不存在的歌单（包含子歌单递归删除）
+            for path, pid in root_existing.items():
+                if path not in disk_paths:
+                    db.delete_playlist(pid)
+                    stats["removed_playlists"] += 1
     finally:
         db.end_persistent()
 
     # 聚合容器歌单（仅有子歌单、无直接音频文件的歌单）的曲目数
     # 进度条保持 100% 但文案提示仍在整理，避免用户误以为已完成
     if progress_callback:
-        progress_callback(counter["total"], counter["total"], "正在整理曲目数...")
+        progress_callback(1, 1, "正在整理曲目数...")
     _update_all_container_track_counts()
 
-    # 扫描完成后更新目录指纹缓存（与预检使用相同的 level）
-    fp.update(root, level="dir")
+    # 扫描完成后更新已扫描根目录的指纹缓存（与预检使用相同的 level）
+    for root in scan_roots:
+        fp.update(root, level="dir")
 
     # "扫描完成"放在所有耗时操作之后，保证 finished 信号发出时 UI 可立即刷新
     if progress_callback:
-        progress_callback(counter["total"], counter["total"], "扫描完成")
+        progress_callback(1, 1, "扫描完成")
 
     print(
         f"音频扫描完成: 新增 {stats['added_playlists']} 个歌单, "

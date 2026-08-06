@@ -37,7 +37,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -47,7 +47,7 @@ USER_CONFIG_PATH = os.path.join(_DATA_DIR, "config.json")
 # 默认配置（仅在 config.json 不存在时使用）
 _DEFAULT_USER_CONFIG = {
     "PHOTO_ROOT": r"E:\hhh\写真",
-    "AUDIO_ROOT": r"E:\音频",
+    "AUDIO_ROOTS": [r"E:\音频"],
     "USE_GPU": True,
     "GPU_FRIENDLY_FORMAT": True,
     "UI_SCALE": 125,
@@ -60,6 +60,16 @@ _DEFAULT_USER_CONFIG = {
 _user_config = dict(_DEFAULT_USER_CONFIG)
 
 
+def _normalize_audio_roots(value):
+    """把 AUDIO_ROOTS 配置归一化为非空字符串列表（兼容旧版单字符串）"""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return list(_DEFAULT_USER_CONFIG["AUDIO_ROOTS"])
+    cleaned = [p.strip() for p in value if isinstance(p, str) and p.strip()]
+    return cleaned or list(_DEFAULT_USER_CONFIG["AUDIO_ROOTS"])
+
+
 def _load_user_config():
     """启动时从 config.json 加载用户配置，缺失字段用默认值"""
     global _user_config
@@ -69,7 +79,15 @@ def _load_user_config():
                 data = json.load(f)
             # 仅接受已知字段，忽略未知键
             merged = dict(_DEFAULT_USER_CONFIG)
-            merged.update({k: v for k, v in data.items() if k in _DEFAULT_USER_CONFIG})
+            for k, v in data.items():
+                if k not in _DEFAULT_USER_CONFIG:
+                    continue
+                if k == "AUDIO_ROOTS":
+                    v = _normalize_audio_roots(v)
+                merged[k] = v
+            # 兼容旧版单路径配置 AUDIO_ROOT → 迁移为 AUDIO_ROOTS
+            if "AUDIO_ROOTS" not in data and "AUDIO_ROOT" in data:
+                merged["AUDIO_ROOTS"] = _normalize_audio_roots(data["AUDIO_ROOT"])
             _user_config = merged
         except (json.JSONDecodeError, OSError) as e:
             print(f"[config] 加载用户配置失败，使用默认值: {e}")
@@ -88,8 +106,13 @@ def set_user_config(key: str, value):
     """更新用户配置项并立即生效（运行时改，需调用 save_user_config() 持久化）"""
     if key not in _DEFAULT_USER_CONFIG:
         raise KeyError(f"未知配置项: {key}")
+    if key == "AUDIO_ROOTS":
+        value = _normalize_audio_roots(value)
     _user_config[key] = value
     globals()[key] = value  # 同步模块级变量，方便 config.XXX 直接访问
+    if key == "AUDIO_ROOTS":
+        # 保持 AUDIO_ROOT = 第一个根目录（兼容旧代码）
+        globals()["AUDIO_ROOT"] = value[0]
 
 
 # 启动时加载用户配置
@@ -97,7 +120,8 @@ _load_user_config()
 
 # 暴露为模块级属性（兼容旧的 config.PHOTO_ROOT 访问方式）
 PHOTO_ROOT = _user_config["PHOTO_ROOT"]
-AUDIO_ROOT = _user_config["AUDIO_ROOT"]
+AUDIO_ROOTS = list(_user_config["AUDIO_ROOTS"])
+AUDIO_ROOT = AUDIO_ROOTS[0]  # 兼容旧代码：第一个音频根目录
 USE_GPU = _user_config["USE_GPU"]
 GPU_FRIENDLY_FORMAT = _user_config["GPU_FRIENDLY_FORMAT"]
 UI_SCALE = _user_config["UI_SCALE"]
