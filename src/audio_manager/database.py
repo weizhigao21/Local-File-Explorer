@@ -331,6 +331,23 @@ def count_tracks_by_playlist():
         return {row["playlist_id"]: row["cnt"] for row in rows}
 
 
+def update_track_counts_batch(updates):
+    """批量更新多个歌单的 track_count
+
+    updates: [(playlist_id, track_count), ...]
+    单次连接 executemany 写入，替代聚合时逐条 update_playlist 的
+    短连接 connect+commit+close（数百歌单场景耗时从数秒降到毫秒级）。
+    使用独立短连接，理由同 update_mtimes_batch。
+    """
+    if not updates:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            "UPDATE playlists SET track_count = ? WHERE id = ?",
+            [(tc, pid) for pid, tc in updates],
+        )
+
+
 def get_playlist_paths():
     """返回 {path: id}"""
     with _active_conn() as conn:

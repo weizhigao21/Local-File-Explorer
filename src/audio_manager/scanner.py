@@ -188,6 +188,8 @@ def _update_all_container_track_counts():
     if not all_pl:
         return
 
+    pending_updates = []  # [(playlist_id, track_count)] 收集后批量写
+
     # 构建 parent_path -> [child_path, ...] 索引
     children_map = {}
     for path, pl in all_pl.items():
@@ -231,9 +233,12 @@ def _update_all_container_track_counts():
         display = own_count if own_count > 0 else children_total
         card_count[path] = display
 
-        # 与数据库现有值不一致才更新，减少无谓写入
+        # 与数据库现有值不一致才记录，最后统一批量写（避免逐条短连接更新）
         if display != pl["track_count"]:
-            db.update_playlist(pl["id"], track_count=display)
+            pending_updates.append((pl["id"], display))
+
+    if pending_updates:
+        db.update_track_counts_batch(pending_updates)
 
 
 def scan(audio_root=None, progress_callback=None, cancel_event=None,
@@ -307,14 +312,18 @@ def scan(audio_root=None, progress_callback=None, cancel_event=None,
     finally:
         db.end_persistent()
 
-    if progress_callback:
-        progress_callback(counter["total"], counter["total"], "扫描完成")
-
     # 聚合容器歌单（仅有子歌单、无直接音频文件的歌单）的曲目数
+    # 进度条保持 100% 但文案提示仍在整理，避免用户误以为已完成
+    if progress_callback:
+        progress_callback(counter["total"], counter["total"], "正在整理曲目数...")
     _update_all_container_track_counts()
 
     # 扫描完成后更新目录指纹缓存（与预检使用相同的 level）
     fp.update(root, level="dir")
+
+    # "扫描完成"放在所有耗时操作之后，保证 finished 信号发出时 UI 可立即刷新
+    if progress_callback:
+        progress_callback(counter["total"], counter["total"], "扫描完成")
 
     print(
         f"音频扫描完成: 新增 {stats['added_playlists']} 个歌单, "

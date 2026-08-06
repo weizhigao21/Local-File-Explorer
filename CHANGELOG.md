@@ -4,6 +4,14 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.1.5] - 2026-08-04
+
+### 修复
+- **扫描完成后 UI 更新延迟** — 原"扫描完成"进度回调发在容器歌单曲目数聚合和目录指纹重建之前，而 UI 刷新要等扫描线程返回（`finished` 信号）后才执行，导致用户看到"扫描完成"后列表还要等待数秒才更新。现在"扫描完成"回调移到所有耗时操作之后，聚合前先提示"正在整理曲目数..."，`finished` 信号发出时数据已就绪、UI 立即刷新。
+
+### 优化
+- **track_count 批量更新** — 新增 `update_track_counts_batch()`，容器歌单聚合后一次 `executemany` 批量写入，替代逐条 `update_playlist`（每次短连接 connect+commit+close），数百歌单场景耗时从数秒降到毫秒级。
+
 ## [v1.1.4] - 2026-08-03
 
 ### 新增
