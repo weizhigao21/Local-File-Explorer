@@ -1,4 +1,4 @@
-# 本地资源管理器 <sub>v1.1.5</sub>
+# 本地资源管理器 <sub>v1.1.6</sub>
 
 基于 PyQt6 的 Windows 本地资源管理工具，采用多模块架构。通过主启动器统一入口，按模块分类管理各类本地资源。
 
@@ -47,6 +47,7 @@
 - **自然排序** - 曲目按文件名自然顺序排列（1, 2, 10 而非 1, 10, 2）
 - **封面标签** - 支持 `封面.jpg` / `cover.jpg` 封面图片和 `标签.txt` 标签文件
 - **音频播放** - 内置播放器，支持播放、暂停、上一首、下一首
+- **持续播放** - (2026-08-06) 播放队列与展示列表解耦，返回歌单列表/切换详情页时音乐不中断，当前曲目自动高亮
 - **进度控制** - 可拖动/点击进度条跳转，显示当前/总时长
 - **音量调节** - 独立音量滑块（0-100%）
 - **背景扫描** - 扫描在后台线程执行，底部状态栏显示进度，扫描期间可正常使用
@@ -170,9 +171,17 @@ python src/main.py
     │   ├── image_loader.py     # 异步解码 + LRU 缓存 + 磁盘缓存
     │   ├── image_viewer.py     # 全屏图片查看器（异步预解码）
     │   ├── main_window.py      # 写真主窗口（作者列表、作品网格、设置对话框、快捷键）
+    │   ├── photo_theme.py      # 写真模块主题（配色、滚动条/按钮样式）
+    │   ├── photo_widgets.py    # 写真模块组件（设置对话框、扫描线程）
     │   ├── tag_widgets.py      # 标签组件（可点击标签按钮、芯片、选择器、解析器）
     │   ├── work_images_view.py # 作品图片缩略图墙（QListWidget IconMode）
-    │   └── audio_view.py       # 音频主窗口（歌单浏览、标签搜索、详情页、播放器、扫描）
+    │   ├── audio_view.py       # 音频主窗口（页面组装、播放器控制、扫描）
+    │   ├── audio_theme.py      # 音频模块主题（配色、通用样式、时间/路径工具）
+    │   ├── audio_widgets.py    # 音频组件（歌单卡片、子歌单卡片、设置对话框）
+    │   ├── audio_browser.py    # 歌单浏览器（层级导航、搜索、标签过滤、双视图、分页）
+    │   ├── audio_detail.py     # 歌单详情页（封面、标签、子歌单、曲目列表）
+    │   ├── audio_player.py     # 底部播放条控件（进度、音量、播放控制信号）
+    │   └── audio_threads.py    # 音频后台线程（扫描、mtime 迁移）
     └── tests/                  # 单元测试
         ├── test_natural_key.py
         ├── test_database.py
@@ -313,6 +322,15 @@ E:\音频\
     └── 子专题\
         └── ...
 ```
+
+## 架构设计
+
+按模块与职责拆分，单个文件控制在 ~600 行以内，便于维护：
+
+- **写真模块 UI** - `main_window.py`（主窗口）+ `photo_theme.py`（主题样式）+ `photo_widgets.py`（设置对话框、扫描线程）
+- **音频模块 UI** - `audio_view.py`（主窗口：页面组装、播放器控制、扫描）+ `audio_browser.py`（歌单浏览器：层级导航/搜索/标签/双视图/分页）+ `audio_detail.py`（歌单详情页）+ `audio_widgets.py`（卡片、设置对话框）+ `audio_player.py`（底部播放条控件）+ `audio_threads.py`（后台线程）+ `audio_theme.py`（主题与工具）
+- **UI 组件分层** - 各模块通过信号（pyqtSignal）解耦：播放条只发控制信号，浏览器只发 `openPlaylist`，详情页只发 `backClicked`/`trackDoubleClicked` 等，主窗口统一连接
+- **后端与前端分离** - `resource_manager/`（写真）与 `audio_manager/`（音频）负责数据库与扫描，UI 层不直接操作 SQLite
 
 ## 模块扩展
 

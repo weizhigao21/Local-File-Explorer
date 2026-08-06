@@ -37,7 +37,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 
 # ==================== 用户可变配置（config.json） ====================
 

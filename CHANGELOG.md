@@ -4,6 +4,19 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.1.6] - 2026-08-06
+
+### 修复
+- **返回歌单列表时音乐被切断** — 原 `_open_playlist()` 每次导航到详情页都调用 `self.player.stop()` 并隐藏播放条，从子歌单返回上级/歌单列表时会再次触发而切断播放。
+
+### 优化
+- **持续播放** — 播放逻辑引入独立播放队列 `_play_queue`，与详情页展示列表解耦：双击某首曲目时以当前列表快照建立队列，上一首/下一首/暂停恢复均在独立队列上操作。返回歌单列表或切换详情页不再重置队列、不再停止播放。
+- **当前曲目高亮** — 高亮改为按曲目路径匹配展示列表（`_highlight_current_in_list()`），切换回歌单后仍在播放的曲目会自动高亮。
+
+### 重构
+- **音频模块拆分** — 原 1600+ 行的 `audio_view.py` 拆分为 `audio_theme`（配色/工具）、`audio_widgets`（卡片/设置对话框）、`audio_browser`（歌单浏览器）、`audio_detail`（详情页）、`audio_player`（播放条）、`audio_threads`（后台线程）和精简后的主窗口，每个模块 400-600 行。
+- **写真模块拆分** — 原 777 行的 `main_window.py` 拆分为 `photo_theme`（主题样式）、`photo_widgets`（设置对话框/扫描线程）和精简后的主窗口。
+
 ## [v1.1.5] - 2026-08-04
 
 ### 修复
