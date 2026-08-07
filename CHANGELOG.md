@@ -4,6 +4,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.1.8] - 2026-08-07
+
+### 新增
+- **点击进度条跳转** — 播放条进度条支持点击轨道任意位置直接跳到该位置（新增 `SeekSlider` 子类，重写 `mousePressEvent` 用 `sliderValueFromPosition` 换算坐标）；点击后按住可继续拖动，点击滑块 handle 仍走原生拖动逻辑，原有 `sliderMoved` / `sliderReleased` 拖动路径不变。
+
 ## [v1.1.7] - 2026-08-06
 
 ### 新增

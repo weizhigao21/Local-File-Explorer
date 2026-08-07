@@ -2,12 +2,63 @@
 音频模块播放条控件
 固定于主窗口底部的播放控制栏：当前曲目、上一首/播放/下一首、进度条、时间、音量
 """
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QSlider
+from PyQt6.QtWidgets import (
+    QFrame, QHBoxLayout, QLabel, QPushButton, QSlider, QStyle, QStyleOptionSlider,
+)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from ui.audio_theme import (
     ACCENT, ACCENT_HOVER, TEXT_PRIMARY, TEXT_DIM, format_time,
 )
+
+
+class SeekSlider(QSlider):
+    """可点击跳转的进度条：点击轨道任意位置直接跳到该位置，拖动 / 点击后拖动均可用"""
+
+    clickedSeek = pyqtSignal(int)  # 点击跳转，单位：秒
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._seeking = False  # 当前是否处于"点击轨道"模式
+
+    def _value_from_pos(self, x: float) -> int:
+        """把鼠标横坐标换算为滑块值（秒）"""
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), int(x), self.width())
+
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self.maximum() > 0
+                and not self._on_handle(event.position().toPoint())):
+            # 点击在轨道上 → 直接跳到点击位置；不调用 super()，避免默认 pageStep 逻辑覆盖
+            self._seeking = True
+            self.setValue(self._value_from_pos(event.position().x()))
+            self.clickedSeek.emit(self.value())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # 点击轨道后按住拖动：持续跟随鼠标位置跳转
+        if self._seeking and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.setValue(self._value_from_pos(event.position().x()))
+            self.clickedSeek.emit(self.value())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._seeking = False
+        super().mouseReleaseEvent(event)
+
+    def _on_handle(self, pos) -> bool:
+        """判断点击点是否落在滑块 handle 上（是则走原生拖动逻辑）"""
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderHandle, self)
+        return rect.contains(pos)
 
 
 class AudioPlayerBar(QFrame):
@@ -68,7 +119,7 @@ class AudioPlayerBar(QFrame):
         self.time_current.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
         player_layout.addWidget(self.time_current)
 
-        self.progress_slider = QSlider(Qt.Orientation.Horizontal)
+        self.progress_slider = SeekSlider(Qt.Orientation.Horizontal)
         self.progress_slider.setFixedHeight(24)
         self.progress_slider.setStyleSheet(f"""
             QSlider::groove:horizontal {{ background: #DDD; height: 4px; border-radius: 2px; }}
@@ -77,6 +128,7 @@ class AudioPlayerBar(QFrame):
             QSlider::sub-page:horizontal {{ background: {ACCENT}; height: 4px; border-radius: 2px; }}
         """)
         self.progress_slider.setRange(0, 0)
+        self.progress_slider.clickedSeek.connect(self._emit_seek)
         self.progress_slider.sliderMoved.connect(self._emit_seek)
         self.progress_slider.sliderReleased.connect(self._emit_seek_on_release)
         player_layout.addWidget(self.progress_slider, 1)
