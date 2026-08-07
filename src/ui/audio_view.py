@@ -117,6 +117,7 @@ class AudioMainWindow(QMainWindow):
         self.player_bar.nextClicked.connect(self.play_next)
         self.player_bar.seekRequested.connect(self._seek)
         self.player_bar.volumeChanged.connect(self._on_volume_changed)
+        self.player_bar.nowPlayingClicked.connect(self._on_now_playing_clicked)
         layout.addWidget(self.player_bar)
         self.player_bar.setVisible(False)
 
@@ -172,6 +173,28 @@ class AudioMainWindow(QMainWindow):
             self.page_stack.setCurrentIndex(0)
 
     @staticmethod
+    def _is_path_within(child_path: str, parent_path: str) -> bool:
+        """child_path 是否等于 parent_path 或位于其子级（兼容 / 与 \\ 分隔符）"""
+        if child_path == parent_path:
+            return True
+        return (child_path.startswith(parent_path + os.sep)
+                or child_path.startswith(parent_path + "/"))
+
+    def _build_ancestor_chain(self, pl):
+        """从叶子歌单沿 parent_path 回溯到根，返回 [根, ..., 叶子] 的歌单 id 链"""
+        chain = [pl["id"]]
+        parent_path = pl.get("parent_path") or ""
+        guard = 0
+        while parent_path and guard < 64:
+            parent = db.get_playlist_by_path(parent_path)
+            if not parent:
+                break
+            chain.insert(0, parent["id"])
+            parent_path = parent.get("parent_path") or ""
+            guard += 1
+        return chain
+
+    @staticmethod
     def _collect_tracks_recursive(pl_id):
         """收集歌单及其所有后代歌单的全部曲目（一次CTE + 一次批量查询替代递归N+1）"""
         pl = db.get_playlist(pl_id)
@@ -196,9 +219,12 @@ class AudioMainWindow(QMainWindow):
                 return cover
         return None
 
-    def _open_playlist(self, pl_id):
-        # 导航历史：首次从浏览器进入时重置，子歌单点击时追加
-        if self.page_stack.currentIndex() != 1:
+    def _open_playlist(self, pl_id, history=None):
+        # 导航历史：默认首次从浏览器进入时重置、子歌单点击时追加；
+        # 传 history 时（如"跳转曲目所属歌单"）直接用预设的祖先链，保证层级完整
+        if history is not None:
+            self._detail_history = list(history)
+        elif self.page_stack.currentIndex() != 1:
             self._detail_history = [pl_id]
         elif pl_id != self._detail_history[-1]:
             self._detail_history.append(pl_id)
@@ -352,6 +378,27 @@ class AudioMainWindow(QMainWindow):
 
     def _on_volume_changed(self, val):
         self.audio_output.setVolume(val / 100.0)
+
+    def _on_now_playing_clicked(self):
+        """点击播放条曲目名 → 回到当前歌单，或按层级跳转到曲目所属歌单"""
+        if not self._play_queue or self._current_track_index < 0 \
+                or self._current_track_index >= len(self._play_queue):
+            return
+        track = self._play_queue[self._current_track_index]
+        target = db.get_playlist(track.get("playlist_id")) if track.get("playlist_id") else None
+        if not target:
+            return  # 歌单已被删除等脏数据，忽略
+
+        # 1) 曲目属于当前展示歌单（或其子孙）→ 切回详情页保持上下文，不重建导航
+        if self._current_playlist_id:
+            current = db.get_playlist(self._current_playlist_id)
+            if current and self._is_path_within(target["path"], current["path"]):
+                self.page_stack.setCurrentIndex(1)
+                return
+
+        # 2) 跨歌单 → 按祖先链逐层展开（根→...→叶子），封面与返回行为同正常浏览
+        chain = self._build_ancestor_chain(target)
+        self._open_playlist(target["id"], history=chain)
 
     # ==================== 扫描 ====================
     def start_scan(self):

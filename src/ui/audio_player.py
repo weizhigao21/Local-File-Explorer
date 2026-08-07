@@ -61,6 +61,31 @@ class SeekSlider(QSlider):
         return rect.contains(pos)
 
 
+class ClickableLabel(QLabel):
+    """可点击的文本标签：左键点击发出 clicked 信号"""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._clickable = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_clickable(self, enabled: bool):
+        """切换可点击状态：控制手型光标与 tooltip 反馈"""
+        self._clickable = enabled
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.setToolTip("点击打开所属歌单" if enabled else "")
+
+    def mousePressEvent(self, event):
+        if self._clickable and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class AudioPlayerBar(QFrame):
     """底部播放条：发出控制信号，由主窗口连接 QMediaPlayer"""
 
@@ -69,6 +94,7 @@ class AudioPlayerBar(QFrame):
     nextClicked = pyqtSignal()
     seekRequested = pyqtSignal(int)  # 秒
     volumeChanged = pyqtSignal(int)  # 0-100
+    nowPlayingClicked = pyqtSignal()  # 点击当前曲目名（跳转所属歌单）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -80,9 +106,14 @@ class AudioPlayerBar(QFrame):
         player_layout.setContentsMargins(12, 6, 12, 6)
         player_layout.setSpacing(8)
 
-        self.now_playing = QLabel("未播放")
+        self.now_playing = ClickableLabel("未播放")
         self.now_playing.setMinimumWidth(160)
-        self.now_playing.setStyleSheet("color: #777; font-size: 12px;")
+        self.now_playing.setStyleSheet(f"""
+            color: #777; font-size: 12px; padding: 2px 4px; border-radius: 4px;
+            QLabel:hover {{ color: {TEXT_PRIMARY}; background-color: rgba(66, 180, 194, 0.15); }}
+        """)
+        self.now_playing.set_clickable(False)
+        self.now_playing.clicked.connect(self.nowPlayingClicked.emit)
         player_layout.addWidget(self.now_playing)
 
         self.prev_btn = QPushButton("⏮")
@@ -165,8 +196,9 @@ class AudioPlayerBar(QFrame):
         self.play_btn.setText("⏸" if playing else "▶")
 
     def set_now_playing(self, text: str):
-        """设置当前曲目文本"""
+        """设置当前曲目文本；播放中可点击跳转所属歌单，未播放时禁用"""
         self.now_playing.setText(text)
+        self.now_playing.set_clickable(bool(text) and text != "未播放")
 
     def set_duration(self, seconds: int):
         """设置进度条总长与总时长文本"""
