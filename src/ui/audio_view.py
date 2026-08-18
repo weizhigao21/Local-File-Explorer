@@ -40,15 +40,10 @@ class AudioMainWindow(QMainWindow):
 
         db.init_db()
 
-        # 播放器
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.player.setAudioOutput(self.audio_output)
-        self.player.positionChanged.connect(self._on_position_changed)
-        self.player.durationChanged.connect(self._on_duration_changed)
-        self.player.mediaStatusChanged.connect(self._on_media_status)
-        self.player.errorOccurred.connect(self._on_player_error)
-        self.audio_output.setVolume(0.8)
+        # 播放器（延迟初始化，避免阻塞窗口显示）
+        self._player = None
+        self._audio_output = None
+        self._player_initialized = False
 
         self.setStyleSheet(f"QMainWindow {{ background-color: {BG_MAIN}; }}")
         self._setup_ui()
@@ -58,6 +53,31 @@ class AudioMainWindow(QMainWindow):
         # 自动后台扫描（延迟 500ms，让 UI 先渲染）
         self._auto_scanning = True
         QTimer.singleShot(500, self.start_scan)
+
+    # ==================== 播放器（延迟初始化） ====================
+    @property
+    def player(self):
+        self._ensure_player()
+        return self._player
+
+    @property
+    def audio_output(self):
+        self._ensure_player()
+        return self._audio_output
+
+    def _ensure_player(self):
+        """延迟初始化 QMediaPlayer（首次使用时创建，避免阻塞窗口显示）"""
+        if self._player_initialized:
+            return
+        self._player_initialized = True
+        self._player = QMediaPlayer()
+        self._audio_output = QAudioOutput()
+        self._player.setAudioOutput(self._audio_output)
+        self._player.positionChanged.connect(self._on_position_changed)
+        self._player.durationChanged.connect(self._on_duration_changed)
+        self._player.mediaStatusChanged.connect(self._on_media_status)
+        self._player.errorOccurred.connect(self._on_player_error)
+        self._audio_output.setVolume(0.8)
 
     # ==================== UI 构建 ====================
     def _setup_ui(self):
@@ -503,11 +523,13 @@ class AudioMainWindow(QMainWindow):
         AudioSettingsDialog(self).exec()
 
     def _back_to_launcher(self):
-        self.player.stop()
+        if self._player_initialized:
+            self._player.stop()
         self.close()
 
     def closeEvent(self, event):
-        self.player.stop()
+        if self._player_initialized:
+            self._player.stop()
         # 等待后台 mtime 迁移线程结束，避免向已删除的窗口发射信号
         if self._mtime_thread and self._mtime_thread.isRunning():
             self._mtime_thread.wait(2000)

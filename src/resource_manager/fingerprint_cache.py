@@ -201,11 +201,33 @@ def update(root=None, extensions=None, level="file"):
     else:
         current = compute_fingerprint(root, extensions=extensions)
         field = "file_fingerprint"
+    _update_cache(root, current, field, level)
+
+
+def update_with_fingerprint(root, fingerprint, level="file"):
+    """使用已计算的指纹值更新缓存（避免重复遍历目录树）
+
+    在扫描流程中，预检阶段已计算过指纹，扫描完成后直接传入复用，
+    消除 update() 中再次调用 compute_dir_fingerprint() 的冗余 IO。
+
+    Args:
+        root: 根目录路径
+        fingerprint: 已计算的指纹字符串
+        level: "file" 或 "dir"
+    """
+    if not fingerprint:
+        return
+    field = "dir_fingerprint" if level == "dir" else "file_fingerprint"
+    _update_cache(root, fingerprint, field, level)
+
+
+def _update_cache(root, fingerprint, field, level):
+    """内部函数：更新指纹缓存"""
     cache = _load_cache()
     record = cache.get(root, {})
     if not isinstance(record, dict):
         record = {}
-    record[field] = current
+    record[field] = fingerprint
     record["level"] = level
     record["updated_at"] = int(time.time())
     cache[root] = record

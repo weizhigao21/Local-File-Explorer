@@ -5,6 +5,7 @@
 """
 import os
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from audio_manager import database as db
 from resource_manager import fingerprint_cache as fp
@@ -47,8 +48,13 @@ def _read_tags_file(tags_path):
 
 def _sync_playlist(folder_path, name, parent_path, existing, stats,
                    progress_callback=None, idx=None, total=None,
-                   allow_empty=False):
-    """同步单个文件夹的歌单和曲目"""
+                   allow_empty=False, pre_collected_files=None):
+    """同步单个文件夹的歌单和曲目
+
+    Args:
+        pre_collected_files: 可选，已由 _scan_dir 收集的音频文件列表 [(name, path), ...]，
+                            避免重复 os.listdir()。
+    """
     if progress_callback and idx is not None and total:
         progress_callback(idx, total, f"正在扫描: {name}")
 
@@ -62,13 +68,21 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
 
     tags = _read_tags_file(os.path.join(norm_folder, "标签.txt"))
 
-    # 收集音频文件
+    # 收集音频文件：优先使用预收集的列表，避免重复 os.listdir()
+    if pre_collected_files is not None:
+        audio_files = pre_collected_files
+    else:
+        audio_files = []
+        for fname in sorted(os.listdir(norm_folder), key=natural_key):
+            fpath = os.path.normpath(os.path.join(norm_folder, fname))
+            if os.path.isfile(fpath) and _is_audio(fpath):
+                audio_files.append((fname, fpath))
+
+    # 构建 tracks 列表
     tracks = []
-    for fname in sorted(os.listdir(norm_folder), key=natural_key):
-        fpath = os.path.normpath(os.path.join(norm_folder, fname))
-        if os.path.isfile(fpath) and _is_audio(fpath):
-            title = os.path.splitext(fname)[0]
-            tracks.append((title, fpath, 0, len(tracks) + 1))
+    for fname, fpath in audio_files:
+        title = os.path.splitext(fname)[0]
+        tracks.append((title, fpath, 0, len(tracks) + 1))
 
     # 无音频文件且不允许空歌单则跳过（容器歌单 allow_empty=True 时会创建）
     if not tracks and not allow_empty:
@@ -156,6 +170,7 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
             _sync_playlist(
                 current_dir, pl_name, parent_path, existing, stats,
                 progress_callback, counter["idx"], counter["total"],
+                pre_collected_files=audio_files,
             )
         except Exception as e:
             print(f"[音频扫描] 同步歌单失败 {current_dir}: {e}")
@@ -300,20 +315,43 @@ def scan(audio_root=None, audio_roots=None, progress_callback=None,
     # 保证所有根目录的歌单最终都平铺在顶层
     roots = sorted(roots, key=lambda r: r.count(os.sep) + r.count('/'))
 
-    # 指纹预检（逐根目录）：目录未变化则跳过该根目录
+    # 指纹预检（并行）：目录未变化则跳过该根目录
     # 使用目录级指纹（level="dir"）：只 stat 目录 mtime，捕获文件夹/音频增删，
     # 速度远快于文件级指纹。漏检"封面/标签文件内容被替换"——用户场景不涉及，可接受。
     existing_count = len(db.get_playlist_paths())
-    scan_roots = []
-    for r in roots:
-        unchanged = False
-        if check_fingerprint:
-            unchanged, _ = fp.is_unchanged(r, level="dir")
-        # 未变化且数据库非空 → 跳过该根目录；数据库为空（被手动删除等）则强制扫描
-        if unchanged and existing_count > 0:
-            print(f"[音频扫描] 目录指纹未变化，跳过扫描: {r}")
-        else:
-            scan_roots.append(r)
+    scan_roots_set = set()  # 用 set 快速查找
+    fingerprints = {}  # 记录每个根目录的指纹值，扫描完成后复用避免重复遍历
+
+    def _check_root_fingerprint(r):
+        """检查单个根目录的指纹是否变化"""
+        if not check_fingerprint:
+            return r, False, None
+        unchanged, fingerprint = fp.is_unchanged(r, level="dir")
+        return r, unchanged, fingerprint
+
+    # 并行计算多个根目录的指纹（每个根目录独立遍历目录树）
+    if len(roots) > 1:
+        with ThreadPoolExecutor(max_workers=min(len(roots), 4)) as executor:
+            futures = {executor.submit(_check_root_fingerprint, r): r for r in roots}
+            for future in as_completed(futures):
+                r, unchanged, fingerprint = future.result()
+                fingerprints[r] = fingerprint
+                if unchanged and existing_count > 0:
+                    print(f"[音频扫描] 目录指纹未变化，跳过扫描: {r}")
+                else:
+                    scan_roots_set.add(r)
+    else:
+        # 单根目录无需并行
+        for r in roots:
+            unchanged, fingerprint = fp.is_unchanged(r, level="dir") if check_fingerprint else (False, None)
+            fingerprints[r] = fingerprint
+            if unchanged and existing_count > 0:
+                print(f"[音频扫描] 目录指纹未变化，跳过扫描: {r}")
+            else:
+                scan_roots_set.add(r)
+
+    # 保持浅→深排序（嵌套根目录最晚扫描，其层级规则最后写入）
+    scan_roots = [r for r in roots if r in scan_roots_set]
 
     if not scan_roots:
         # 即使跳过扫描，仍需运行容器歌单聚合，确保 track_count 与代码逻辑一致
@@ -372,9 +410,13 @@ def scan(audio_root=None, audio_roots=None, progress_callback=None,
         progress_callback(1, 1, "正在整理曲目数...")
     _update_all_container_track_counts()
 
-    # 扫描完成后更新已扫描根目录的指纹缓存（与预检使用相同的 level）
+    # 扫描完成后更新已扫描根目录的指纹缓存（复用预检阶段计算的指纹，避免重复遍历）
     for root in scan_roots:
-        fp.update(root, level="dir")
+        cached_fp = fingerprints.get(root)
+        if cached_fp:
+            fp.update_with_fingerprint(root, cached_fp, level="dir")
+        else:
+            fp.update(root, level="dir")
 
     # "扫描完成"放在所有耗时操作之后，保证 finished 信号发出时 UI 可立即刷新
     if progress_callback:
