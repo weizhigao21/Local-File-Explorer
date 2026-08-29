@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QUrl, QTimer
 from PyQt6.QtGui import QShortcut, QKeySequence
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 
 from audio_manager import database as db
 from resource_manager import config
@@ -78,6 +78,31 @@ class AudioMainWindow(QMainWindow):
         self._player.mediaStatusChanged.connect(self._on_media_status)
         self._player.errorOccurred.connect(self._on_player_error)
         self._audio_output.setVolume(0.8)
+        # 记录当前绑定的播放设备，并监听系统音频设备变化（切换默认设备后重建输出）
+        self._bound_device_id = QMediaDevices.defaultAudioOutput().id()
+        self._media_devices = QMediaDevices(self)
+        self._media_devices.audioOutputsChanged.connect(self._on_audio_devices_changed)
+
+    def _on_audio_devices_changed(self):
+        """系统音频设备列表变化（拔插/切换设备）：重建音频输出以跟随新设备"""
+        if not self._player_initialized:
+            return
+        self._rebind_audio_output(force=True)
+
+    def _rebind_audio_output(self, force=False):
+        """把 QAudioOutput 重绑到系统当前默认播放设备
+
+        Windows 上 Qt 的 WMF 后端会把音频流绑定到开播时的设备端点，
+        不会跟随系统默认播放设备切换，导致切换设备后声音仍发往旧设备（表现为无声）。
+        因此在设备列表变化或每次开播前，显式把输出重绑到当前默认设备。
+        注：不能通过新建 QAudioOutput 替换（Qt 6.11 实测替换会丢绑定），
+        直接对现有输出 setDevice 即可，播放中重绑不中断。
+        """
+        default_dev = QMediaDevices.defaultAudioOutput()
+        if not force and default_dev.id() == self._bound_device_id:
+            return
+        self._audio_output.setDevice(default_dev)
+        self._bound_device_id = default_dev.id()
 
     # ==================== UI 构建 ====================
     def _setup_ui(self):
@@ -331,6 +356,7 @@ class AudioMainWindow(QMainWindow):
         if not os.path.exists(path):
             QMessageBox.warning(self, "文件不存在", f"找不到文件: {path}")
             return
+        self._rebind_audio_output()  # 开播前校验默认播放设备是否已切换
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
         self.player_bar.set_playing(True)

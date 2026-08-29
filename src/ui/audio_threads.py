@@ -1,15 +1,17 @@
 """
 音频模块后台线程
-扫描线程与 mtime 后台迁移线程
+扫描线程、mtime 迁移线程与曲目时长探测线程
 """
 import os
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from audio_manager import database as db
 from audio_manager import scanner as audio_scanner
+from audio_manager.duration import get_duration
 
 
 class AudioScanThread(QThread):
@@ -66,3 +68,38 @@ class MtimeMigrationThread(QThread):
             print(f"[音频] mtime 迁移失败: {e}")
             traceback.print_exc()
             self.migrated.emit(0)
+
+
+class DurationProbeThread(QThread):
+    """后台并行探测曲目时长，逐个回调主线程更新列表
+
+    由曲目详情页触发；gen 用于区分多次切换歌单，丢弃过期结果。
+    """
+    resolved = pyqtSignal(int, int, int)  # (gen, index, seconds)
+
+    def __init__(self, tracks, gen=0, parent=None):
+        super().__init__(parent)
+        self._tracks = list(tracks)
+        self._gen = gen
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        try:
+            paths = [t.get("path") for t in self._tracks]
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures = {ex.submit(get_duration, p): i for i, p in enumerate(paths)}
+                for fut in futures:
+                    if self._stop.is_set():
+                        break
+                    try:
+                        secs = fut.result()
+                    except Exception:
+                        secs = 0
+                    if secs > 0:
+                        self.resolved.emit(self._gen, futures[fut], secs)
+        except Exception as e:
+            print(f"[音频] 时长探测失败: {e}")
+            traceback.print_exc()

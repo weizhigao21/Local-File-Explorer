@@ -7,7 +7,8 @@ import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QPushButton, QScrollArea,
-    QListWidget, QListWidgetItem, QSizePolicy,
+    QTableWidget, QTableWidgetItem, QComboBox,
+    QHeaderView, QAbstractItemView, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
@@ -19,6 +20,7 @@ from ui.audio_theme import (
     TEXT_PRIMARY, TEXT_MUTED, TEXT_DIM, BTN_QSS,
 )
 from ui.audio_widgets import SubPlaylistCard
+from ui.audio_threads import DurationProbeThread
 
 
 class PlaylistDetailPage(QWidget):
@@ -88,7 +90,8 @@ class PlaylistDetailPage(QWidget):
         self.playlist_count = QLabel()
         self.playlist_count.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
         info_col.addWidget(self.playlist_count)
-        info_col.addStretch()
+        # 注意：这里不要 addStretch()——嵌套 stretch 会让信息行变为"可扩展"项，
+        # 在无曲目表的容器页会分到多余空间导致封面垂直居中、标题与封面顶部分离
         info_row.addLayout(info_col, 1)
         self.info_layout.addLayout(info_row)
 
@@ -98,59 +101,113 @@ class PlaylistDetailPage(QWidget):
         self.sub_header.setVisible(False)
         self.info_layout.addWidget(self.sub_header)
 
-        self.sub_scroll = QScrollArea()
-        self.sub_scroll.setWidgetResizable(True)
-        self.sub_scroll.setMaximumHeight(200)
-        self.sub_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.sub_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.sub_scroll.setStyleSheet("QScrollArea { background-color: transparent; border: none; }")
+        # 子歌单容器：直接挂在主布局上（外层 info_scroll 已提供整页滚动，无需内层滚动区）
+        # 横向铺满、纵向按内容高度：卡片紧贴"子歌单"标题下方，数量多时由外层滚动
         self.sub_cards = QWidget()
+        self.sub_cards.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.sub_vbox = QVBoxLayout(self.sub_cards)
         self.sub_vbox.setContentsMargins(0, 0, 0, 0)
         self.sub_vbox.setSpacing(2)
-        self.sub_cards.setLayout(self.sub_vbox)
-        self.sub_scroll.setWidget(self.sub_cards)
-        self.sub_scroll.setVisible(False)
-        self.info_layout.addWidget(self.sub_scroll)
+        self.sub_cards.setVisible(False)
+        self.info_layout.addWidget(self.sub_cards)
 
-        track_header = QLabel("曲目列表")
-        track_header.setStyleSheet(f"color: #BBB; font-size: 13px; font-weight: bold; padding-top: 8px;")
-        self.track_header = track_header
-        self.info_layout.addWidget(self.track_header)
+        # 曲目列表标题栏 + 类型筛选
+        self.info_layout.addWidget(self._build_track_header())
 
-        self.track_list = QListWidget()
+        self.track_list = QTableWidget(0, 4)
+        self.track_list.setHorizontalHeaderLabels(["#", "标题", "类型", "时长"])
+        self.track_list.verticalHeader().setVisible(False)
+        header = self.track_list.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.track_list.setColumnWidth(0, 44)
+        self.track_list.setColumnWidth(2, 70)
+        self.track_list.setColumnWidth(3, 70)
+        header.setHighlightSections(False)
+        header.setStyleSheet("QHeaderView::section { background: #F5F0E8; color: #999; border: none; "
+                             "border-bottom: 1px solid #E8E0D5; padding: 4px 8px; font-size: 11px; }")
         self.track_list.setStyleSheet(f"""
-            QListWidget {{
+            QTableWidget {{
                 background-color: {BG_MAIN}; color: #777;
                 border: 1px solid #EDE6DA; border-radius: 4px; outline: none;
+                gridline-color: #EFE9DE;
             }}
-            QListWidget::item {{
-                padding: 8px 12px; border-bottom: 1px solid #E8E0D5;
-            }}
-            QListWidget::item:hover {{ background-color: #EDE6DA; color: {TEXT_PRIMARY}; }}
-            QListWidget::item:selected {{
+            QTableWidget::item {{ padding: 4px 8px; border-bottom: 1px solid #E8E0D5; }}
+            QTableWidget::item:hover {{ background-color: #EDE6DA; color: {TEXT_PRIMARY}; }}
+            QTableWidget::item:selected {{
                 background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};
             }}
         """)
-        self.track_list.itemDoubleClicked.connect(self._on_track_double_clicked)
+        self.track_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.track_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.track_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.track_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.track_list.cellDoubleClicked.connect(self._on_track_double_clicked)
         self.info_layout.addWidget(self.track_list, 1)
+        # 末尾兜底空白：内容（子歌单卡片）不足一屏时收在顶部，下方留空
+        self.info_layout.addStretch()
 
         info_scroll.setWidget(info_content)
         layout.addWidget(info_scroll, 1)
 
         # 内部状态
-        self._tracks_paths = []          # 当前展示列表的曲目 dict（与 track_list 顺序一致）
+        self._tracks_paths = []          # 当前展示的笑单完整曲目 dict（原始序号）
         self._sub_playlists = []         # 当前展示的子歌单列表
+        self._track_types = []           # 每首曲目的文件类型（大写扩展名）
+        self._durations = {}             # 原始序 -> 秒数（数据库 + 后台探测）
+        self._visible_orig = []          # 当前表行对应的原始序号（受类型筛选影响）
+        self._selected_type = ""         # 当前类型筛选（""=全部）
+        self._probe_thread = None        # 曲目时长后台探测线程
+        self._probe_gen = 0              # 探测代数，切换歌单后丢弃过期结果
 
     # ── 信号桥 ──
 
     def _back_clicked(self):
         self.backClicked.emit()
 
-    def _on_track_double_clicked(self, item):
-        d = item.data(Qt.ItemDataRole.UserRole)
-        if d is not None:
-            self.trackDoubleClicked.emit(d)
+    def _on_track_double_clicked(self, row, _col):
+        """双击曲目行：发出原始曲目序号（同窗口 _tracks_data 的索引）"""
+        if 0 <= row < len(self._visible_orig):
+            self.trackDoubleClicked.emit(self._visible_orig[row])
+
+    def _build_track_header(self):
+        """构建"曲目列表"标题栏与类型筛选下拉框"""
+        bar = QFrame()
+        self._track_header_bar = bar
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 8, 0, 0)
+        row.setSpacing(8)
+        title = QLabel("曲目列表")
+        title.setStyleSheet(f"color: #BBB; font-size: 13px; font-weight: bold; padding-top: 0;")
+        self.track_header = title
+        row.addWidget(title)
+        row.addStretch()
+        label = QLabel("类型:")
+        label.setStyleSheet("color: #BBB; font-size: 12px;")
+        self.type_filter = QComboBox()
+        self.type_filter.addItem("全部类型", "")
+        self.type_filter.setFixedWidth(110)
+        self.type_filter.setStyleSheet(f"""
+            QComboBox {{ background: #FFFFFF; color: {TEXT_PRIMARY}; border: 1px solid #E0D8CC;
+                          border-radius: 4px; padding: 2px 6px; font-size: 12px; }}
+            QComboBox::drop-down {{ border: none; width: 18px; }}
+            QComboBox QAbstractItemView {{ background: #FFFFFF; color: {TEXT_PRIMARY};
+                                           selection-background-color: {ACCENT_TINT};
+                                           selection-color: {TEXT_PRIMARY}; }}
+        """)
+        self.type_filter.currentIndexChanged.connect(self._on_type_filter_changed)
+        row.addWidget(label)
+        row.addWidget(self.type_filter)
+        return bar
+
+    def _on_type_filter_changed(self, _idx):
+        """类型筛选变化：重建当前显示行"""
+        self._selected_type = self.type_filter.currentData() or ""
+        self._rebuild_track_rows()
 
     def _on_sub_clicked(self, pl_id):
         self.subPlaylistClicked.emit(pl_id)
@@ -170,7 +227,7 @@ class PlaylistDetailPage(QWidget):
         pl_name: 歌单名称
         cover_path: 封面路径（可为 None）
         tags_str: 标签字符串
-        tracks: 曲目 dict 列表 [{"title", "path"}, ...]（展示列表）
+        tracks: 曲目 dict 列表 [{"title", "path", "duration"}, ...]（展示列表）
         sub_playlists: 后代歌单 dict 列表 [{id, name, track_count}, ...]
         """
         self._tracks_paths = tracks
@@ -180,29 +237,144 @@ class PlaylistDetailPage(QWidget):
         self._rebuild_tag_buttons(tags_str)
         self._set_cover(cover_path)
 
-        # 子歌单区域：2+ 子歌单时清空曲目区域保留布局；否则显示曲目列表
-        multi_child = len(sub_playlists) >= 2
-        if multi_child:
-            self.track_header.setVisible(True)
-            self.track_list.setVisible(True)
-            self.track_list.clear()
+        # 有子歌单即为容器：隐藏曲目区（表头+表格）、只显示子歌单卡片（更清爽），叶子歌单才显示曲目
+        has_children = bool(sub_playlists)
+        if has_children:
+            self._track_header_bar.setVisible(False)
+            self.track_list.setVisible(False)
+            self.track_list.setRowCount(0)
+            self._stop_probe()
+            self._rebuild_type_filter(set())
+            self._selected_type = ""
             self.playlist_count.setText(f"共 {len(sub_playlists)} 个子歌单")
         else:
-            self.track_header.setVisible(True)
+            self._track_header_bar.setVisible(True)
             self.track_list.setVisible(True)
             self.playlist_count.setText(f"共 {len(tracks)} 首曲目")
-            self.track_list.clear()
+            # 重建类型索引与类型筛选选项
+            self._track_types = [self._file_type(tr) for tr in tracks]
+            self._rebuild_type_filter(set(self._track_types))
+            self._selected_type = ""
+            # 时长优先取数据库已有值，缺失的交给后台探测补全
+            self._durations = {}
             for i, tr in enumerate(tracks):
-                title = tr.get("title") or os.path.basename(tr["path"])
-                item = QListWidgetItem(f"{i + 1}. {title}")
-                item.setData(Qt.ItemDataRole.UserRole, i)
-                self.track_list.addItem(item)
+                secs = tr.get("duration") or 0
+                if secs > 0:
+                    self._durations[i] = int(secs)
+            self._rebuild_track_rows()
+            self._start_probe(tracks)
 
         # 子歌单区域填充
-        if multi_child and sub_playlists:
+        if has_children and sub_playlists:
             self._rebuild_sub_cards(sub_playlists)
         else:
             self._clear_sub_cards()
+
+
+    @staticmethod
+    def _file_type(tr):
+        """从文件路径取大写扩展名作为类型（如 MP3 / FLAC）"""
+        ext = os.path.splitext((tr.get("path") or ""))[1]
+        return ext.lstrip(".").upper()
+
+
+    def _rebuild_type_filter(self, types):
+        """重建类型筛选下拉框选项（保留当前选中的项若仍存在）"""
+        cur = self.type_filter.currentData()
+        self.type_filter.blockSignals(True)
+        self.type_filter.clear()
+        self.type_filter.addItem("全部类型", "")
+        for t in sorted(types):
+            if t:
+                self.type_filter.addItem(t, t)
+        # 尽量保持原选中项
+        if cur and self.type_filter.findData(cur) >= 0:
+            self.type_filter.setCurrentIndex(self.type_filter.findData(cur))
+        else:
+            self.type_filter.setCurrentIndex(0)
+        self.type_filter.blockSignals(False)
+
+
+    def _rebuild_track_rows(self):
+        """按当前类型筛选重建表格内容（# / 标题 / 类型 / 时长）"""
+        self.track_list.setRowCount(0)
+        self._visible_orig = []
+        shown = []
+        for i, tr in enumerate(self._tracks_paths):
+            if self._selected_type and self._track_types[i] != self._selected_type:
+                continue
+            self._visible_orig.append(i)
+            title = tr.get("title") or os.path.basename(tr["path"])
+            shown.append((i, title))
+        self.track_list.setRowCount(len(shown))
+        for row, (i, title) in enumerate(shown):
+            self._set_row(row, i + 1, title, self._track_types[i], self._durations.get(i))
+        self._rehighlight_current_row()
+
+
+    def _set_row(self, row, number, title, ftype, secs):
+        """写入表格的一行数据（# / 标题 / 类型 / 时长）"""
+        cells = [str(number), title, ftype, self._fmt_time(secs)]
+        for col, text in enumerate(cells):
+            item = QTableWidgetItem(text)
+            if col != 1:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.track_list.setItem(row, col, item)
+
+
+    @staticmethod
+    def _fmt_time(secs):
+        """秒 → "mm:ss"（不足 1 秒显示为空，避免干扰列表）"""
+        if not secs or secs <= 0:
+            return ""
+        minutes = int(secs // 60)
+        seconds = int(round(secs % 60))
+        if seconds >= 60:
+            minutes += 1
+            seconds -= 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+
+    def _start_probe(self, tracks):
+        """启动后台时长探测线程，仅对缺少时长的曲目逐条回填（按原始序）"""
+        missing = [t for i, t in enumerate(tracks) if i not in self._durations]
+        self._stop_probe()
+        if not missing:
+            return
+        self._missing_orig = [i for i, t in enumerate(tracks) if i not in self._durations]
+        self._probe_gen += 1
+        gen = self._probe_gen
+        self._probe_thread = DurationProbeThread(missing, gen=gen)
+        self._probe_thread.resolved.connect(self._on_duration_resolved)
+        self._probe_thread.start()
+
+
+    def _on_duration_resolved(self, gen, pos, secs):
+        """收到一条曲目时长：存表并更新所有可见行对应的时长列"""
+        if gen != self._probe_gen or secs <= 0:
+            return
+        if pos >= len(self._missing_orig):
+            return
+        orig = self._missing_orig[pos]
+        self._durations[orig] = int(secs)
+        if orig in self._visible_orig:
+            row = self._visible_orig.index(orig)
+            self.track_list.item(row, 3).setText(self._fmt_time(secs))
+
+
+    def _stop_probe(self):
+        """停止并回收上一代的探测线程"""
+        if self._probe_thread:
+            self._probe_thread.stop()
+            self._probe_thread.resolved.disconnect(self._on_duration_resolved)
+            self._probe_thread.wait(500)
+            self._probe_thread = None
+            self._missing_orig = []
+
+
+    def _rehighlight_current_row(self):
+        """重新应用当前高亮（重建表格后保持选中态）"""
+        self.set_highlight_by_path(getattr(self, "_highlight_path", ""))
 
     def _set_cover(self, cover_path):
         got = False
@@ -245,7 +417,7 @@ class PlaylistDetailPage(QWidget):
             if item and item.widget():
                 item.widget().deleteLater()
         self.sub_header.setVisible(False)
-        self.sub_scroll.setVisible(False)
+        self.sub_cards.setVisible(False)
 
     def _rebuild_sub_cards(self, sub_playlists):
         """重建子歌单卡片"""
@@ -254,7 +426,7 @@ class PlaylistDetailPage(QWidget):
             return
 
         self.sub_header.setVisible(True)
-        self.sub_scroll.setVisible(True)
+        self.sub_cards.setVisible(True)
         for child in sub_playlists:
             card = SubPlaylistCard(child)
             card.clicked.connect(self._on_sub_clicked)
@@ -263,13 +435,16 @@ class PlaylistDetailPage(QWidget):
     # ── 高亮 ──
 
     def set_highlight_by_path(self, playing_path):
-        """按曲目路径高亮展示列表中的当前播放曲目（若存在于列表）"""
-        for i in range(self.track_list.count()):
-            it = self.track_list.item(i)
-            if not it:
-                continue
-            d = it.data(Qt.ItemDataRole.UserRole)
-            if d is not None and 0 <= d < len(self._tracks_paths):
-                if self._tracks_paths[d].get("path") == playing_path:
-                    self.track_list.setCurrentItem(it)
-                    break
+        """按曲目路径高亮展示列表中的当前播放曲目（若存在于过滤后的列表）"""
+        self._highlight_path = playing_path or ""
+        if not self._highlight_path:
+            return
+        for row, orig in enumerate(self._visible_orig):
+            if orig < len(self._tracks_paths):
+                if self._tracks_paths[orig].get("path") == self._highlight_path:
+                    self.track_list.selectRow(row)
+                    self.track_list.scrollToItem(
+                        self.track_list.item(row, 1),
+                        QAbstractItemView.ScrollHint.EnsureVisible,
+                    )
+                    return
