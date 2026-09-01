@@ -21,6 +21,7 @@ from ui.audio_theme import (
 )
 from ui.audio_widgets import SubPlaylistCard
 from ui.audio_threads import DurationProbeThread
+from audio_manager.dlsite_db import split_cv_names
 
 
 class PlaylistDetailPage(QWidget):
@@ -30,6 +31,7 @@ class PlaylistDetailPage(QWidget):
     tagClicked = pyqtSignal(str)
     trackDoubleClicked = pyqtSignal(int)
     backClicked = pyqtSignal()
+    dlsiteFieldClicked = pyqtSignal(str, str)  # (field: circle/cv, value)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -459,20 +461,33 @@ class PlaylistDetailPage(QWidget):
         self.dlsite_status.setVisible(True)
 
     def show_dlsite_info(self, info):
-        """渲染 DLsite 作品信息（层级：胶囊标签 → 元数据行 → 折叠分类/简介）"""
-        # 胶囊：社团 / CV（醒目主色）
+        """渲染 DLsite 作品信息（层级：胶囊标签 → 元数据行 → 折叠简介）
+
+        社团/CV 胶囊可点击：点击发出 dlsiteFieldClicked(field, value)，
+        由主窗口切回列表并按该维度过滤（与标签叠加 AND）。
+        """
+        # 胶囊：社团 / CV（醒目主色，可点击筛选；CV 多声优拆分为多个胶囊）
         self._clear_flow_layout(self.dlsite_caps_flow)
         capsules = []
         if info.get("circle"):
-            capsules.append(f"社团 · {info['circle']}")
-        if info.get("cv"):
-            capsules.append(f"CV · {info['cv']}")
+            capsules.append(("circle", info["circle"], f"社团 · {info['circle']}"))
+        for name in split_cv_names(info.get("cv") or ""):
+            capsules.append(("cv", name, f"CV · {name}"))
         if capsules:
-            for text in capsules:
-                pill = QLabel(text)
+            for field, value, text in capsules:
+                pill = QPushButton(text)
+                pill.setCursor(Qt.CursorShape.PointingHandCursor)
+                pill.setToolTip("点击筛选该" + ("社团" if field == "circle" else "CV"))
                 pill.setStyleSheet(
-                    f"background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};"
-                    "border-radius: 10px; padding: 3px 10px; font-size: 12px; font-weight: bold;"
+                    "QPushButton {"
+                    f"    background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};"
+                    "    border: none; border-radius: 10px; padding: 3px 10px;"
+                    "    font-size: 12px; font-weight: bold;"
+                    "}"
+                    "QPushButton:hover { background-color: #EFD9B8; }"
+                )
+                pill.clicked.connect(
+                    lambda _=False, f=field, v=value: self.dlsiteFieldClicked.emit(f, v)
                 )
                 self.dlsite_caps_flow.addWidget(pill)
             self.dlsite_capsules.setVisible(True)

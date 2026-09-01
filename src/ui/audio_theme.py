@@ -33,6 +33,24 @@ QPushButton:pressed {
 }
 """
 
+# 右键菜单样式：悬停时背景与文字颜色同时变化，避免浅底浅字看不清
+MENU_QSS = f"""
+QMenu {{
+    background-color: {BG_SIDEBAR}; color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER_COLOR}; border-radius: 6px;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 6px 24px; border-radius: 4px; font-size: 12px;
+}}
+QMenu::item:selected {{
+    background-color: {ACCENT}; color: #FFFFFF;
+}}
+QMenu::separator {{
+    height: 1px; background-color: {BORDER_COLOR}; margin: 4px 8px;
+}}
+"""
+
 
 def format_time(seconds):
     """将秒数格式化为 MM:SS"""

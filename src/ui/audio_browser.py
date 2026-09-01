@@ -14,12 +14,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 
 from audio_manager import database as db
+from audio_manager import dlsite_db
+from audio_manager.dlsite import extract_rj_code
 from resource_manager import config
 from ui.flow_layout import FlowLayout
-from ui.tag_widgets import TagChip, TagSelectorDialog, parse_tags
+from ui.tag_widgets import TagChip, FilterSelectorDialog, parse_tags
 from ui.audio_theme import (
     ACCENT, ACCENT_TINT, BG_MAIN, BG_SIDEBAR,
-    TEXT_PRIMARY, TEXT_MUTED, TEXT_DIM, BTN_QSS, get_basename,
+    TEXT_PRIMARY, TEXT_MUTED, TEXT_DIM, BTN_QSS, MENU_QSS, get_basename,
 )
 from ui.audio_widgets import PlaylistCard
 
@@ -36,7 +38,9 @@ class PlaylistBrowser(QWidget):
         self._filtered_cache = []  # 当前筛选/排序后的歌单缓存
         self._page_size = 30  # 每页歌单数
         self._current_page = 0  # 当前页码（0-based）
-        self._active_tags: set = set()  # 当前活动的标签过滤
+        self._active_tags: set = set()  # 当前活动的标签过滤（维内 AND）
+        self._dlsite_circles: set = set()  # 社团过滤（多选，维内 OR）
+        self._dlsite_cvs: set = set()      # CV 过滤（多选，维内 OR）
         self._search_timer = QTimer()  # 搜索防抖
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(300)
@@ -93,7 +97,7 @@ class PlaylistBrowser(QWidget):
         self.search_box.textChanged.connect(self._on_search_changed)
         nav_layout.addWidget(self.search_box)
 
-        # 标签选择器按钮
+        # 联合筛选选择器按钮（标签/CV/社团）
         self.tag_selector_btn = QPushButton("+")
         self.tag_selector_btn.setFixedSize(26, 26)
         self.tag_selector_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -105,8 +109,8 @@ class PlaylistBrowser(QWidget):
             }}
             QPushButton:hover {{ background-color: #48B8BC; }}
         """)
-        self.tag_selector_btn.setToolTip("按标签筛选")
-        self.tag_selector_btn.clicked.connect(self._open_tag_selector)
+        self.tag_selector_btn.setToolTip("添加筛选条件（标签 / CV / 社团）")
+        self.tag_selector_btn.clicked.connect(self._open_filter_selector)
         nav_layout.addWidget(self.tag_selector_btn)
 
         # 排序
@@ -331,6 +335,11 @@ class PlaylistBrowser(QWidget):
         if self._active_tags:
             filtered = [pl for pl in filtered if self._playlist_matches_tags(pl)]
 
+        # DLsite 社团/CV 过滤（与标签叠加跨维度 AND；无 RJ 码或未抓取的歌单不匹配）
+        if self._dlsite_circles or self._dlsite_cvs:
+            rjs = dlsite_db.find_rjs_by(circles=self._dlsite_circles, cvs=self._dlsite_cvs)
+            filtered = [pl for pl in filtered if extract_rj_code(pl["name"]) in rjs]
+
         # 排序
         idx = self.sort_selector.currentIndex() if hasattr(self, 'sort_selector') else 0
         if idx <= 1:
@@ -350,7 +359,7 @@ class PlaylistBrowser(QWidget):
 
         total = len(self._all_playlists)
         shown = len(self._filtered_cache)
-        if self._active_tags:
+        if self._active_tags or self._dlsite_circles or self._dlsite_cvs:
             self.count_label.setText(f"共 {shown} 个歌单" if shown else "")
         elif text:
             self.count_label.setText(f"搜索: {shown}/{total} 个歌单")
@@ -448,43 +457,94 @@ class PlaylistBrowser(QWidget):
         self._apply_filter()
 
     def clear_tags(self):
-        """清除所有标签过滤"""
+        """清除所有标签过滤（含社团/CV 过滤）"""
         self._active_tags.clear()
+        self._dlsite_circles.clear()
+        self._dlsite_cvs.clear()
         self.search_box.setVisible(True)
         self.search_box.clear()
         self._sync_tag_ui()
         self._apply_filter()
 
-    def _open_tag_selector(self):
-        """打开标签选择器窗口"""
-        all_tags = db.get_all_tags()
-        if not all_tags:
-            return
-        dialog = TagSelectorDialog(all_tags, self)
+    # ── DLsite 社团/CV 过滤（与标签叠加 AND） ──
+
+    def filter_by_dlsite(self, field, value):
+        """切换社团/CV 过滤：已选中则移除，未选中则加入（多选，维内 OR）"""
+        target = self._dlsite_circles if field == "circle" else self._dlsite_cvs
+        if value in target:
+            target.discard(value)
+        else:
+            target.add(value)
+        self._sync_tag_ui()
+        self._apply_filter()
+
+    def set_dlsite_filters(self, circles, cvs):
+        """批量设置社团/CV 过滤（选择器确定时调用）"""
+        self._dlsite_circles = set(circles)
+        self._dlsite_cvs = set(cvs)
+        self._sync_tag_ui()
+        self._apply_filter()
+
+    def _on_dlsite_chip_removed(self, field, value):
+        """移除单个社团/CV 过滤（导航栏芯片 × 按钮）"""
+        target = self._dlsite_circles if field == "circle" else self._dlsite_cvs
+        target.discard(value)
+        self._sync_tag_ui()
+        self._apply_filter()
+
+    def _open_filter_selector(self):
+        """打开联合筛选选择器窗口（标签/CV/社团 三个页签）"""
+        dialog = FilterSelectorDialog(
+            all_tags=db.get_all_tags(),
+            circle_counts=dlsite_db.get_circle_counts(),
+            cv_counts=dlsite_db.get_cv_counts(),
+            selected_tags=self._active_tags,
+            selected_circles=self._dlsite_circles,
+            selected_cvs=self._dlsite_cvs,
+            parent=self,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            selected = dialog.get_selected_tags()
-            if selected:
-                self.filter_by_tags(set(selected))
+            tags, circles, cvs = dialog.get_selected()
+            self.filter_by_tags(set(tags))
+            self.set_dlsite_filters(circles, cvs)
 
     def _sync_tag_ui(self):
-        """同步标签芯片 UI 与 _active_tags 状态"""
+        """同步标签/社团/CV 芯片 UI 与过滤状态"""
         # 清除旧芯片
         while self._tag_bar_layout.count():
             item = self._tag_bar_layout.takeAt(0)
             if item and item.widget():
                 item.widget().deleteLater()
 
+        has_any_filter = bool(self._active_tags or self._dlsite_circles or self._dlsite_cvs)
+
         if self._active_tags:
             for tag in sorted(self._active_tags, key=str.lower):
                 chip = TagChip(tag)
                 chip.removed.connect(self._on_tag_removed)
                 self._tag_bar_layout.addWidget(chip)
+
+        for circle in sorted(self._dlsite_circles):
+            chip = TagChip(f"社团: {circle}")
+            chip.removed.connect(
+                lambda _t, c=circle: self._on_dlsite_chip_removed("circle", c)
+            )
+            self._tag_bar_layout.addWidget(chip)
+
+        for cv in sorted(self._dlsite_cvs):
+            chip = TagChip(f"CV: {cv}")
+            chip.removed.connect(
+                lambda _t, v=cv: self._on_dlsite_chip_removed("cv", v)
+            )
+            self._tag_bar_layout.addWidget(chip)
+
+        if has_any_filter:
             self._tag_bar_layout.addStretch()
             self._tag_bar.setVisible(True)
         else:
             self._tag_bar.setVisible(False)
 
-        self.search_box.setVisible(not bool(self._active_tags))
+        self.search_box.setVisible(not has_any_filter)
 
     def _playlist_matches_tags(self, pl):
         """检查歌单是否匹配所有活动标签（AND 逻辑）"""
@@ -580,6 +640,7 @@ class PlaylistBrowser(QWidget):
         if not pl_path:
             return
         menu = QMenu(self)
+        menu.setStyleSheet(MENU_QSS)
         copy_action = menu.addAction("复制歌单名称")
         copy_action.triggered.connect(lambda: QApplication.clipboard().setText(pl_name))
         menu.addSeparator()

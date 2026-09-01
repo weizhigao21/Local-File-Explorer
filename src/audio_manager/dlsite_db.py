@@ -7,10 +7,23 @@ DLsite 作品信息独立数据库（data/dlsite.db）。
 """
 import json
 import os
+import re
 import sqlite3
 import time
 
 from resource_manager import config
+
+
+def split_cv_names(cv_text):
+    """把 DLsite 的 CV 字段拆成单个声优名列表（兼容 / ／ 、 , ， ; ； 等分隔符）"""
+    if not cv_text:
+        return []
+    names = []
+    for part in re.split(r"[/／、,，;；]", str(cv_text)):
+        part = part.strip()
+        if part and part not in names:
+            names.append(part)
+    return names
 
 # 连接级配置：WAL + 忙等待，多线程短连接友好
 _CONN_KWARGS = dict(timeout=10)
@@ -162,6 +175,65 @@ def get_genre_map() -> dict:
         if isinstance(gs, list) and gs:
             out[r["rj_code"]] = gs
     return out
+
+
+def find_rjs_by(circles=None, cvs=None) -> set:
+    """按社团/CV 集合查询 RJ 码集合。
+
+    语义：同维度内 OR（命中任一即可），跨维度 AND（社团与 CV 需同时满足）。
+    社团精确匹配、CV 子串匹配，均大小写不敏感；均为空返回空集合。
+    仅在抓取成功的记录中查找。
+    """
+    circ = {c.strip().lower() for c in (circles or []) if c and str(c).strip()}
+    cvs_l = {c.strip().lower() for c in (cvs or []) if c and str(c).strip()}
+    if not circ and not cvs_l:
+        return set()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT rj_code, circle, cv FROM works "
+            "WHERE title IS NOT NULL AND title != '' AND error IS NULL"
+        ).fetchall()
+    hits = set()
+    for r in rows:
+        if circ and (r["circle"] or "").strip().lower() not in circ:
+            continue
+        if cvs_l:
+            cv_field = (r["cv"] or "").strip().lower()
+            if not any(name in cv_field for name in cvs_l):
+                continue
+        hits.add(r["rj_code"])
+    return hits
+
+
+def get_circle_counts() -> dict:
+    """返回 {社团名: 作品数}（仅抓取成功的记录），按作品数降序排序"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT circle FROM works "
+            "WHERE title IS NOT NULL AND title != '' AND error IS NULL "
+            "AND circle IS NOT NULL AND circle != ''"
+        ).fetchall()
+    counts = {}
+    for r in rows:
+        name = (r["circle"] or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def get_cv_counts() -> dict:
+    """返回 {声优名: 作品数}（CV 字段拆分后聚合），按作品数降序排序"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT cv FROM works "
+            "WHERE title IS NOT NULL AND title != '' AND error IS NULL "
+            "AND cv IS NOT NULL AND cv != ''"
+        ).fetchall()
+    counts = {}
+    for r in rows:
+        for name in split_cv_names(r["cv"]):
+            counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
 def search_by_genres(required) -> set:

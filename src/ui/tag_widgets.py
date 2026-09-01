@@ -5,7 +5,7 @@ import re
 
 from PyQt6.QtWidgets import (
     QPushButton, QFrame, QHBoxLayout, QVBoxLayout, QLabel, QWidget,
-    QDialog, QListWidget, QListWidgetItem, QLineEdit,
+    QDialog, QListWidget, QListWidgetItem, QLineEdit, QTabWidget,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -153,91 +153,183 @@ class TagFilterWidget(QWidget):
 
 
 # =============================================================
-#  TagSelectorDialog — 全量标签选择窗口（多选）
+#  FilterSelectorDialog — 联合筛选选择窗口（标签 / CV / 社团 三个页签）
 # =============================================================
 BG_SIDEBAR = "#FDF9F2"
 BORDER_COLOR = "#D5CDC0"
 
+_LIST_QSS = f"""
+    QListWidget {{
+        background-color: #FFFFFF; color: {TEXT_PRIMARY};
+        border: 1px solid {BORDER_COLOR}; border-radius: 4px;
+        outline: none;
+    }}
+    QListWidget::item {{
+        padding: 6px 8px; border-bottom: 1px solid #E8E0D5;
+    }}
+    QListWidget::item:hover {{ background-color: {ACCENT_TINT}; }}
+    QListWidget::item:selected {{
+        background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};
+    }}
+"""
 
-class TagSelectorDialog(QDialog):
-    """显示所有歌单标签，支持勾选多选，确定后返回选中标签"""
+_SEARCH_QSS = f"""
+    QLineEdit {{
+        background-color: #EDE6DA; color: {TEXT_PRIMARY};
+        border: 1px solid {BORDER_COLOR}; border-radius: 4px;
+        padding: 4px 8px; font-size: 12px;
+    }}
+    QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+"""
 
-    def __init__(self, all_tags: list[str], parent=None):
+_BTN_QSS = f"""
+    QPushButton {{
+        background-color: {TAG_BG}; color: {TEXT_PRIMARY};
+        border: 1px solid {BORDER_COLOR}; border-radius: 4px;
+        padding: 4px 12px; font-size: 12px;
+    }}
+    QPushButton:hover {{ border: 1px solid {ACCENT}; }}
+"""
+
+
+class _CheckListTab(QWidget):
+    """选择器单个页签：搜索框 + 可勾选列表（显示文本带计数，UserRole 存实际筛选值）"""
+
+    def __init__(self, placeholder, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择标签")
-        self.setFixedSize(320, 420)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText(placeholder)
+        self.search_box.setStyleSheet(_SEARCH_QSS)
+        self.search_box.textChanged.connect(self._filter)
+        layout.addWidget(self.search_box)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet(_LIST_QSS)
+        self.list_widget.itemClicked.connect(self._toggle_item)  # 点击整行即切换勾选
+        layout.addWidget(self.list_widget, 1)
+
+    def set_items(self, display_items):
+        """display_items: [(显示文本, 实际值, 是否预勾选), ...]"""
+        self.list_widget.clear()
+        for text, value, checked in display_items:
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, value)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            self.list_widget.addItem(item)
+
+    def get_checked_values(self) -> list:
+        """返回所有勾选项的实际值（非显示文本）"""
+        return [
+            self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.list_widget.count())
+            if self.list_widget.item(i).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _toggle_item(self, item):
+        """单击行内任意位置切换勾选状态（无需精确点中小方框）"""
+        if item.checkState() == Qt.CheckState.Checked:
+            item.setCheckState(Qt.CheckState.Unchecked)
+        else:
+            item.setCheckState(Qt.CheckState.Checked)
+
+    def _filter(self, text):
+        text = text.strip().lower()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            item.setHidden(bool(text) and text not in item.text().lower())
+
+    def select_all(self):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def clear_all(self):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+
+class FilterSelectorDialog(QDialog):
+    """联合筛选选择窗口：标签 / CV / 社团 三个页签，各自独立搜索与多选。
+
+    确定后返回 (tags, circles, cvs) 三元组；
+    CV/社团条目附带作品数辅助挑选；已激活的条件会预勾选。
+    """
+
+    def __init__(self, all_tags, circle_counts, cv_counts,
+                 selected_tags=None, selected_circles=None, selected_cvs=None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加筛选条件")
+        self.setFixedSize(380, 480)
         self.setStyleSheet(f"QDialog {{ background-color: {BG_SIDEBAR}; color: {TEXT_PRIMARY}; }}")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
 
-        title = QLabel("选择要过滤的标签（可多选）")
+        title = QLabel("选择筛选条件（同页签内多选取「或」，页签之间叠加取「与」）")
         title.setStyleSheet(
-            f"color: {TEXT_PRIMARY}; font-size: 14px; font-weight: bold; border: none;"
+            f"color: {TEXT_PRIMARY}; font-size: 13px; font-weight: bold; border: none;"
         )
         layout.addWidget(title)
 
-        # 搜索输入框
-        self._search_box = QLineEdit()
-        self._search_box.setPlaceholderText("搜索标签...")
-        self._search_box.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: #EDE6DA; color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 4px;
-                padding: 4px 8px; font-size: 12px;
-            }}
-            QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
-        """)
-        self._search_box.textChanged.connect(self._filter_tags)
-        layout.addWidget(self._search_box)
+        selected_tags = set(selected_tags or [])
+        selected_circles = set(selected_circles or [])
+        selected_cvs = set(selected_cvs or [])
 
-        self.list_widget = QListWidget()
-        self.list_widget.setStyleSheet(f"""
-            QListWidget {{
-                background-color: #FFFFFF; color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 4px;
-                outline: none;
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {BORDER_COLOR}; border-radius: 4px; background: #FFFFFF;
             }}
-            QListWidget::item {{
-                padding: 6px 8px; border-bottom: 1px solid #E8E0D5;
+            QTabBar::tab {{
+                background: {TAG_BG}; color: {TEXT_PRIMARY};
+                padding: 5px 18px; border-top-left-radius: 4px; border-top-right-radius: 4px;
+                font-size: 12px;
             }}
-            QListWidget::item:hover {{ background-color: {ACCENT_TINT}; }}
-            QListWidget::item:selected {{
-                background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};
-            }}
+            QTabBar::tab:selected {{ background: {ACCENT}; color: #fff; }}
         """)
 
-        self._all_tags = all_tags
-        for tag in all_tags:
-            item = QListWidgetItem(tag)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            self.list_widget.addItem(item)
+        self.tag_tab = _CheckListTab("搜索标签...")
+        self.tag_tab.set_items([(t, t, t in selected_tags) for t in all_tags])
+        self.tabs.addTab(self.tag_tab, f"标签 {len(all_tags)}")
 
-        layout.addWidget(self.list_widget, 1)
+        self.circle_tab = _CheckListTab("搜索社团...")
+        self.circle_tab.set_items([
+            (f"{name}（{count}）", name, name in selected_circles)
+            for name, count in circle_counts.items()
+        ])
+        self.tabs.addTab(self.circle_tab, f"社团 {len(circle_counts)}")
+
+        self.cv_tab = _CheckListTab("搜索声优...")
+        self.cv_tab.set_items([
+            (f"{name}（{count}）", name, name in selected_cvs)
+            for name, count in cv_counts.items()
+        ])
+        self.tabs.addTab(self.cv_tab, f"CV {len(cv_counts)}")
+
+        layout.addWidget(self.tabs, 1)
 
         # 按钮
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(6)
 
-        select_all_btn = QPushButton("全选")
+        select_all_btn = QPushButton("全选本页")
         select_all_btn.setFixedHeight(28)
-        select_all_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {TAG_BG}; color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 4px;
-                padding: 4px 12px; font-size: 12px;
-            }}
-            QPushButton:hover {{ border: 1px solid {ACCENT}; }}
-        """)
-        select_all_btn.clicked.connect(self._select_all)
+        select_all_btn.setStyleSheet(_BTN_QSS)
+        select_all_btn.clicked.connect(lambda: self.tabs.currentWidget().select_all())
         btn_layout.addWidget(select_all_btn)
 
-        clear_btn = QPushButton("清除")
+        clear_btn = QPushButton("清空本页")
         clear_btn.setFixedHeight(28)
-        clear_btn.setStyleSheet(select_all_btn.styleSheet())
-        clear_btn.clicked.connect(self._clear_all)
+        clear_btn.setStyleSheet(_BTN_QSS)
+        clear_btn.clicked.connect(lambda: self.tabs.currentWidget().clear_all())
         btn_layout.addWidget(clear_btn)
 
         btn_layout.addStretch()
@@ -257,39 +349,16 @@ class TagSelectorDialog(QDialog):
 
         cancel_btn = QPushButton("取消")
         cancel_btn.setFixedHeight(28)
-        cancel_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {TAG_BG}; color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 4px;
-                padding: 4px 12px; font-size: 12px;
-            }}
-            QPushButton:hover {{ border: 1px solid {ACCENT}; }}
-        """)
+        cancel_btn.setStyleSheet(_BTN_QSS)
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
 
         layout.addLayout(btn_layout)
 
-    def get_selected_tags(self) -> list[str]:
-        """返回所有勾选的标签"""
-        result = []
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                result.append(item.text())
-        return result
-
-    def _select_all(self):
-        for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setCheckState(Qt.CheckState.Checked)
-
-    def _clear_all(self):
-        for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setCheckState(Qt.CheckState.Unchecked)
-
-    def _filter_tags(self, text: str):
-        """按搜索文本过滤标签列表"""
-        text = text.strip().lower()
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            item.setHidden(bool(text) and text not in item.text().lower())
+    def get_selected(self):
+        """返回 (tags, circles, cvs) 三个值列表"""
+        return (
+            self.tag_tab.get_checked_values(),
+            self.circle_tab.get_checked_values(),
+            self.cv_tab.get_checked_values(),
+        )

@@ -108,7 +108,9 @@ class PlaylistCard(QFrame):
 
     def contextMenuEvent(self, event):
         from PyQt6.QtWidgets import QMenu
+        from ui.audio_theme import MENU_QSS
         menu = QMenu(self)
+        menu.setStyleSheet(MENU_QSS)
         copy_action = menu.addAction("复制歌单名称")
         copy_action.triggered.connect(lambda: QApplication.clipboard().setText(self._pl_name))
         menu.addSeparator()

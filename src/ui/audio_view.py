@@ -164,6 +164,7 @@ class AudioMainWindow(QMainWindow):
         self.detail.backClicked.connect(self._detail_back)
         self.detail.subPlaylistClicked.connect(self._open_sub_playlist)
         self.detail.tagClicked.connect(self._on_tag_clicked)
+        self.detail.dlsiteFieldClicked.connect(self._on_dlsite_field_clicked)
         self.detail.trackDoubleClicked.connect(self._on_track_double_clicked)
         self.page_stack.addWidget(self.detail)  # index 1
 
@@ -602,6 +603,11 @@ class AudioMainWindow(QMainWindow):
         """点击标签按钮 → 返回歌单浏览器并追加标签过滤（与已有标签叠加 AND 逻辑）"""
         self.page_stack.setCurrentIndex(0)
         self.browser.filter_by_tag(tag)
+
+    def _on_dlsite_field_clicked(self, field, value):
+        """点击社团/CV 胶囊 → 返回浏览器并按该维度过滤（同值再点取消，异值替换）"""
+        self.page_stack.setCurrentIndex(0)
+        self.browser.filter_by_dlsite(field, value)
 
     # ==================== 播放控制 ====================
     def _on_track_double_clicked(self, index):

@@ -29,7 +29,10 @@ HEADERS = {
 COOKIES = {"locale": "zh-cn", "adultchecked": "1"}
 
 # RJ 码（兼容新旧位数，如 RJ01196889 / RJ283610）
-_RJ_RE = re.compile(r"\b(RJ\d{6,10})\b", re.IGNORECASE)
+# 注意：不能用 \b 词边界——Python 的 \w 把 CJK 汉字当单词字符，
+# "RJ01155419付" 中数字与汉字之间不构成 \b 会导致提取失败。
+# 这里只要求 RJ 后面不是紧跟更多数字即可。
+_RJ_RE = re.compile(r"(RJ\d{6,10})(?!\d)", re.IGNORECASE)
 
 
 def extract_rj_code(name: str) -> str | None:
