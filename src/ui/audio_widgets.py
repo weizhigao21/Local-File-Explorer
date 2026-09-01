@@ -92,7 +92,8 @@ class PlaylistCard(QFrame):
         if self._cover_path:
             QTimer.singleShot(1, self._load_cover)
 
-    def mousePressEvent(self, event):
+    def mouseReleaseEvent(self, event):
+        # 用 release 而非 press 触发：避免双击/页面切换瞬间按压落点偏移导致误开歌单
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.pl_id)
 
@@ -165,8 +166,9 @@ class SubPlaylistCard(QFrame):
         arrow.setStyleSheet("color: #555; font-size: 10px;")
         layout.addWidget(arrow)
 
-    def mousePressEvent(self, event):
-        self.clicked.emit(self.pl_id)
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.pl_id)
 
 
 # =============================================================

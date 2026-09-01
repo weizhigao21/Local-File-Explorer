@@ -36,16 +36,6 @@ def _is_within(path, root):
     return path == root or path.startswith(root + os.sep) or path.startswith(root + "/")
 
 
-def _read_tags_file(tags_path):
-    if not os.path.exists(tags_path):
-        return ""
-    try:
-        with open(tags_path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-
 def _sync_playlist(folder_path, name, parent_path, existing, stats,
                    progress_callback=None, idx=None, total=None,
                    allow_empty=False, pre_collected_files=None):
@@ -65,8 +55,6 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
         cover = os.path.join(norm_folder, "cover.jpg")
         if not os.path.exists(cover):
             cover = None
-
-    tags = _read_tags_file(os.path.join(norm_folder, "标签.txt"))
 
     # 收集音频文件：优先使用预收集的列表，避免重复 os.listdir()
     if pre_collected_files is not None:
@@ -90,7 +78,8 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
 
     if norm_folder in existing:
         pid = existing[norm_folder]
-        db.update_playlist(pid, cover=cover, tags=tags,
+        # 标签不再由扫描器写入：标签统一来自 DLsite 网络分类（由 audio_view 同步管理）
+        db.update_playlist(pid, cover=cover,
                            track_count=len(tracks),
                            name=name, parent_path=parent_path,
                            mtime=os.path.getmtime(norm_folder))
@@ -112,13 +101,13 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
         row = db.get_playlist_by_path(norm_folder)
         if row:
             db.update_playlist(row["id"], parent_path=parent_path, name=name,
-                               cover=cover, tags=tags,
+                               cover=cover,
                                mtime=os.path.getmtime(norm_folder))
             existing[norm_folder] = row["id"]
             stats["skipped"] += 1
             return
         pid = db.add_playlist(name, norm_folder, cover=cover,
-                              tags=tags, parent_path=parent_path,
+                              parent_path=parent_path,
                               mtime=os.path.getmtime(norm_folder))
         if pid and tracks:
             db.add_tracks(pid, tracks)

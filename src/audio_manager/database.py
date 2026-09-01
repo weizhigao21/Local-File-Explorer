@@ -240,6 +240,37 @@ def update_playlist(playlist_id, cover=None, tags=None, track_count=None,
         )
 
 
+def update_playlists_batch(updates):
+    """批量更新歌单字段（单连接单事务，供 DLsite 信息同步等批量场景）
+
+    updates: [(playlist_id, {field: value}), ...]，field 仅支持 cover/tags/track_count/mtime
+    """
+    if not updates:
+        return
+    with _active_conn() as conn:
+        for pid, fields in updates:
+            sets = []
+            params = []
+            for k in ("cover", "tags", "track_count", "mtime"):
+                if fields.get(k) is not None:
+                    sets.append(f"{k} = ?")
+                    params.append(fields[k])
+            if sets:
+                params.append(pid)
+                conn.execute(
+                    f"UPDATE playlists SET {', '.join(sets)} WHERE id = ?", params
+                )
+
+
+def list_playlists_by_rj(rj):
+    """按歌单名模糊匹配 RJ 码（抓取完成后精准同步，避免全表扫描卡 UI）"""
+    with _active_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, name, cover, tags FROM playlists WHERE name LIKE ?",
+            (f"%{rj}%",)
+        ).fetchall()]
+
+
 def delete_playlist(playlist_id):
     """删除歌单及所有子歌单、曲目（递归CTE批量删除，替代逐层递归N+1）"""
     pl = get_playlist(playlist_id)

@@ -3,16 +3,19 @@
 组装歌单浏览器、歌单详情页、播放条与扫描逻辑
 """
 import os
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QMessageBox, QStackedWidget,
+    QDialog, QPlainTextEdit, QProgressBar,
 )
 from PyQt6.QtCore import QUrl, QTimer
 from PyQt6.QtGui import QShortcut, QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 
 from audio_manager import database as db
+from audio_manager import dlsite, dlsite_db
 from resource_manager import config
 from ui.audio_theme import (
     BG_MAIN, BG_SIDEBAR, TEXT_PRIMARY, BTN_QSS,
@@ -21,7 +24,7 @@ from ui.audio_widgets import AudioSettingsDialog
 from ui.audio_browser import PlaylistBrowser
 from ui.audio_player import AudioPlayerBar
 from ui.audio_detail import PlaylistDetailPage
-from ui.audio_threads import AudioScanThread, MtimeMigrationThread
+from ui.audio_threads import AudioScanThread, MtimeMigrationThread, DlsiteWorker
 
 
 class AudioMainWindow(QMainWindow):
@@ -37,8 +40,16 @@ class AudioMainWindow(QMainWindow):
         self._tracks_data = []
         self._play_queue = []  # 独立播放队列（导航/切歌单时保持播放）
         self._mtime_thread = None  # 后台 mtime 迁移线程
+        self._dlsite_thread = None  # DLsite 信息后台抓取线程
+        self._current_dlsite_rj = None  # 当前详情页歌单对应的 RJ 码
+        self._browser_refresh_deferred = False  # 详情页期间推迟的列表刷新
 
         db.init_db()
+        if dlsite.AVAILABLE:
+            try:
+                dlsite_db.init_db()
+            except Exception as e:
+                print(f"[DLsite] 数据库初始化失败: {e}")
 
         # 播放器（延迟初始化，避免阻塞窗口显示）
         self._player = None
@@ -98,6 +109,7 @@ class AudioMainWindow(QMainWindow):
         注：不能通过新建 QAudioOutput 替换（Qt 6.11 实测替换会丢绑定），
         直接对现有输出 setDevice 即可，播放中重绑不中断。
         """
+        self._ensure_player()  # 首次开播时播放器可能尚未初始化
         default_dev = QMediaDevices.defaultAudioOutput()
         if not force and default_dev.id() == self._bound_device_id:
             return
@@ -171,6 +183,47 @@ class AudioMainWindow(QMainWindow):
         layout.addWidget(self._scan_bar)
         self._scan_bar.setVisible(False)
 
+        # DLsite 抓取状态栏（进度 + 日志入口）
+        self._dlsite_bar = self._build_dlsite_bar()
+        layout.addWidget(self._dlsite_bar)
+        self._dlsite_bar.setVisible(False)
+        self._dlsite_logs = []            # 抓取日志缓冲（带时间戳）
+        self._dlsite_log_dialog = None    # 日志窗口（懒创建）
+        self._dlsite_hide_timer = QTimer(self)
+        self._dlsite_hide_timer.setSingleShot(True)
+        self._dlsite_hide_timer.timeout.connect(self._dlsite_bar.hide)
+
+    def _build_dlsite_bar(self):
+        bar = QFrame()
+        bar.setFixedHeight(36)
+        bar.setStyleSheet(f"""
+            QFrame {{ background-color: {BG_SIDEBAR}; border-top: 1px solid #EDE6DA; }}
+            QLabel {{ color: #777; font-size: 11px; padding: 2px; }}
+            QProgressBar {{
+                border: none; background: #EDE6DA; border-radius: 2px;
+                text-align: center; color: {TEXT_PRIMARY}; font-size: 10px; height: 12px;
+            }}
+            QProgressBar::chunk {{ background-color: #8FA9C2; border-radius: 2px; }}
+        """)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(8, 4, 8, 4)
+        row.setSpacing(8)
+        self.dlsite_status_label = QLabel("DLsite 信息抓取中...")
+        self.dlsite_status_label.setFixedWidth(340)
+        self.dlsite_progress_bar = QProgressBar()
+        self.dlsite_progress_bar.setFixedWidth(260)
+        self.dlsite_progress_bar.setRange(0, 1)
+        self.dlsite_progress_bar.setValue(0)
+        log_btn = QPushButton("日志")
+        log_btn.setStyleSheet(BTN_QSS)
+        log_btn.setFixedWidth(50)
+        log_btn.clicked.connect(self._show_dlsite_log)
+        row.addWidget(self.dlsite_status_label)
+        row.addWidget(self.dlsite_progress_bar)
+        row.addStretch()
+        row.addWidget(log_btn)
+        return bar
+
     def _build_scan_bar(self):
         bar = QFrame()
         bar.setFixedHeight(36)
@@ -216,6 +269,10 @@ class AudioMainWindow(QMainWindow):
         else:
             self._detail_history = []
             self.page_stack.setCurrentIndex(0)
+            # 返回列表时补上详情页期间推迟的刷新（避免用户正要看列表时卡片被重绘）
+            if getattr(self, "_browser_refresh_deferred", False):
+                self._browser_refresh_deferred = False
+                self._schedule_browser_refresh()
 
     @staticmethod
     def _is_path_within(child_path: str, parent_path: str) -> bool:
@@ -290,6 +347,16 @@ class AudioMainWindow(QMainWindow):
         # 标签和封面：子歌单使用主歌单的，主歌单用自己的
         main_pl = db.get_playlist(self._detail_history[0]) if len(self._detail_history) > 1 else pl
         tags_str = main_pl.get("tags", "") or ""
+        # 网络分类优先：主歌单已有 DLsite 分类时，直接用它替代本地标签显示
+        if dlsite.AVAILABLE:
+            main_rj = dlsite.extract_rj_code(main_pl.get("name", ""))
+            if main_rj:
+                try:
+                    main_info = dlsite_db.get_work(main_rj)
+                except Exception:
+                    main_info = None
+                if main_info and main_info.get("genres"):
+                    tags_str = "，".join(str(g) for g in main_info["genres"])
 
         cover_path = main_pl.get("cover")
         if not (cover_path and os.path.exists(cover_path)):
@@ -317,10 +384,211 @@ class AudioMainWindow(QMainWindow):
 
     def detail_display(self, pl, tags_str, cover_path, descendants):
         """把组装好的数据交给详情页渲染"""
+        # DLsite 信息：歌单名含 RJ 码时先查缓存；封面缺失时用 DLsite 封面回退
+        rj = dlsite.extract_rj_code(pl["name"]) if dlsite.AVAILABLE else None
+        self._current_dlsite_rj = rj
+        info = None
+        if rj:
+            try:
+                info = dlsite_db.get_work(rj)
+            except Exception:
+                info = None
+        cached_ok = bool(info and info.get("title") and not info.get("error"))
+        if cached_ok and not (cover_path and os.path.exists(cover_path)):
+            cp = info.get("cover_path")
+            if cp and os.path.exists(cp):
+                cover_path = cp
+
         self.detail.display(
             pl["name"], cover_path, tags_str,
             self._tracks_data, descendants,
         )
+
+        # DLsite 信息区（display 内部会 clear，需在其后填充）
+        if cached_ok:
+            self.detail.show_dlsite_info(info)
+        elif rj:
+            # 未命中缓存：显示占位并插队优先抓取，完成后 _on_dlsite_fetched 回调刷新
+            self.detail.show_dlsite_pending(rj)
+            self._ensure_dlsite_thread()
+            self._dlsite_thread.request(rj, priority=True)
+
+    # ==================== DLsite 后台抓取 ====================
+    def _ensure_dlsite_thread(self):
+        if self._dlsite_thread and self._dlsite_thread.isRunning():
+            return
+        self._dlsite_thread = DlsiteWorker()
+        self._dlsite_thread.fetched.connect(self._on_dlsite_fetched)
+        self._dlsite_thread.progress.connect(self._on_dlsite_progress)
+        self._dlsite_thread.log.connect(self._on_dlsite_log)
+        self._dlsite_thread.start()
+
+    def _start_dlsite_prefetch(self):
+        """扫描完成后：先同步缓存信息（封面+标签），再把未获取过信息的歌单加入并行预取队列
+
+        本地批量校验：与 dlsite.db 已成功缓存的全量 RJ 码集合做差集，
+        只把缺失的 ID 入队——已获取过的绝不重复请求。
+        """
+        if not dlsite.AVAILABLE:
+            return
+        # 启动即同步：dlsite.db 里已有的封面/标签立即应用到主列表（不依赖抓取信号）
+        if self._sync_dlsite_info():
+            self._schedule_browser_refresh()
+        try:
+            codes = set()
+            for pl in db.list_playlists():
+                rj = dlsite.extract_rj_code(pl.get("name", ""))
+                if rj:
+                    codes.add(rj)
+        except Exception as e:
+            print(f"[DLsite] 预取收集失败: {e}")
+            return
+        if not codes:
+            return
+        # 批量校验已缓存 ID，只抓缺失的
+        try:
+            missing = codes - dlsite_db.get_cached_rjs()
+        except Exception as e:
+            print(f"[DLsite] 缓存校验失败，全量入队: {e}")
+            missing = codes
+        if not missing:
+            return
+        self._ensure_dlsite_thread()
+        self._dlsite_thread.request_many(missing)
+
+    def _sync_dlsite_info(self, rj=None):
+        """把 dlsite.db 缓存的信息同步到主库（网络信息统一管理）
+
+        - 封面：本地无封面文件的歌单回填 DLsite 封面（本地封面优先，已有则不覆盖）
+        - 标签：有网络分类的歌单统一使用网络标签（覆盖本地 标签.txt），全半角逗号分隔
+        - rj=None 时全量同步（扫描完成后调用一次）；指定 rj 时只精准同步该 RJ 的歌单
+          （每次抓取完成后调用，避免全表扫描+逐条写库阻塞 UI 线程）
+        重扫描后扫描器会把 tags 重置为本地值，全量同步在每次扫描后都会再次执行，保证收敛。
+        返回是否有任何写入。
+        """
+        try:
+            cover_map = dlsite_db.get_cover_map()
+            genre_map = dlsite_db.get_genre_map()
+            if not cover_map and not genre_map:
+                return False
+            pls = db.list_playlists_by_rj(rj) if rj else db.list_playlists()
+            updates = []
+            for pl in pls:
+                pl_rj = dlsite.extract_rj_code(pl.get("name", ""))
+                if rj and pl_rj != rj:
+                    continue
+                fields = {}
+                # 封面回填
+                cover = pl.get("cover")
+                if not (cover and os.path.exists(cover)):
+                    cp = cover_map.get(pl_rj)
+                    if cp:
+                        fields["cover"] = cp
+                # 网络标签统一（网络分类替代本地标签）
+                genres = genre_map.get(pl_rj)
+                if genres:
+                    tags_str = "，".join(str(g) for g in genres)
+                    if (pl.get("tags") or "") != tags_str:
+                        fields["tags"] = tags_str
+                elif pl_rj and (pl.get("tags") or ""):
+                    # 有 RJ 码但还没有网络数据：清掉残留的本地 标签.txt 内容
+                    fields["tags"] = ""
+                if fields:
+                    updates.append((pl["id"], fields))
+            if updates:
+                db.update_playlists_batch(updates)  # 单连接单事务，UI 无感
+            return bool(updates)
+        except Exception as e:
+            print(f"[DLsite] 信息同步失败: {e}")
+            return False
+
+    # ── DLsite 进度与日志 ──
+    def _on_dlsite_progress(self, done, total, action):
+        """更新底部 DLsite 抓取进度条"""
+        if total <= 0:
+            return
+        self._dlsite_bar.setVisible(True)
+        if done >= total:
+            self.dlsite_status_label.setText(f"DLsite 信息全部完成（{total} 个）")
+            self.dlsite_progress_bar.setRange(0, 1)
+            self.dlsite_progress_bar.setValue(1)
+            self._dlsite_hide_timer.start(4000)  # 完成后停留 4 秒再隐藏
+        else:
+            self._dlsite_hide_timer.stop()
+            text = f"DLsite 信息: {done}/{total}"
+            if action:
+                text += f"  {action}"
+            self.dlsite_status_label.setText(text)
+            self.dlsite_progress_bar.setRange(0, total)
+            self.dlsite_progress_bar.setValue(done)
+
+    def _on_dlsite_log(self, line):
+        """接收 worker 日志行（带时间戳缓冲，日志窗口打开时实时追加）"""
+        self._dlsite_logs.append(f"{datetime.now():%H:%M:%S}  {line}")
+        if len(self._dlsite_logs) > 1000:
+            del self._dlsite_logs[:-1000]
+        if self._dlsite_log_dialog and self._dlsite_log_dialog.isVisible():
+            self._dlsite_log_text.appendPlainText(self._dlsite_logs[-1])
+
+    def _show_dlsite_log(self):
+        """打开抓取日志窗口（懒创建，单实例）"""
+        if self._dlsite_log_dialog is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("DLsite 抓取日志")
+            dlg.resize(580, 400)
+            v = QVBoxLayout(dlg)
+            txt = QPlainTextEdit()
+            txt.setReadOnly(True)
+            txt.setMaximumBlockCount(5000)
+            txt.setStyleSheet("QPlainTextEdit { background: #FFFFFF; color: #555; font-size: 12px; border: none; }")
+            v.addWidget(txt)
+            self._dlsite_log_dialog = dlg
+            self._dlsite_log_text = txt
+        self._dlsite_log_text.setPlainText("\n".join(self._dlsite_logs))
+        sb = self._dlsite_log_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        self._dlsite_log_dialog.show()
+        self._dlsite_log_dialog.raise_()
+
+    def _on_dlsite_fetched(self, rj):
+        """后台抓取完成回调：封面回填主列表 + 刷新当前详情页"""
+        try:
+            info = dlsite_db.get_work(rj)
+        except Exception:
+            info = None
+        ok = bool(info and info.get("title") and not info.get("error"))
+
+        # 新抓到的封面/标签立即精准同步到主列表（只处理该 RJ，批量写库不卡 UI）
+        if ok and self._sync_dlsite_info(rj):
+            self._schedule_browser_refresh()
+
+        # 若抓取的正是当前展示的歌单，立即刷新详情页信息区与封面
+        if rj != self._current_dlsite_rj or self.page_stack.currentIndex() != 1:
+            return
+        if ok:
+            self.detail.show_dlsite_info(info)
+            self.detail.try_dlsite_cover(info.get("cover_path"))
+        else:
+            self.detail.show_dlsite_error()
+
+    def _schedule_browser_refresh(self):
+        """合并短时间内的多次刷新请求（预取期间会连续回填多个封面）
+
+        用户停留在详情页时推迟刷新：列表不可见时重绘纯属浪费，且卡片重绘
+        发生在用户返回列表的瞬间容易造成点击落点偏移误开歌单；返回列表时统一补刷。
+        """
+        if self.page_stack.currentIndex() == 1:
+            self._browser_refresh_deferred = True
+            return
+        if getattr(self, "_browser_refresh_pending", False):
+            return
+        self._browser_refresh_pending = True
+
+        def _do():
+            self._browser_refresh_pending = False
+            self.browser.reload_current()
+
+        QTimer.singleShot(1000, _do)
 
     def _collect_descendant_playlists(self, path):
         """收集指定路径下的所有后代歌单（递归CTE，一次SQL查询）"""
@@ -507,11 +775,13 @@ class AudioMainWindow(QMainWindow):
                 self.scan_label.setText("目录无变化，已跳过扫描")
                 QTimer.singleShot(2000, self._scan_bar.hide)
             self._start_mtime_migration()
+            self._start_dlsite_prefetch()
             return
 
         self._scan_bar.setVisible(False)
         self._refresh_playlists()
         self._start_mtime_migration()
+        self._start_dlsite_prefetch()
         if auto or cancelling:
             return  # 自动扫描或用户取消，静默完成
         msg_parts = []
@@ -559,6 +829,10 @@ class AudioMainWindow(QMainWindow):
         # 等待后台 mtime 迁移线程结束，避免向已删除的窗口发射信号
         if self._mtime_thread and self._mtime_thread.isRunning():
             self._mtime_thread.wait(2000)
+        # 停止 DLsite 后台抓取线程（可能正在礼貌延迟中，wait 足够覆盖一个延迟周期）
+        if self._dlsite_thread and self._dlsite_thread.isRunning():
+            self._dlsite_thread.stop()
+            self._dlsite_thread.wait(3000)
         super().closeEvent(event)
         if self._on_back_to_launcher:
             cb = self._on_back_to_launcher

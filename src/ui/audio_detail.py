@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QPushButton, QScrollArea,
     QTableWidget, QTableWidgetItem, QComboBox,
-    QHeaderView, QAbstractItemView, QSizePolicy,
+    QHeaderView, QAbstractItemView, QSizePolicy, QToolButton,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
@@ -90,6 +90,32 @@ class PlaylistDetailPage(QWidget):
         self.playlist_count = QLabel()
         self.playlist_count.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
         info_col.addWidget(self.playlist_count)
+        # DLsite 信息区（层级：状态行 → 社团/CV 胶囊 → 元数据行 → 可折叠分类/简介）
+        self.dlsite_status = QLabel()
+        self.dlsite_status.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
+        self.dlsite_status.setVisible(False)
+        info_col.addWidget(self.dlsite_status)
+
+        self.dlsite_capsules = QWidget()
+        self.dlsite_caps_flow = FlowLayout(self.dlsite_capsules, margin=0, h_spacing=6, v_spacing=4)
+        self.dlsite_capsules.setContentsMargins(0, 0, 0, 0)
+        self.dlsite_capsules.setLayout(self.dlsite_caps_flow)
+        self.dlsite_capsules.setVisible(False)
+        info_col.addWidget(self.dlsite_capsules)
+
+        self.dlsite_meta = QLabel()
+        self.dlsite_meta.setWordWrap(True)
+        self.dlsite_meta.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
+        self.dlsite_meta.setVisible(False)
+        info_col.addWidget(self.dlsite_meta)
+
+        # 可折叠"简介"区：自动换行文本（网络分类已改为顶部可点击标签按钮，不再单设分类区）
+        self.dlsite_desc_label = QLabel()
+        self.dlsite_desc_label.setWordWrap(True)
+        self.dlsite_desc_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.dlsite_desc_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
+        self.dlsite_desc_sec = self._make_dlsite_section("简介", self.dlsite_desc_label)
+        info_col.addWidget(self.dlsite_desc_sec)
         # 注意：这里不要 addStretch()——嵌套 stretch 会让信息行变为"可扩展"项，
         # 在无曲目表的容器页会分到多余空间导致封面垂直居中、标题与封面顶部分离
         info_row.addLayout(info_col, 1)
@@ -236,6 +262,7 @@ class PlaylistDetailPage(QWidget):
         self.playlist_title.setText(pl_name)
         self._rebuild_tag_buttons(tags_str)
         self._set_cover(cover_path)
+        self.clear_dlsite()
 
         # 有子歌单即为容器：隐藏曲目区（表头+表格）、只显示子歌单卡片（更清爽），叶子歌单才显示曲目
         has_children = bool(sub_playlists)
@@ -376,6 +403,122 @@ class PlaylistDetailPage(QWidget):
         """重新应用当前高亮（重建表格后保持选中态）"""
         self.set_highlight_by_path(getattr(self, "_highlight_path", ""))
 
+    # ── DLsite 信息展示 ──
+
+    def _make_dlsite_section(self, title, body):
+        """构建可折叠区块：点击标题展开/收起 body（默认收起）"""
+        sec = QWidget()
+        v = QVBoxLayout(sec)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        btn = QToolButton()
+        btn.setText(title)
+        btn.setCheckable(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            "QToolButton { color: #BBB; font-size: 13px; font-weight: bold; border: none;"
+            " background: transparent; text-align: left; padding: 0; }"
+            "QToolButton:hover { color: #888; }"
+        )
+        body.setVisible(False)
+        btn.toggled.connect(
+            lambda checked: (body.setVisible(checked),
+                             btn.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow))
+        )
+        v.addWidget(btn)
+        v.addWidget(body)
+        sec.setVisible(False)
+        return sec
+
+    @staticmethod
+    def _clear_flow_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def clear_dlsite(self):
+        """清空/隐藏 DLsite 信息区（切换歌单时调用）"""
+        self.dlsite_status.setVisible(False)
+        self.dlsite_status.setText("")
+        self._clear_flow_layout(self.dlsite_caps_flow)
+        self.dlsite_capsules.setVisible(False)
+        self.dlsite_meta.setVisible(False)
+        self.dlsite_desc_label.setText("")
+        self.dlsite_desc_sec.setVisible(False)
+
+    def show_dlsite_pending(self, rj):
+        """显示"正在获取"占位（后台线程抓取完成后由主窗口回调刷新）"""
+        self.dlsite_status.setText(f"正在获取 DLsite 信息（{rj}）…")
+        self.dlsite_status.setVisible(True)
+
+    def show_dlsite_error(self):
+        """显示获取失败提示（失败记录 24 小时后才会自动重试）"""
+        self.dlsite_status.setText("DLsite 信息获取失败")
+        self.dlsite_status.setVisible(True)
+
+    def show_dlsite_info(self, info):
+        """渲染 DLsite 作品信息（层级：胶囊标签 → 元数据行 → 折叠分类/简介）"""
+        # 胶囊：社团 / CV（醒目主色）
+        self._clear_flow_layout(self.dlsite_caps_flow)
+        capsules = []
+        if info.get("circle"):
+            capsules.append(f"社团 · {info['circle']}")
+        if info.get("cv"):
+            capsules.append(f"CV · {info['cv']}")
+        if capsules:
+            for text in capsules:
+                pill = QLabel(text)
+                pill.setStyleSheet(
+                    f"background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};"
+                    "border-radius: 10px; padding: 3px 10px; font-size: 12px; font-weight: bold;"
+                )
+                self.dlsite_caps_flow.addWidget(pill)
+            self.dlsite_capsules.setVisible(True)
+        else:
+            self.dlsite_capsules.setVisible(False)
+
+        # 元数据行（灰字）：发售日 · 年龄 · 形式 · 文件 · 容量
+        meta_parts = [info.get(k) for k in ("release_date", "age_rating", "work_type", "file_type", "file_size")]
+        meta_str = " · ".join(str(p) for p in meta_parts if p)
+        if meta_str:
+            self.dlsite_meta.setText(meta_str)
+            self.dlsite_meta.setVisible(True)
+        else:
+            self.dlsite_meta.setVisible(False)
+
+        # 分类标签：不再在信息区单独渲染（分类已作为顶部可点击标签按钮展示）
+        self.dlsite_status.setVisible(False)
+
+        # 简介（默认折叠）
+        desc_parts = info.get("description") or []
+        desc_text = "\n\n".join(
+            f"{p.get('heading', '')}\n{p.get('text', '')}".strip()
+            for p in desc_parts if (p.get("heading") or p.get("text"))
+        )
+        if desc_text:
+            self.dlsite_desc_label.setText(desc_text)
+            self.dlsite_desc_sec.setVisible(True)
+        else:
+            self.dlsite_desc_sec.setVisible(False)
+
+        self.dlsite_status.setVisible(False)
+
+    def try_dlsite_cover(self, cover_path):
+        """当前无封面时用 DLsite 封面补位（异步抓取完成后回调）"""
+        if getattr(self, "_has_cover", False):
+            return
+        if cover_path and os.path.exists(cover_path):
+            pix = QPixmap(cover_path)
+            if not pix.isNull():
+                self.cover_label.setPixmap(
+                    pix.scaled(160, 160, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+                )
+                self.cover_label.setText("")
+                self._has_cover = True
+
     def _set_cover(self, cover_path):
         got = False
         if cover_path and os.path.exists(cover_path):
@@ -387,6 +530,7 @@ class PlaylistDetailPage(QWidget):
                 )
                 self.cover_label.setText("")
                 got = True
+        self._has_cover = got
         if not got:
             self.cover_label.setPixmap(QPixmap())
             self.cover_label.setText("无封面")

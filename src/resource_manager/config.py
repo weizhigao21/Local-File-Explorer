@@ -24,6 +24,10 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 # 本地数据库路径
 DB_PATH = os.path.join(_DATA_DIR, "resource_manager.db")
 
+# DLsite 作品信息：独立数据库 + 封面缓存目录
+DLSITE_DB_PATH = os.path.join(_DATA_DIR, "dlsite.db")
+DLSITE_COVER_DIR = os.path.join(_DATA_DIR, "dlsite_covers")
+
 # 缩略图缓存目录（在 data 下，与其他数据文件统一）
 THUMBNAIL_DIR = os.path.join(_DATA_DIR, "thumbnails")
 
@@ -37,7 +41,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # ==================== 用户可变配置（config.json） ====================
 
