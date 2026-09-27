@@ -3,23 +3,52 @@
 歌单卡片（网格）、子歌单卡片（紧凑列表）、设置对话框
 """
 import os
+from functools import lru_cache
 
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QImageReader, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
-    QHBoxLayout, QVBoxLayout,
-    QLabel, QFrame, QPushButton, QListWidget,
-    QDialog, QMessageBox, QFileDialog,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QPixmap
 
-from resource_manager import config
 from audio_manager import database as db
+from resource_manager import config
 from ui.audio_theme import (
-    ACCENT, CARD_BG, CARD_HOVER, BORDER_COLOR,
-    TEXT_PRIMARY, TEXT_MUTED, TEXT_DIM,
+    ACCENT,
+    BORDER_COLOR,
+    CARD_BG,
+    CARD_HOVER,
     INPUT_BG,
+    TEXT_DIM,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
 )
+
+
+@lru_cache(maxsize=128)
+def _cover_thumbnail(path, mtime_ns, file_size):
+    """按显示尺寸解码封面；文件状态参与缓存键，换图后不会复用旧图。"""
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    target = QSize(160, 140)
+    if size.isValid() and (size.width() > target.width() or size.height() > target.height()):
+        reader.setScaledSize(size.scaled(target, Qt.AspectRatioMode.KeepAspectRatio))
+    image = reader.read()
+    if image.isNull():
+        return QPixmap()
+    pix = QPixmap.fromImage(image)
+    return pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
+                      Qt.TransformationMode.SmoothTransformation)
 
 
 # =============================================================
@@ -66,6 +95,7 @@ class PlaylistCard(QFrame):
         # 歌单名（自动换行）
         name = pl["name"]
         name_label = QLabel(name)
+        name_label.setToolTip(name)
         name_label.setWordWrap(True)
         name_label.setFixedWidth(160)
         name_label.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 12px;")
@@ -90,7 +120,7 @@ class PlaylistCard(QFrame):
         # 加载封面
         self._cover_path = pl.get("cover")
         if self._cover_path:
-            QTimer.singleShot(1, self._load_cover)
+            self._load_cover()
 
     def mouseReleaseEvent(self, event):
         # 用 release 而非 press 触发：避免双击/页面切换瞬间按压落点偏移导致误开歌单
@@ -98,16 +128,18 @@ class PlaylistCard(QFrame):
             self.clicked.emit(self.pl_id)
 
     def _load_cover(self):
-        if self._cover_path and os.path.exists(self._cover_path):
-            pix = QPixmap(self._cover_path)
-            if not pix.isNull():
-                scaled = pix.scaled(160, 140, Qt.AspectRatioMode.KeepAspectRatio,
-                                    Qt.TransformationMode.SmoothTransformation)
-                self.cover_label.setPixmap(scaled)
-                self.cover_label.setText("")
+        try:
+            stat = os.stat(self._cover_path)
+        except OSError:
+            return
+        pix = _cover_thumbnail(self._cover_path, stat.st_mtime_ns, stat.st_size)
+        if not pix.isNull():
+            self.cover_label.setPixmap(pix)
+            self.cover_label.setText("")
 
     def contextMenuEvent(self, event):
         from PyQt6.QtWidgets import QMenu
+
         from ui.audio_theme import MENU_QSS
         menu = QMenu(self)
         menu.setStyleSheet(MENU_QSS)
@@ -137,17 +169,17 @@ class SubPlaylistCard(QFrame):
         self.pl_id = pl["id"]
         self.setFixedHeight(32)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet(f"""
-            SubPlaylistCard {{
+        self.setStyleSheet("""
+            SubPlaylistCard {
                 background-color: transparent;
                 border: 1px solid transparent;
                 border-radius: 4px;
                 padding: 2px 8px;
-            }}
-            SubPlaylistCard:hover {{
+            }
+            SubPlaylistCard:hover {
                 background-color: #EDE6DA;
                 border: 1px solid #D5CDC0;
-            }}
+            }
         """)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 2, 8, 2)
@@ -155,6 +187,7 @@ class SubPlaylistCard(QFrame):
 
         name = pl["name"]
         name_label = QLabel(name)
+        name_label.setToolTip(name)
         name_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
         layout.addWidget(name_label)
 

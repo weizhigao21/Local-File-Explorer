@@ -3,7 +3,6 @@
 验证基于 mtime + size 的指纹生成、对比、更新、清除逻辑
 """
 import os
-import time
 
 import pytest
 

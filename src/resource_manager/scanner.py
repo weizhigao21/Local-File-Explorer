@@ -1,7 +1,7 @@
-import os
 import hashlib
+import os
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image
@@ -10,7 +10,6 @@ from resource_manager import config
 from resource_manager import database as db
 from resource_manager import fingerprint_cache as fp
 from resource_manager.utils import natural_key
-
 
 # 并行生成缩略图的线程数（IO 密集 + CPU 解码 JPEG）
 _THUMB_WORKERS = 4
@@ -88,7 +87,7 @@ def _sync_work_images(work_id, current_images, stats):
     current_images: [(path, mtime), ...]
     stats: 累计统计 dict
     """
-    current_map = {p: m for p, m in current_images}
+    current_map = dict(current_images)
     db_map = db.get_work_image_mtimes(work_id)
 
     current_paths = set(current_map.keys())
@@ -221,7 +220,7 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
          check_fingerprint=True):
     """增量扫描：检测文件增删改，同步数据库，清理孤儿缩略图
     使用 SQLite 长连接贯穿整个扫描，避免频繁 connect/close
-    
+
     Args:
         check_fingerprint: 为 True 时先对比目录指纹，无变化则直接跳过扫描
     """

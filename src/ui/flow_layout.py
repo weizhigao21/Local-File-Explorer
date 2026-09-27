@@ -1,5 +1,5 @@
-from PyQt6.QtCore import Qt, QPoint, QRect, QSize
-from PyQt6.QtWidgets import QLayout, QSizePolicy, QStyle, QStyleOption
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt
+from PyQt6.QtWidgets import QLayout
 
 
 class FlowLayout(QLayout):

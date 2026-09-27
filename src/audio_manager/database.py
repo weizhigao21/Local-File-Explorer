@@ -5,10 +5,10 @@
 import os
 import re
 import sqlite3
-from contextlib import contextmanager
-
+from contextlib import contextmanager, suppress
 
 from resource_manager.config import get_project_root
+
 _DATA_DIR = os.path.join(get_project_root(), "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(_DATA_DIR, "audio_manager.db")
@@ -81,6 +81,10 @@ def init_db():
                 FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_tracks_playlist ON tracks(playlist_id);
+            CREATE TABLE IF NOT EXISTS scan_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
         """)
         # 为旧数据库添加 parent_path 列 + 索引（兼容已有数据库）
         for stmt in [
@@ -88,10 +92,26 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_playlists_parent ON playlists(parent_path)",
             "ALTER TABLE playlists ADD COLUMN mtime REAL DEFAULT 0",
         ]:
-            try:
+            with suppress(sqlite3.OperationalError):
                 conn.execute(stmt)
-            except sqlite3.OperationalError:
-                pass
+
+
+def get_scan_data_version():
+    """扫描数据规则版本；旧库无记录时返回 0。"""
+    with _active_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM scan_meta WHERE key = 'audio_catalog'"
+        ).fetchone()
+        return row["value"] if row else 0
+
+
+def set_scan_data_version(version):
+    with _active_conn() as conn:
+        conn.execute(
+            "INSERT INTO scan_meta (key, value) VALUES ('audio_catalog', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (version,),
+        )
 
 
 # ── 歌单层级查询 ──
@@ -161,14 +181,6 @@ def get_playlist_by_path(path):
             (path,),
         ).fetchone()
         return dict(row) if row else None
-
-
-def playlist_has_children(playlist_id):
-    """判断歌单是否有子歌单"""
-    pl = get_playlist(playlist_id)
-    if not pl:
-        return False
-    return get_child_count(pl["path"]) > 0
 
 
 def get_descendant_playlists(parent_path):
@@ -278,6 +290,21 @@ def delete_playlist(playlist_id):
         return
     with _active_conn() as conn:
         conn.execute("PRAGMA foreign_keys = ON")
+        # 扫描器复用的长连接可能已经处于事务中，此时 PRAGMA foreign_keys
+        # 不会生效；先显式删曲目，避免留下无歌单的旧记录。
+        conn.execute("""
+            DELETE FROM tracks WHERE playlist_id IN (
+                WITH RECURSIVE descendants(id) AS (
+                    SELECT id FROM playlists WHERE id = ?
+                    UNION ALL
+                    SELECT p.id FROM playlists p
+                    JOIN descendants d ON p.parent_path = (
+                        SELECT path FROM playlists WHERE id = d.id
+                    )
+                )
+                SELECT id FROM descendants
+            )
+        """, (playlist_id,))
         conn.execute("""
             DELETE FROM playlists WHERE id IN (
                 WITH RECURSIVE descendants(id) AS (
@@ -340,6 +367,8 @@ def add_tracks(playlist_id, tracks):
 def delete_tracks_not_in(playlist_id, valid_paths):
     """删除歌单中不在 valid_paths 中的曲目（临时表方案，突破SQLite 999参数上限）"""
     if not valid_paths:
+        with _active_conn() as conn:
+            conn.execute("DELETE FROM tracks WHERE playlist_id = ?", (playlist_id,))
         return
     with _active_conn() as conn:
         conn.execute("CREATE TEMP TABLE IF NOT EXISTS _valid_paths (path TEXT)")

@@ -275,9 +275,9 @@ def _ogg_duration(path):
     nseg = head[26] if len(head) > 26 else 0
     if nseg > 0:
         seg_start = 27 + nseg
-        if head[seg_start:seg_start + 7] == b"\x01vorbis":
-            if seg_start + 7 + 4 + 1 + 4 <= len(head):
-                sample_rate = struct.unpack_from("<I", head, seg_start + 13)[0]
+        if (head[seg_start:seg_start + 7] == b"\x01vorbis"
+                and seg_start + 7 + 4 + 1 + 4 <= len(head)):
+            sample_rate = struct.unpack_from("<I", head, seg_start + 13)[0]
     # 读取文件末尾，找到最后一个 Ogg 页的 granule position（未设置残留位）
     tail = _read_head_gen(path, size)
     end = len(tail)

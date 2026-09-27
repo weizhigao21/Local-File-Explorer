@@ -3,14 +3,20 @@
 """
 import re
 
-from PyQt6.QtWidgets import (
-    QPushButton, QFrame, QHBoxLayout, QVBoxLayout, QLabel, QWidget,
-    QDialog, QListWidget, QListWidgetItem, QLineEdit, QTabWidget,
-)
 from PyQt6.QtCore import Qt, pyqtSignal
-
-from ui.flow_layout import FlowLayout
-
+from PyQt6.QtWidgets import (
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 # ---- 配色（与主窗口黏土风统一） ----
 ACCENT = "#42B4C2"
@@ -26,7 +32,7 @@ def parse_tags(tags_str: str) -> list[str]:
     if not tags_str or not tags_str.strip():
         return []
     return sorted(
-        set(t.strip() for t in re.split(r"[,，\n\r\s]+", tags_str) if t.strip()),
+        {t.strip() for t in re.split(r"[,，\n\r\s]+", tags_str) if t.strip()},
         key=str.lower,
     )
 
@@ -116,40 +122,6 @@ class TagChip(QFrame):
 
     def get_tag(self) -> str:
         return self._tag
-
-
-# =============================================================
-#  TagFilterWidget — 浏览器导航栏的标签过滤区域
-# =============================================================
-class TagFilterWidget(QWidget):
-    """封装活动标签芯片的容器，自动换行布局，支持添加/移除标签"""
-
-    tagRemoved = pyqtSignal(str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._layout = FlowLayout(self, margin=0, h_spacing=4, v_spacing=2)
-        self.setContentsMargins(0, 0, 0, 2)
-        self.setLayout(self._layout)
-        self.setVisible(False)
-
-    def set_tags(self, tags: set):
-        """设置并显示标签芯片"""
-        # 清除旧芯片
-        while self._layout.count():
-            item = self._layout.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
-
-        for tag in sorted(tags, key=str.lower):
-            chip = TagChip(tag)
-            chip.removed.connect(self._on_chip_removed)
-            self._layout.addWidget(chip)
-
-        self.setVisible(bool(tags))
-
-    def _on_chip_removed(self, tag):
-        self.tagRemoved.emit(tag)
 
 
 # =============================================================

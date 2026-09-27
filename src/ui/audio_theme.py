@@ -1,24 +1,36 @@
 """
 音频模块主题与工具函数
 配色常量、通用按钮样式、时间/路径格式化工具
+
+配色令牌统一来自 ui.theme_base（见该模块说明），此处继续对外导出，
+保持 `from ui.audio_theme import ACCENT` 这类既有写法不变。
 """
 import os
 
+from ui.theme_base import (
+    ACCENT,
+    ACCENT_HOVER,
+    ACCENT_TINT,
+    BG_MAIN,
+    BG_SIDEBAR,
+    BORDER_COLOR,
+    CARD_BG,
+    CARD_HOVER,
+    INPUT_BG,
+    PLAYER_BG,
+    TEXT_DIM,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+)
 
-# ---- 配色（3D 黏土风 / 轻拟物新拟态） ----
-ACCENT = "#42B4C2"
-ACCENT_HOVER = "#48B8BC"
-ACCENT_TINT = "rgba(66, 180, 194, 0.15)"
-BG_MAIN = "#F5F0E8"
-BG_SIDEBAR = "#FDF9F2"
-CARD_BG = "#FFFFFF"
-CARD_HOVER = "#FFFDF8"
-TEXT_PRIMARY = "#555555"
-TEXT_MUTED = "#999999"
-TEXT_DIM = "#BBBBBB"
-INPUT_BG = "#EDE6DA"
-BORDER_COLOR = "#D5CDC0"
-PLAYER_BG = "#EDE6DA"
+__all__ = [
+    # 从 theme_base 转出的设计令牌
+    "ACCENT", "ACCENT_HOVER", "ACCENT_TINT",
+    "BG_MAIN", "BG_SIDEBAR", "CARD_BG", "CARD_HOVER", "INPUT_BG", "PLAYER_BG",
+    "TEXT_PRIMARY", "TEXT_MUTED", "TEXT_DIM", "BORDER_COLOR",
+    # 本模块自有的样式与工具
+    "BTN_QSS", "MENU_QSS", "format_time", "get_basename",
+]
 
 BTN_QSS = """
 QPushButton {

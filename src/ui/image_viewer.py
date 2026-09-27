@@ -1,16 +1,16 @@
+from PyQt6.QtCore import QRectF, Qt, QTimer
+from PyQt6.QtGui import QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PyQt6.QtWidgets import (
     QDialog,
-    QGraphicsView,
     QGraphicsScene,
-    QVBoxLayout,
+    QGraphicsView,
     QHBoxLayout,
-    QPushButton,
     QLabel,
+    QPushButton,
+    QVBoxLayout,
 )
-from PyQt6.QtGui import QPixmap, QKeySequence, QWheelEvent, QShortcut
-from PyQt6.QtCore import Qt, QRectF, QTimer
 
-from ui.image_loader import loader, get_cached
+from ui.image_loader import get_cached, loader
 
 
 class ImageViewer(QDialog):

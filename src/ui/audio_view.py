@@ -3,44 +3,66 @@
 组装歌单浏览器、歌单详情页、播放条与扫描逻辑
 """
 import os
+from contextlib import suppress
 from datetime import datetime
 
+from PyQt6.QtCore import QTimer, QUrl
+from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QMessageBox, QStackedWidget,
-    QDialog, QPlainTextEdit, QProgressBar,
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import QUrl, QTimer
-from PyQt6.QtGui import QShortcut, QKeySequence
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 
 from audio_manager import database as db
 from audio_manager import dlsite, dlsite_db
+from audio_manager.catalog import build_audio_catalog
 from resource_manager import config
-from ui.audio_theme import (
-    BG_MAIN, BG_SIDEBAR, TEXT_PRIMARY, BTN_QSS,
-)
-from ui.audio_widgets import AudioSettingsDialog
 from ui.audio_browser import PlaylistBrowser
-from ui.audio_player import AudioPlayerBar
 from ui.audio_detail import PlaylistDetailPage
-from ui.audio_threads import AudioScanThread, MtimeMigrationThread, DlsiteWorker
+from ui.audio_player import AudioPlayerBar
+from ui.audio_theme import (
+    BG_MAIN,
+    BG_SIDEBAR,
+    BTN_QSS,
+    TEXT_PRIMARY,
+)
+from ui.audio_threads import AudioScanThread, DlsiteWorker, MtimeMigrationThread
+from ui.audio_widgets import AudioSettingsDialog
+
+# 关闭窗口时若扫描线程来不及退出，仍需持有其 Python 引用：
+# QThread 没有 Qt parent，失去引用后被 GC 会销毁正在运行的线程对象，导致崩溃。
+_detached_threads = set()
 
 
 class AudioMainWindow(QMainWindow):
     def __init__(self, on_back_to_launcher=None):
         super().__init__()
         self._on_back_to_launcher = on_back_to_launcher
-        self.setWindowTitle("本地资源管理器 - 音频")
+        self.setWindowTitle(f"本地资源管理器 - 音频 v{config.APP_VERSION}")
         self.resize(1080, 700)
 
         self._current_playlist_id = None
         self._current_track_index = -1
         self._detail_history = []  # 详情页导航栈
+        self._detail_group_id = None
+        self._detail_entries = {}  # 当前主歌单下含直接音频的子目录
+        self._filter_origin = None  # 从详情页进入筛选视图时的导航历史快照（返回时还原）
         self._tracks_data = []
         self._play_queue = []  # 独立播放队列（导航/切歌单时保持播放）
         self._mtime_thread = None  # 后台 mtime 迁移线程
         self._dlsite_thread = None  # DLsite 信息后台抓取线程
+        self.scan_thread = None  # 音频扫描线程（沿用既有命名）
         self._current_dlsite_rj = None  # 当前详情页歌单对应的 RJ 码
         self._browser_refresh_deferred = False  # 详情页期间推迟的列表刷新
 
@@ -59,6 +81,10 @@ class AudioMainWindow(QMainWindow):
         self.setStyleSheet(f"QMainWindow {{ background-color: {BG_MAIN}; }}")
         self._setup_ui()
         self._setup_shortcuts()
+        # 已下载的 DLsite 封面先同步到歌单库，再创建首屏卡片。
+        # 否则失效的旧路径要等自动扫描结束及延迟刷新后才会被替换。
+        if dlsite.AVAILABLE:
+            self._sync_dlsite_info()
         self._refresh_playlists()
 
         # 自动后台扫描（延迟 500ms，让 UI 先渲染）
@@ -157,6 +183,7 @@ class AudioMainWindow(QMainWindow):
         # — 页面 0: 歌单浏览器
         self.browser = PlaylistBrowser()
         self.browser.openPlaylist.connect(self._open_playlist)
+        self.browser.returnToPlaylist.connect(self._return_from_filter_view)
         self.page_stack.addWidget(self.browser)  # index 0
 
         # — 页面 1: 曲目详情页
@@ -229,6 +256,7 @@ class AudioMainWindow(QMainWindow):
         bar = QFrame()
         bar.setFixedHeight(36)
         from PyQt6.QtWidgets import QHBoxLayout, QProgressBar
+
         from ui.audio_theme import ACCENT
         bar.setStyleSheet(f"""
             QFrame {{ background-color: {BG_SIDEBAR}; border-top: 1px solid #EDE6DA; }}
@@ -280,8 +308,7 @@ class AudioMainWindow(QMainWindow):
         """child_path 是否等于 parent_path 或位于其子级（兼容 / 与 \\ 分隔符）"""
         if child_path == parent_path:
             return True
-        return (child_path.startswith(parent_path + os.sep)
-                or child_path.startswith(parent_path + "/"))
+        return child_path.startswith((parent_path + os.sep, parent_path + "/"))
 
     def _build_ancestor_chain(self, pl):
         """从叶子歌单沿 parent_path 回溯到根，返回 [根, ..., 叶子] 的歌单 id 链"""
@@ -323,8 +350,7 @@ class AudioMainWindow(QMainWindow):
         return None
 
     def _open_playlist(self, pl_id, history=None):
-        # 导航历史：默认首次从浏览器进入时重置、子歌单点击时追加；
-        # 传 history 时（如"跳转曲目所属歌单"）直接用预设的祖先链，保证层级完整
+        # 主列表进入时先打开歌单分组；在其详情页点子歌单时只追加该子目录。
         if history is not None:
             self._detail_history = list(history)
         elif self.page_stack.currentIndex() != 1:
@@ -335,7 +361,20 @@ class AudioMainWindow(QMainWindow):
         self._current_playlist_id = pl_id
         # 注意：这里不再 stop() —— 播放队列与展示列表解耦，导航/返回时保持播放
 
-        pl = db.get_playlist(pl_id)
+        group_id = self._detail_history[0] if self._detail_history else pl_id
+        group = db.get_playlist(group_id)
+        if not group:
+            return
+        if self._detail_group_id != group_id or pl_id == group_id:
+            descendants = db.get_descendant_playlists(group["path"])
+            direct_counts = db.count_tracks_by_playlist()
+            direct_counts.pop(group_id, None)  # 主歌单本身不重复出现在自己的子歌单列表里
+            entries = build_audio_catalog(
+                [group, *descendants], direct_counts, [group["path"]],
+            )
+            self._detail_entries = {entry["id"]: entry for entry in entries}
+            self._detail_group_id = group_id
+        pl = group if pl_id == group_id else self._detail_entries.get(pl_id) or db.get_playlist(pl_id)
         if not pl:
             return
 
@@ -345,12 +384,11 @@ class AudioMainWindow(QMainWindow):
         else:
             self.detail.set_back_label("← 返回上级")
 
-        # 标签和封面：子歌单使用主歌单的，主歌单用自己的
-        main_pl = db.get_playlist(self._detail_history[0]) if len(self._detail_history) > 1 else pl
-        tags_str = main_pl.get("tags", "") or ""
-        # 网络分类优先：主歌单已有 DLsite 分类时，直接用它替代本地标签显示
+        # 子歌单展示记录已沿目录路径继承最近的封面、标签和 RJ 码。
+        tags_str = pl.get("tags", "") or ""
+        # 网络分类优先：已缓存的 DLsite 分类直接替代数据库标签。
         if dlsite.AVAILABLE:
-            main_rj = dlsite.extract_rj_code(main_pl.get("name", ""))
+            main_rj = pl.get("rj_code") or dlsite.extract_rj_code(pl.get("name", ""))
             if main_rj:
                 try:
                     main_info = dlsite_db.get_work(main_rj)
@@ -359,26 +397,14 @@ class AudioMainWindow(QMainWindow):
                 if main_info and main_info.get("genres"):
                     tags_str = "，".join(str(g) for g in main_info["genres"])
 
-        cover_path = main_pl.get("cover")
-        if not (cover_path and os.path.exists(cover_path)):
-            cover_path = self._find_first_cover(main_pl)
-
-        # 加载曲目：有直接音频则用自身的，否则递归聚合所有子歌单曲目
-        direct_tracks = db.list_tracks(pl_id)
-        if direct_tracks:
-            self._tracks_data = direct_tracks
-        else:
-            raw = self._collect_tracks_recursive(pl_id)
-            self._tracks_data = []
-            seen = set()
-            for tr in raw:
-                if tr["path"] not in seen:
-                    seen.add(tr["path"])
-                    self._tracks_data.append(tr)
-
-        # 后代歌单列表
-        descendants = self._collect_descendant_playlists(pl["path"])
-        self.detail_display(pl, tags_str, cover_path, descendants)
+        cover_path = pl.get("cover")
+        if pl_id == group_id and not (cover_path and os.path.exists(cover_path)):
+            cover_path = next((entry["cover"] for entry in self._detail_entries.values()
+                               if entry.get("cover")), None)
+        self._tracks_data = db.list_tracks(pl_id)
+        sub_playlists = (sorted(self._detail_entries.values(), key=lambda entry: entry["name"].lower())
+                         if pl_id == group_id else [])
+        self.detail_display(pl, tags_str, cover_path, sub_playlists)
         self.page_stack.setCurrentIndex(1)
         # 若当前正在播放的曲目属于刚展示的列表，高亮它
         self._highlight_current_in_list()
@@ -386,7 +412,7 @@ class AudioMainWindow(QMainWindow):
     def detail_display(self, pl, tags_str, cover_path, descendants):
         """把组装好的数据交给详情页渲染"""
         # DLsite 信息：歌单名含 RJ 码时先查缓存；封面缺失时用 DLsite 封面回退
-        rj = dlsite.extract_rj_code(pl["name"]) if dlsite.AVAILABLE else None
+        rj = (pl.get("rj_code") or dlsite.extract_rj_code(pl["name"])) if dlsite.AVAILABLE else None
         self._current_dlsite_rj = rj
         info = None
         if rj:
@@ -457,7 +483,7 @@ class AudioMainWindow(QMainWindow):
         self._ensure_dlsite_thread()
         self._dlsite_thread.request_many(missing)
 
-    def _sync_dlsite_info(self, rj=None):
+    def _sync_dlsite_info(self, rj=None, info=None):
         """把 dlsite.db 缓存的信息同步到主库（网络信息统一管理）
 
         - 封面：本地无封面文件的歌单回填 DLsite 封面（本地封面优先，已有则不覆盖）
@@ -468,8 +494,16 @@ class AudioMainWindow(QMainWindow):
         返回是否有任何写入。
         """
         try:
-            cover_map = dlsite_db.get_cover_map()
-            genre_map = dlsite_db.get_genre_map()
+            if rj:
+                work = info if info is not None else dlsite_db.get_work(rj)
+                cover_path = (work or {}).get("cover_path")
+                cover_map = {rj: cover_path} if cover_path and os.path.exists(cover_path) else {}
+                genres = (work or {}).get("genres")
+                valid = bool(work and work.get("title") and not work.get("error"))
+                genre_map = {rj: genres} if valid and isinstance(genres, list) and genres else {}
+            else:
+                cover_map = dlsite_db.get_cover_map()
+                genre_map = dlsite_db.get_genre_map()
             if not cover_map and not genre_map:
                 return False
             pls = db.list_playlists_by_rj(rj) if rj else db.list_playlists()
@@ -560,7 +594,7 @@ class AudioMainWindow(QMainWindow):
         ok = bool(info and info.get("title") and not info.get("error"))
 
         # 新抓到的封面/标签立即精准同步到主列表（只处理该 RJ，批量写库不卡 UI）
-        if ok and self._sync_dlsite_info(rj):
+        if ok and self._sync_dlsite_info(rj, info):
             self._schedule_browser_refresh()
 
         # 若抓取的正是当前展示的歌单，立即刷新详情页信息区与封面
@@ -601,13 +635,34 @@ class AudioMainWindow(QMainWindow):
 
     def _on_tag_clicked(self, tag):
         """点击标签按钮 → 返回歌单浏览器并追加标签过滤（与已有标签叠加 AND 逻辑）"""
-        self.page_stack.setCurrentIndex(0)
+        self._enter_filter_view()
         self.browser.filter_by_tag(tag)
 
     def _on_dlsite_field_clicked(self, field, value):
         """点击社团/CV 胶囊 → 返回浏览器并按该维度过滤（同值再点取消，异值替换）"""
-        self.page_stack.setCurrentIndex(0)
+        self._enter_filter_view()
         self.browser.filter_by_dlsite(field, value)
+
+    def _enter_filter_view(self):
+        """从详情页进入筛选视图：记录来源歌单，供列表页返回按钮/擦除筛选后回退
+
+        筛选视图是详情页之上的一层临时状态，必须记住"从哪个歌单来的"，
+        否则返回按钮只能按目录层级回退（根目录下甚至没有返回入口）。
+        """
+        if self.page_stack.currentIndex() == 1 and self._detail_history:
+            pl_id = self._detail_history[-1]
+            self._filter_origin = list(self._detail_history)
+            self.browser.set_return_target(pl_id, self.detail.playlist_title.text())
+        else:
+            self._filter_origin = None
+            self.browser.clear_return_target()
+        self.page_stack.setCurrentIndex(0)
+
+    def _return_from_filter_view(self, pl_id):
+        """筛选视图返回：还原来源歌单详情页及其原有层级导航历史"""
+        history = self._filter_origin or [pl_id]
+        self._filter_origin = None
+        self._open_playlist(pl_id, history=history)
 
     # ==================== 播放控制 ====================
     def _on_track_double_clicked(self, index):
@@ -709,16 +764,14 @@ class AudioMainWindow(QMainWindow):
         if not target:
             return  # 歌单已被删除等脏数据，忽略
 
-        # 1) 曲目属于当前展示歌单（或其子孙）→ 切回详情页保持上下文，不重建导航
-        if self._current_playlist_id:
-            current = db.get_playlist(self._current_playlist_id)
-            if current and self._is_path_within(target["path"], current["path"]):
-                self.page_stack.setCurrentIndex(1)
-                return
+        # 每张卡片只对应本目录曲目；即使目标位于当前目录下，也要打开它自己的歌单。
+        if self._current_playlist_id == target["id"]:
+            self.page_stack.setCurrentIndex(1)
+            return
 
-        # 2) 跨歌单 → 按祖先链逐层展开（根→...→叶子），封面与返回行为同正常浏览
         chain = self._build_ancestor_chain(target)
-        self._open_playlist(target["id"], history=chain)
+        history = [chain[0], target["id"]] if chain[0] != target["id"] else [target["id"]]
+        self._open_playlist(target["id"], history=history)
 
     # ==================== 扫描 ====================
     def start_scan(self):
@@ -832,6 +885,8 @@ class AudioMainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._player_initialized:
             self._player.stop()
+        # 先停扫描线程：它持有数据库长连接，且会向即将关闭的窗口发信号
+        self._stop_scan_thread()
         # 等待后台 mtime 迁移线程结束，避免向已删除的窗口发射信号
         if self._mtime_thread and self._mtime_thread.isRunning():
             self._mtime_thread.wait(2000)
@@ -844,6 +899,25 @@ class AudioMainWindow(QMainWindow):
             cb = self._on_back_to_launcher
             self._on_back_to_launcher = None
             cb()
+
+    def _stop_scan_thread(self):
+        """取消并等待扫描线程退出（幂等：线程未启动/已结束时安全）"""
+        t = self.scan_thread
+        if t is None or not t.isRunning():
+            return
+        t.cancel()
+        if t.wait(3000):
+            return
+        # 兜底：扫描仍未在 3 秒内收尾。断开信号避免回调到已关闭的窗口，
+        # 并用模块级集合持有引用防止 QThread 被 GC（见 _detached_threads 注释）。
+        # 没有连接的信号 disconnect() 会抛 TypeError，逐个吞掉
+        for sig in (t.finished, t.error, t.progress):
+            with suppress(TypeError):
+                sig.disconnect()
+        _detached_threads.add(t)
+        # 注意：AudioScanThread.finished 是 pyqtSignal(dict)，槽必须能接住这个参数
+        t.finished.connect(lambda *_: _detached_threads.discard(t))
+        print("[关闭] 音频扫描线程未在 3 秒内退出，已断开其信号并保持引用直到结束")
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Space"), self, self.toggle_play)

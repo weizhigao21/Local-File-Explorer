@@ -1,4 +1,3 @@
-import os
 import sqlite3
 from contextlib import contextmanager
 
@@ -89,15 +88,44 @@ def init_db():
             conn.execute("ALTER TABLE images ADD COLUMN mtime INTEGER DEFAULT 0")
 
 
+def _insert_or_ignore_id(conn, insert_sql, insert_params, id_sql, id_params):
+    """执行 INSERT OR IGNORE，返回对应行的主键 id（不存在则返回 None）。
+
+    为什么不能直接用 `cur.lastrowid`：
+        sqlite3 的 `lastrowid` 取自连接级的 `sqlite3_last_insert_rowid()`，
+        含义是「**本连接上**上一次成功插入的行 id」。当 INSERT OR IGNORE 因唯一约束
+        被忽略时，该值**不会更新**，于是会把上一次插入——可能是**另一张表**——的
+        行 id 当成新行 id 返回。典型后果：长连接扫描中先插入 images（rowid=2），
+        再对已存在作者执行 `INSERT OR IGNORE INTO authors`，作者 id 被错认成 2，
+        作品就挂到了不存在的 author_id 上（悬空外键）。
+    因此仅当 rowcount==1（确实插入）时采用 lastrowid，否则按唯一键回查。
+    """
+    cur = conn.execute(insert_sql, insert_params)
+    if cur.rowcount:
+        return cur.lastrowid
+    row = conn.execute(id_sql, id_params).fetchone()
+    return row["id"] if row else None
+
+
 def add_author(name):
-    with get_conn() as conn:
-        cur = conn.execute("INSERT OR IGNORE INTO authors (name) VALUES (?)", (name,))
-        conn.commit()
-        return cur.lastrowid or get_author_id(name)
+    """插入作者（幂等），返回 author_id。
+
+    必须走 _active_conn()：扫描期间 scan() 持有长连接写事务，若此处另开短连接写入，
+    SQLite 会因无法取得写锁而抛 `database is locked`，且该异常被扫描器的
+    per-author try/except 吞掉 → 整批作品静默丢失。
+    """
+    with _active_conn() as conn:
+        return _insert_or_ignore_id(
+            conn,
+            "INSERT OR IGNORE INTO authors (name) VALUES (?)",
+            (name,),
+            "SELECT id FROM authors WHERE name = ?",
+            (name,),
+        )
 
 
 def get_author_id(name):
-    with get_conn() as conn:
+    with _active_conn() as conn:
         row = conn.execute("SELECT id FROM authors WHERE name = ?", (name,)).fetchone()
         return row["id"] if row else None
 
@@ -114,22 +142,6 @@ def list_authors():
             """
         ).fetchall()
         return [dict(row) for row in rows]
-
-
-def add_work(author_id, name, path, thumbnail=None):
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO works (author_id, name, path, thumbnail) VALUES (?, ?, ?, ?)",
-            (author_id, name, path, thumbnail),
-        )
-        conn.commit()
-        return cur.lastrowid or get_work_id_by_path(path)
-
-
-def get_work_id_by_path(path):
-    with get_conn() as conn:
-        row = conn.execute("SELECT id FROM works WHERE path = ?", (path,)).fetchone()
-        return row["id"] if row else None
 
 
 def list_works(author_id=None):
@@ -150,36 +162,43 @@ def list_works(author_id=None):
         return [dict(row) for row in rows]
 
 
-def add_image(work_id, path, mtime=0):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO images (work_id, path, mtime) VALUES (?, ?, ?)",
-            (work_id, path, mtime),
-        )
-
-
 def add_author_with_works(author_name, works, progress_callback=None):
     """
     按作者批量插入作品和图片，整个作者在一个事务中完成。
     works: [(work_name, work_path, thumbnail, [(image_path, mtime), ...]), ...]
     progress_callback: 可选，接收 (current_work_name, total_images) 用于进度显示
+
+    必须走 _active_conn()：与 add_author 同理，扫描长连接持写锁时另开短连接会
+    `database is locked`，导致新作品整批丢失（而统计仍显示成功）。
     """
-    with get_conn() as conn:
-        cur = conn.execute("INSERT OR IGNORE INTO authors (name) VALUES (?)", (author_name,))
-        author_id = cur.lastrowid
-        if not author_id:
-            row = conn.execute("SELECT id FROM authors WHERE name = ?", (author_name,)).fetchone()
-            author_id = row["id"]
+    with _active_conn() as conn:
+        author_id = _insert_or_ignore_id(
+            conn,
+            "INSERT OR IGNORE INTO authors (name) VALUES (?)",
+            (author_name,),
+            "SELECT id FROM authors WHERE name = ?",
+            (author_name,),
+        )
 
         for work_name, work_path, thumbnail, images in works:
-            cur = conn.execute(
+            work_id = _insert_or_ignore_id(
+                conn,
                 "INSERT OR IGNORE INTO works (author_id, name, path, thumbnail) VALUES (?, ?, ?, ?)",
                 (author_id, work_name, work_path, thumbnail),
+                "SELECT id FROM works WHERE path = ?",
+                (work_path,),
             )
-            work_id = cur.lastrowid
-            if not work_id:
-                row = conn.execute("SELECT id FROM works WHERE path = ?", (work_path,)).fetchone()
-                work_id = row["id"]
+            if work_id is None:
+                # path 未命中：目录被重命名时 name 冲突而 path 变化，按 (author_id, name) 兜底
+                row = conn.execute(
+                    "SELECT id FROM works WHERE author_id = ? AND name = ?",
+                    (author_id, work_name),
+                ).fetchone()
+                work_id = row["id"] if row else None
+            if work_id is None:
+                # 兜底仍失败：宁可不写，也不落下悬空外键
+                print(f"[跳过作品] 无法解析 work_id: {work_path}")
+                continue
 
             if images:
                 # images: [(path, mtime), ...]

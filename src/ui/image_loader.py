@@ -8,14 +8,15 @@
 """
 import hashlib
 import os
+import threading
+import traceback
 from collections import OrderedDict
-from typing import Optional, Tuple
+from contextlib import suppress
 
-from PyQt6.QtCore import Qt, QSize, QThreadPool, QRunnable, pyqtSignal, QObject
+from PyQt6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QImage, QImageReader, QPixmap
 
 from resource_manager.config import GPU_FRIENDLY_FORMAT, IMAGE_THUMBNAIL_DIR
-
 
 # 标准尺寸（按 64 像素对齐）：所有请求尺寸向上取到最接近的标准尺寸
 # 这样同一张图在 165x222、166x223、167x224 显示时都会对齐到同一个缓存键
@@ -25,7 +26,7 @@ _SIZE_STEP = 64
 _DISK_CACHE_MAX_DIM = 512
 
 
-def _normalize_size(size: QSize) -> Tuple[int, int]:
+def _normalize_size(size: QSize) -> tuple[int, int]:
     """将尺寸对齐到 64 像素的倍数（向上取）
     例：(165, 222) -> (192, 224)；(200, 200) -> (256, 256)
     """
@@ -37,7 +38,7 @@ def _normalize_size(size: QSize) -> Tuple[int, int]:
     return (w, h)
 
 
-def _disk_cache_path(path: str, w: int, h: int) -> Optional[str]:
+def _disk_cache_path(path: str, w: int, h: int) -> str | None:
     """返回磁盘缓存文件路径。None 表示该尺寸不缓存到磁盘"""
     if w > _DISK_CACHE_MAX_DIM or h > _DISK_CACHE_MAX_DIM:
         return None
@@ -48,24 +49,34 @@ def _disk_cache_path(path: str, w: int, h: int) -> Optional[str]:
 
 
 # 全局 LRU 缓存：key = (path, w, h)，其中 w/h 是标准化后的尺寸
-_cache: "OrderedDict[Tuple[str, int, int], QPixmap]" = OrderedDict()
+_cache: "OrderedDict[tuple[str, int, int], QPixmap]" = OrderedDict()
 _CACHE_MAX = 600
+
+# 缓存被多个解码线程（QThreadPool）与主线程并发访问，必须加锁：
+# get_cached 的「pop 再插回」与 _trim_cache 的淘汰可能交错，
+# 未加锁时 _cache.pop(key) 会在 key 刚被淘汰后抛 KeyError —— 该异常发生在
+# QRunnable.run 中，PyQt6 会直接 abort 整个进程（不是普通报错）。
+# 用 RLock 以便 _trim_cache 被 put_cache 持锁调用时仍可重入。
+_cache_lock = threading.RLock()
 
 
 def _trim_cache():
-    while len(_cache) > _CACHE_MAX:
-        _cache.popitem(last=False)
+    """淘汰最久未使用的条目（调用方可直接在持锁状态下调用，RLock 可重入）"""
+    with _cache_lock:
+        while len(_cache) > _CACHE_MAX:
+            _cache.popitem(last=False)
 
 
-def get_cached(path: str, target: QSize) -> Optional[QPixmap]:
+def get_cached(path: str, target: QSize) -> QPixmap | None:
     """从内存缓存读取。未命中返回 None（不查磁盘，磁盘由 _decode 负责）"""
     key = (path, *_normalize_size(target))
-    if key in _cache:
-        # 移到末尾，标记为最近使用
-        pix = _cache.pop(key)
-        _cache[key] = pix
+    with _cache_lock:
+        # pop(key, None)：并发淘汰下 key 可能已被移除，不能用 pop(key) 否则 KeyError
+        pix = _cache.pop(key, None)
+        if pix is None:
+            return None
+        _cache[key] = pix  # 移到末尾，标记为最近使用
         return pix
-    return None
 
 
 def put_cache(path: str, target: QSize, pixmap: QPixmap):
@@ -73,15 +84,16 @@ def put_cache(path: str, target: QSize, pixmap: QPixmap):
     if pixmap.isNull():
         return
     key = (path, *_normalize_size(target))
-    if key in _cache:
-        _cache.pop(key)
-    _cache[key] = pixmap
-    _trim_cache()
+    with _cache_lock:
+        _cache.pop(key, None)
+        _cache[key] = pixmap
+        _trim_cache()
 
 
 def clear_cache():
     """清空内存缓存（不影响磁盘缓存）"""
-    _cache.clear()
+    with _cache_lock:
+        _cache.clear()
 
 
 def _decode(path: str, target: QSize) -> QPixmap:
@@ -101,20 +113,18 @@ def _decode(path: str, target: QSize) -> QPixmap:
                 img = img.convertToFormat(QImage.Format.Format_RGBX8888)
             return QPixmap.fromImage(img)
         # 磁盘缓存损坏，删除重生成
-        try:
+        with suppress(OSError):
             os.remove(disk_path)
-        except OSError:
-            pass
 
     # 2. 解码原图
     reader = QImageReader(path)
     reader.setAutoTransform(True)
     orig = reader.size()
-    if orig.isValid():
-        if orig.width() > decode_size.width() or orig.height() > decode_size.height():
-            reader.setScaledSize(
-                orig.scaled(decode_size, Qt.AspectRatioMode.KeepAspectRatio)
-            )
+    if orig.isValid() and (
+            orig.width() > decode_size.width() or orig.height() > decode_size.height()):
+        reader.setScaledSize(
+            orig.scaled(decode_size, Qt.AspectRatioMode.KeepAspectRatio)
+        )
     img = reader.read()
     if img.isNull():
         return QPixmap()
@@ -152,14 +162,23 @@ class ImageLoadTask(QRunnable):
         self.setAutoDelete(True)
 
     def run(self):
-        # 命中缓存直接返回
-        cached = get_cached(self.path, self.target)
-        if cached is not None:
-            self.signals.loaded.emit(self.path, self.target, cached, self.token)
-            return
-        pixmap = _decode(self.path, self.target)
-        put_cache(self.path, self.target, pixmap)
-        self.signals.loaded.emit(self.path, self.target, pixmap, self.token)
+        # QRunnable 里未捕获的 Python 异常在 PyQt6 下不会只打印，而是 qFatal → abort 整个进程。
+        # 因此这里必须兜住所有异常：解码失败时发射空 pixmap，调用方的 _on_loaded
+        # 已经统一判 isNull() 并保持占位图（grid_view / image_viewer / work_images_view）。
+        try:
+            # 命中缓存直接返回
+            cached = get_cached(self.path, self.target)
+            if cached is not None:
+                self.signals.loaded.emit(self.path, self.target, cached, self.token)
+                return
+            pixmap = _decode(self.path, self.target)
+            put_cache(self.path, self.target, pixmap)
+            self.signals.loaded.emit(self.path, self.target, pixmap, self.token)
+        except Exception:
+            traceback.print_exc()
+            # 连发射都失败（如 QObject 已析构）则彻底放弃该任务
+            with suppress(Exception):
+                self.signals.loaded.emit(self.path, self.target, QPixmap(), self.token)
 
 
 class ImageLoader:
@@ -170,7 +189,7 @@ class ImageLoader:
         loader.request(path, target, on_loaded)
     """
 
-    def __init__(self, pool: Optional[QThreadPool] = None):
+    def __init__(self, pool: QThreadPool | None = None):
         self._pool = pool or QThreadPool.globalInstance()
         self._next_token = 0
 
@@ -195,18 +214,9 @@ class ImageLoader:
         self._pool.start(task)
         return token
 
-    def request_sync(self, path: str, target: QSize) -> QPixmap:
-        """同步解码（仅用于必须立即返回结果的场景），仍走缓存"""
-        cached = get_cached(path, target)
-        if cached is not None:
-            return cached
-        pixmap = _decode(path, target)
-        put_cache(path, target, pixmap)
-        return pixmap
-
 
 # 全局单例
-_loader: Optional[ImageLoader] = None
+_loader: ImageLoader | None = None
 
 
 def loader() -> ImageLoader:

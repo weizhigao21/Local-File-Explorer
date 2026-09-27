@@ -8,12 +8,13 @@ import time
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from audio_manager import database as db
-from audio_manager import scanner as audio_scanner
 from audio_manager import dlsite, dlsite_db
+from audio_manager import scanner as audio_scanner
 from audio_manager.duration import get_duration
 from resource_manager import config
 
@@ -244,10 +245,8 @@ class DlsiteWorker(QThread):
         except Exception as e:
             print(f"[DLsite] 抓取 {rj} 失败: {e}")
             traceback.print_exc()
-            try:
+            with suppress(Exception):
                 dlsite_db.set_error(rj, str(e))
-            except Exception:
-                pass
             self.log.emit(f"{rj} 抓取异常：{e}")
         finally:
             with self._lock:

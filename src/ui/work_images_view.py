@@ -5,22 +5,21 @@
 - 自定义 ItemDelegate 直接绘制，避免 widget 树开销
 - 视口检测通过 visualItemRect 高效获取
 """
+from PyQt6.QtCore import QModelIndex, QRect, QSize, Qt, QTimer
+from PyQt6.QtGui import QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
     QHBoxLayout,
     QLabel,
+    QListView,
     QListWidget,
     QListWidgetItem,
-    QListView,
-    QStyledItemDelegate,
     QStyle,
+    QStyledItemDelegate,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QIcon
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRect, QModelIndex, QTimer
 
-from ui.image_loader import loader, get_cached
-
+from ui.image_loader import get_cached, loader
 
 # 卡片尺寸（含外边距）
 ITEM_W = 165          # 卡片宽度

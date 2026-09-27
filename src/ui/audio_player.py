@@ -2,13 +2,23 @@
 音频模块播放条控件
 固定于主窗口底部的播放控制栏：当前曲目、上一首/播放/下一首、进度条、时间、音量
 """
-from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QSlider, QStyle, QStyleOptionSlider,
-)
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSlider,
+    QStyle,
+    QStyleOptionSlider,
+)
 
 from ui.audio_theme import (
-    ACCENT, ACCENT_HOVER, TEXT_PRIMARY, TEXT_DIM, format_time,
+    ACCENT,
+    ACCENT_HOVER,
+    TEXT_DIM,
+    TEXT_PRIMARY,
+    format_time,
 )
 
 
@@ -108,8 +118,12 @@ class AudioPlayerBar(QFrame):
 
         self.now_playing = ClickableLabel("未播放")
         self.now_playing.setMinimumWidth(160)
+        # 注意：QSS 里不能把「裸声明」与「选择器块」混写。Qt 一旦遇到顶层裸声明
+        # （形如 `color: #777;`）就会判定整张表非法并**整表丢弃**，报
+        # "Could not parse stylesheet" —— 结果是这里所有样式（含 hover）都不生效。
+        # 必须全部写成 选择器 { ... } 形式。QLabel 作为类型选择器同样匹配其子类。
         self.now_playing.setStyleSheet(f"""
-            color: #777; font-size: 12px; padding: 2px 4px; border-radius: 4px;
+            QLabel {{ color: #777; font-size: 12px; padding: 2px 4px; border-radius: 4px; }}
             QLabel:hover {{ color: {TEXT_PRIMARY}; background-color: rgba(66, 180, 194, 0.15); }}
         """)
         self.now_playing.set_clickable(False)
@@ -119,7 +133,7 @@ class AudioPlayerBar(QFrame):
         self.prev_btn = QPushButton("⏮")
         self.prev_btn.setFixedSize(32, 28)
         self.prev_btn.setStyleSheet(
-            "background: transparent; color: #BBB; border: none; font-size: 16px; padding: 0; "
+            "QPushButton { background: transparent; color: #BBB; border: none; font-size: 16px; padding: 0; } "
             f"QPushButton:hover {{ color: {TEXT_PRIMARY}; }}"
         )
         self.prev_btn.clicked.connect(self.prevClicked.emit)
@@ -140,7 +154,7 @@ class AudioPlayerBar(QFrame):
         self.next_btn = QPushButton("⏭")
         self.next_btn.setFixedSize(32, 28)
         self.next_btn.setStyleSheet(
-            "background: transparent; color: #BBB; border: none; font-size: 16px; padding: 0; "
+            "QPushButton { background: transparent; color: #BBB; border: none; font-size: 16px; padding: 0; } "
             f"QPushButton:hover {{ color: {TEXT_PRIMARY}; }}"
         )
         self.next_btn.clicked.connect(self.nextClicked.emit)

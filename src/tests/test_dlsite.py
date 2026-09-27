@@ -1,16 +1,13 @@
-# -*- coding: utf-8 -*-
 """DLsite 集成测试：RJ 码提取、parse 解析（离线 fixture）、独立数据库读写"""
 import os
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from audio_manager import dlsite, dlsite_db  # noqa: E402
 from resource_manager import config  # noqa: E402
-
 
 # ── 离线 HTML fixture：模拟 DLsite 中文详情页关键结构 ──
 FIXTURE_HTML = """

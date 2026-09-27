@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 DLsite 作品信息独立数据库（data/dlsite.db）。
 
@@ -10,6 +9,7 @@ import os
 import re
 import sqlite3
 import time
+from contextlib import suppress
 
 from resource_manager import config
 
@@ -26,7 +26,7 @@ def split_cv_names(cv_text):
     return names
 
 # 连接级配置：WAL + 忙等待，多线程短连接友好
-_CONN_KWARGS = dict(timeout=10)
+_CONN_KWARGS = {"timeout": 10}
 
 
 def get_conn() -> sqlite3.Connection:
@@ -124,10 +124,8 @@ def get_work(rj: str) -> dict | None:
     for key in ("genres", "description"):
         v = d.get(key)
         if isinstance(v, str) and v:
-            try:
+            with suppress(json.JSONDecodeError):
                 d[key] = json.loads(v)
-            except json.JSONDecodeError:
-                pass
     return d
 
 
@@ -234,27 +232,3 @@ def get_cv_counts() -> dict:
         for name in split_cv_names(r["cv"]):
             counts[name] = counts.get(name, 0) + 1
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
-
-
-def search_by_genres(required) -> set:
-    """返回 genres 同时包含全部 required 项（不区分大小写）的 RJ 码集合。
-
-    required 为要匹配的分类标签列表；为空时返回空集合。
-    供浏览器按 DLsite 分类筛选歌单使用，一次查询预处理全部作品。
-    """
-    req = {g.strip().lower() for g in required if g and str(g).strip()}
-    if not req:
-        return set()
-    with get_conn() as conn:
-        rows = conn.execute("SELECT rj_code, genres FROM works").fetchall()
-    hits = set()
-    for rj, genres_json in rows:
-        if not genres_json:
-            continue
-        try:
-            gs = {g.strip().lower() for g in json.loads(genres_json)}
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if req <= gs:
-            hits.add(rj)
-    return hits

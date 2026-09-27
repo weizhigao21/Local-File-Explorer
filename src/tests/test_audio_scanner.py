@@ -10,6 +10,7 @@ import pytest
 
 from audio_manager import database as adb
 from audio_manager import scanner as ascanner
+from audio_manager.catalog import build_audio_catalog
 from resource_manager import fingerprint_cache as fp
 
 
@@ -46,11 +47,22 @@ def _get_track_count(db, playlist_id):
     return db.get_playlist(playlist_id)["track_count"]
 
 
+def _pin_roots(monkeypatch, root):
+    """把「扫描根目录集合」固定为 root（与生产路径一致）。
+
+    生产上由 scan() 设置 scanner._SCANNED_ROOTS；而 _update_all_container_track_counts
+    的兜底读的是 AUDIO_ROOTS（配置中恒为非空列表），所以单独 monkeypatch AUDIO_ROOT
+    是无效的 —— 会导致「根歌单」特殊层级规则在测试里根本不生效。
+    这里按生产语义固定根目录，使测试与机器上的实际配置无关。
+    """
+    monkeypatch.setattr(ascanner, "_SCANNED_ROOTS", {os.path.normpath(root)})
+
+
 # ==================== 聚合逻辑：核心修复场景 ====================
 
 def test_leaf_playlist_keeps_own_count(temp_audio_db, monkeypatch):
     """纯叶子歌单（无子歌单）：track_count = 自身直接曲目数"""
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", "/fake/root")
+    _pin_roots(monkeypatch, "/fake/root")
     db = temp_audio_db
     pid = _add_playlist(db, "叶子", "/fake/root/leaf")
     _add_tracks(db, pid, 5)
@@ -62,7 +74,7 @@ def test_leaf_playlist_keeps_own_count(temp_audio_db, monkeypatch):
 
 def test_pure_container_aggregates_children(temp_audio_db, monkeypatch):
     """纯容器歌单（无直接音频，有子）：track_count = 子歌单之和"""
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", "/fake/root")
+    _pin_roots(monkeypatch, "/fake/root")
     db = temp_audio_db
     container = _add_playlist(db, "容器", "/fake/root/container", parent_path="")
     c1 = _add_playlist(db, "子1", "/fake/root/container/c1", parent_path="/fake/root/container")
@@ -84,7 +96,7 @@ def test_mixed_playlist_aggregates_children(temp_audio_db, monkeypatch):
     这是本次修复的核心场景。修复前，混合型歌单只保留直接曲目数，
     不聚合子歌单，导致其父歌单的聚合数也跟着错误。
     """
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", "/fake/root")
+    _pin_roots(monkeypatch, "/fake/root")
     db = temp_audio_db
     # 混合型歌单：2 首直接 + 2 个子歌单（各 5 首、3 首）
     mixed = _add_playlist(db, "混合", "/fake/root/mixed", parent_path="")
@@ -105,7 +117,7 @@ def test_mixed_playlist_aggregates_children(temp_audio_db, monkeypatch):
 
 def test_parent_of_mixed_playlist_aggregates_correctly(temp_audio_db, monkeypatch):
     """父歌单（容器）的子歌单是混合型时，父歌单的聚合数必须包含混合型子歌单的全部后代"""
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", "/fake/root")
+    _pin_roots(monkeypatch, "/fake/root")
     db = temp_audio_db
     # 结构: root_container (0 直接)
     #        ├── mixed_child (1 直接 + 2 个孙歌单: 24 + 3 = 27)  → 应为 28
@@ -138,7 +150,7 @@ def test_parent_of_mixed_playlist_aggregates_correctly(temp_audio_db, monkeypatc
 
 def test_deep_nesting_aggregation(temp_audio_db, monkeypatch):
     """多层嵌套：容器→混合→容器→叶子，逐层聚合正确"""
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", "/fake/root")
+    _pin_roots(monkeypatch, "/fake/root")
     db = temp_audio_db
     # 结构: L0 (容器, 0直接)
     #        └── L1 (混合, 2直接)
@@ -173,7 +185,7 @@ def test_stale_track_count_corrected(temp_audio_db, monkeypatch):
     _update_all_container_track_counts 不能直接拿 track_count 当"直接数"，
     否则会重复累加。
     """
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", "/fake/root")
+    _pin_roots(monkeypatch, "/fake/root")
     db = temp_audio_db
     # 容器 + 1 个子叶子
     container = _add_playlist(db, "容器", "/fake/root/container", parent_path="")
@@ -194,7 +206,7 @@ def test_stale_track_count_corrected(temp_audio_db, monkeypatch):
 
 def test_empty_playlist_stays_zero(temp_audio_db, monkeypatch):
     """无曲目无子歌单的歌单：track_count 保持 0"""
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", "/fake/root")
+    _pin_roots(monkeypatch, "/fake/root")
     db = temp_audio_db
     pid = _add_playlist(db, "空", "/fake/root/empty")
 
@@ -210,7 +222,7 @@ def test_root_playlist_aggregates_top_level(temp_audio_db, monkeypatch):
     需要把根本身从 children_map[""] 中排除，避免自引用。
     """
     root_path = os.path.normpath("/fake/root")
-    monkeypatch.setattr(ascanner, "AUDIO_ROOT", root_path)
+    _pin_roots(monkeypatch, root_path)
     db = temp_audio_db
     # 根目录歌单（自身有 1 首直接曲目）+ 2 个顶层子歌单
     root = _add_playlist(db, "音频根目录", root_path, parent_path="")
@@ -393,3 +405,64 @@ def test_scan_multiple_roots_root_playlist_names(temp_audio_env, tmp_path):
     assert os.path.basename(root1) in names
     assert os.path.basename(str(root2)) in names
     assert len(names) == 2  # 不再出现重名的"音频根目录"
+
+
+def test_audio_catalog_flattens_only_folders_with_tracks(temp_audio_env):
+    """空中间目录保留在名称里，但不单独占一张歌单卡片。"""
+    root = temp_audio_env
+    _make_audio_file(root, "文件夹1/01.mp3")
+    _make_audio_file(root, "文件夹1/文件夹2/02.mp3")
+    _make_audio_file(root, "文件夹1/文件夹2/文件夹3/文件夹4/04.mp3")
+    cover = os.path.join(root, "文件夹1", "封面.jpg")
+    with open(cover, "wb") as file:
+        file.write(b"cover")
+
+    ascanner.scan(audio_root=root)
+    parent = adb.get_playlist_by_path(os.path.normpath(os.path.join(root, "文件夹1")))
+    adb.update_playlist(parent["id"], tags="剧情")
+    catalog = build_audio_catalog(adb.list_playlists(), adb.count_tracks_by_playlist(), [root])
+    assert {pl["name"] for pl in catalog} == {
+        "文件夹1",
+        "文件夹1 > 文件夹2",
+        "文件夹1 > 文件夹2 > 文件夹3 > 文件夹4",
+    }
+    assert all(pl["track_count"] == 1 for pl in catalog)
+    assert all(pl["tags"] == "剧情" and pl["cover"] == cover for pl in catalog)
+    assert len({pl["path"] for pl in catalog}) == 3
+
+
+def test_audio_removed_from_parent_keeps_only_child_in_catalog(temp_audio_env):
+    """父目录最后一首音频被移走时，它变成容器，不再重复显示为歌单。"""
+    root = temp_audio_env
+    parent_track = _make_audio_file(root, "父/01.mp3")
+    _make_audio_file(root, "父/子/02.mp3")
+    ascanner.scan(audio_root=root)
+
+    os.remove(parent_track)
+    _bump_dir_mtime(os.path.join(root, "父"))
+    ascanner.scan(audio_root=root)
+
+    catalog = build_audio_catalog(adb.list_playlists(), adb.count_tracks_by_playlist(), [root])
+    assert [pl["name"] for pl in catalog] == ["父 > 子"]
+    parent = adb.get_playlist_by_path(os.path.normpath(os.path.join(root, "父")))
+    assert parent is not None
+    assert adb.list_tracks(parent["id"]) == []
+
+
+def test_old_fingerprint_is_reconciled_after_scan_rule_upgrade(temp_audio_env):
+    """即使旧指纹显示无变化，也重扫一次并清除已无音频的旧歌单。"""
+    root = temp_audio_env
+    track = _make_audio_file(root, "旧歌单/01.mp3")
+    ascanner.scan(audio_root=root)
+    old_id = adb.get_playlist_by_path(os.path.normpath(os.path.join(root, "旧歌单")))["id"]
+
+    os.remove(track)
+    _bump_dir_mtime(os.path.join(root, "旧歌单"))
+    fp.update(root, level="dir")  # 模拟旧版本已错误地接受了这个状态
+    adb.set_scan_data_version(0)
+    stats = ascanner.scan(audio_root=root)
+
+    assert not stats.get("unchanged")
+    assert adb.get_playlist(old_id) is None
+    assert old_id not in adb.count_tracks_by_playlist()
+    assert build_audio_catalog(adb.list_playlists(), adb.count_tracks_by_playlist(), [root]) == []

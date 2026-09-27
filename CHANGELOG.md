@@ -4,6 +4,41 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.6.0] - 2026-09-27
+
+### 变更
+- **主歌单与子歌单分层显示** — 主列表只显示根级歌单分组；进入主歌单后，仅把含直接音频的后代文件夹列为子歌单。子歌单名称以 ` > ` 展示相对路径，空的中间文件夹只保留在路径中；主歌单自身不会重复出现在子歌单列表。
+- **曲目与数量分开统计** — 主歌单卡片保留自身及后代的曲目总数；子歌单显示其文件夹的直接曲目数。主歌单同时含音频和子歌单时，详情页两部分同时显示，进入子歌单只显示本目录曲目。
+- **版本显示统一** — 启动器、写真窗口和音频窗口均从 `APP_VERSION` 显示 v1.6.0。
+
+### 修复与优化
+- **清理残留音频记录** — 修复文件夹移走最后一首音频后，旧曲目和歌单仍留在数据库的问题。旧库升级后自动完整扫描一次清理残留，后续继续使用目录指纹增量扫描。
+- **封面首屏显示** — 歌单卡片按显示尺寸解码并缓存封面，已有封面在首屏绘制前显示；启动时先同步已下载的 DLsite 封面，避免失效旧路径等待扫描后才替换。
+- **DLsite 单条回填** — 抓取完成后直接使用该作品的数据更新歌单，避免每次都读取全量封面和分类映射。
+- **回归验证** — 补充路径式子歌单、空目录清理与封面首屏加载测试；完整测试集 124 项通过。
+
+## [v1.5.1] - 2026-09-21
+
+### 修复
+- **写真扫描静默丢数据（高危）** — 扫描期间长连接已持有写事务，但 `add_author` / `get_author_id` / `add_author_with_works` 仍走 `get_conn()` 独立短连接，触发 `sqlite3.OperationalError: database is locked`：新作品永远不入库，进度条却照常报"新增 N 张"，且指纹仍被更新 → 后续扫描直接跳过该目录，新作品长期不显示。三个函数改用活动长连接（`_active_conn()`），与音频模块做法对齐。
+- **`INSERT OR IGNORE` 被忽略时产生悬空外键** — `cursor.lastrowid` 在插入被 `OR IGNORE` 忽略时**不会更新**，返回的是该连接上"上一次成功插入"的 rowid，会把作品挂到不存在的作者 id 上（实测作品 `author_id=2` 而该作者不存在）。新增 `_insert_or_ignore_id()` 统一处理：插入成功取 `lastrowid`，被忽略则回查真实 id。
+- **图片解码异常导致进程崩溃** — `ImageLoadTask.run` 未捕获异常，PyQt6 下未捕获异常会 **abort 整个进程**（而非跳过该图）；现改为捕获后回调空图。
+- **关闭窗口不停扫描线程** — 写真 / 音频两个主窗口的 `closeEvent` 都没有停止 `scan_thread`：扫描中点"← 返回主界面"会让线程继续跑在已销毁的窗口上，重新进入模块又会再开一个扫描线程，两个线程同时对同一张表取长连接。现先取消并等待（3s），超时则断开信号并显式保留引用防止线程被回收。
+- **播放条整张样式表失效** — `audio_player.py` 3 处把**裸声明**与 `:hover` 选择器混写在同一个 QSS 字符串里，Qt 会丢弃**整张**样式表（仅打印 `Could not parse stylesheet`，不抛异常）："未播放"标签与 ⏮/⏭ 按钮的样式及悬停反馈其实从未生效。现包进显式类型选择器块。
+- **容器歌单曲目数口径不一致** — `_update_all_container_track_counts` 原为"有直接音频则只显示本级"，与函数文档字符串"聚合自身+后代"及测试三方冲突。现统一为聚合全部后代（`aggregate_total[path]`）。
+
+### 变更
+- **移除音频浏览器"子文件夹下钻 + 面包屑"死代码** — 该套 `_path_stack` 逻辑全项目从不调用，正是"进入标签筛选后回不到来源歌单"的成因。返回按钮改为 `← 返回歌单`（无筛选来源时隐藏），仅保留"筛选视图 → 来源歌单"一层返回语义。
+
+### 重构
+- **设计令牌单一来源** — 新增 `ui/theme_base.py` 集中全部配色常量，`launcher.py` / `photo_theme.py` / `audio_theme.py` 改为引用，消除三处重复声明（重构前后取值零漂移）。
+- **删除死代码** — `resource_manager/gpu_decoder.py`（整文件）、`dlsite_db.search_by_genres()`、`audio_manager/database.playlist_has_children()`、`ui/tag_widgets.TagFilterWidget`、`image_loader.request_sync()`、`database.add_work()` / `get_work_id_by_path()` / `add_image()`。
+- **线程引用显式化** — `main_window.py` / `audio_view.py` 在 `__init__` 显式初始化 `scan_thread`，去掉 `getattr` 兜底。
+
+### 工程
+- **新增 `pyproject.toml`** — 固化 ruff 规则集（`F,E,W,I,UP,B,C4,PIE,RET,SIM`）与 `[tool.pytest.ini_options]`；`ruff check` 从 137 项问题清零。
+- **测试扩充至 116 条** — 新增 `test_audio_navigation.py`（8）、`test_thread_lifecycle.py`（7）、`test_ui_theme.py`（4）、`test_ui_qss.py`（3）与 `conftest.py`（固定 PyQt6 binding）。
+
 ## [v1.2.0] - 2026-08-18
 
 ### 优化

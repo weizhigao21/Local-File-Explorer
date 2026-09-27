@@ -4,24 +4,39 @@
 """
 import os
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFrame, QPushButton, QScrollArea,
-    QTableWidget, QTableWidgetItem, QComboBox,
-    QHeaderView, QAbstractItemView, QSizePolicy, QToolButton,
-)
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
+from audio_manager.dlsite_db import split_cv_names
+from ui.audio_theme import (
+    ACCENT_TINT,
+    BG_MAIN,
+    BG_SIDEBAR,
+    BTN_QSS,
+    TEXT_DIM,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+)
+from ui.audio_threads import DurationProbeThread
+from ui.audio_widgets import SubPlaylistCard
 from ui.flow_layout import FlowLayout
 from ui.tag_widgets import TagButton, parse_tags
-from ui.audio_theme import (
-    ACCENT_TINT, BG_MAIN, BG_SIDEBAR,
-    TEXT_PRIMARY, TEXT_MUTED, TEXT_DIM, BTN_QSS,
-)
-from ui.audio_widgets import SubPlaylistCard
-from ui.audio_threads import DurationProbeThread
-from audio_manager.dlsite_db import split_cv_names
 
 
 class PlaylistDetailPage(QWidget):
@@ -125,7 +140,7 @@ class PlaylistDetailPage(QWidget):
 
         # 子歌单区域
         self.sub_header = QLabel("子歌单")
-        self.sub_header.setStyleSheet(f"color: #BBB; font-size: 13px; font-weight: bold; padding-top: 8px;")
+        self.sub_header.setStyleSheet("color: #BBB; font-size: 13px; font-weight: bold; padding-top: 8px;")
         self.sub_header.setVisible(False)
         self.info_layout.addWidget(self.sub_header)
 
@@ -210,7 +225,7 @@ class PlaylistDetailPage(QWidget):
         row.setContentsMargins(0, 8, 0, 0)
         row.setSpacing(8)
         title = QLabel("曲目列表")
-        title.setStyleSheet(f"color: #BBB; font-size: 13px; font-weight: bold; padding-top: 0;")
+        title.setStyleSheet("color: #BBB; font-size: 13px; font-weight: bold; padding-top: 0;")
         self.track_header = title
         row.addWidget(title)
         row.addStretch()
@@ -266,20 +281,19 @@ class PlaylistDetailPage(QWidget):
         self._set_cover(cover_path)
         self.clear_dlsite()
 
-        # 有子歌单即为容器：隐藏曲目区（表头+表格）、只显示子歌单卡片（更清爽），叶子歌单才显示曲目
+        # 主歌单自身也可能有音频；曲目与子歌单应同时显示，各自只计算一次。
         has_children = bool(sub_playlists)
-        if has_children:
+        has_tracks = bool(tracks)
+        if not has_tracks:
             self._track_header_bar.setVisible(False)
             self.track_list.setVisible(False)
             self.track_list.setRowCount(0)
             self._stop_probe()
             self._rebuild_type_filter(set())
             self._selected_type = ""
-            self.playlist_count.setText(f"共 {len(sub_playlists)} 个子歌单")
         else:
             self._track_header_bar.setVisible(True)
             self.track_list.setVisible(True)
-            self.playlist_count.setText(f"共 {len(tracks)} 首曲目")
             # 重建类型索引与类型筛选选项
             self._track_types = [self._file_type(tr) for tr in tracks]
             self._rebuild_type_filter(set(self._track_types))
@@ -293,6 +307,13 @@ class PlaylistDetailPage(QWidget):
             self._rebuild_track_rows()
             self._start_probe(tracks)
 
+        if has_tracks and has_children:
+            self.playlist_count.setText(f"本目录 {len(tracks)} 首曲目 · {len(sub_playlists)} 个子歌单")
+        elif has_children:
+            self.playlist_count.setText(f"共 {len(sub_playlists)} 个子歌单")
+        else:
+            self.playlist_count.setText(f"共 {len(tracks)} 首曲目")
+
         # 子歌单区域填充
         if has_children and sub_playlists:
             self._rebuild_sub_cards(sub_playlists)
@@ -303,7 +324,7 @@ class PlaylistDetailPage(QWidget):
     @staticmethod
     def _file_type(tr):
         """从文件路径取大写扩展名作为类型（如 MP3 / FLAC）"""
-        ext = os.path.splitext((tr.get("path") or ""))[1]
+        ext = os.path.splitext(tr.get("path") or "")[1]
         return ext.lstrip(".").upper()
 
 
@@ -599,11 +620,11 @@ class PlaylistDetailPage(QWidget):
         if not self._highlight_path:
             return
         for row, orig in enumerate(self._visible_orig):
-            if orig < len(self._tracks_paths):
-                if self._tracks_paths[orig].get("path") == self._highlight_path:
-                    self.track_list.selectRow(row)
-                    self.track_list.scrollToItem(
-                        self.track_list.item(row, 1),
-                        QAbstractItemView.ScrollHint.EnsureVisible,
-                    )
-                    return
+            if (orig < len(self._tracks_paths)
+                    and self._tracks_paths[orig].get("path") == self._highlight_path):
+                self.track_list.selectRow(row)
+                self.track_list.scrollToItem(
+                    self.track_list.item(row, 1),
+                    QAbstractItemView.ScrollHint.EnsureVisible,
+                )
+                return

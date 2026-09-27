@@ -16,6 +16,8 @@ AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".aac", ".ogg", ".wma", ".m4a"}
 
 # 根目录歌单名称（兜底：根目录名称为空时使用）
 ROOT_PLAYLIST_NAME = "音频根目录"
+# v1 修复旧扫描数据：无音频目录留下的歌单/曲目必须在升级后重扫一次清理。
+SCAN_DATA_VERSION = 1
 
 # 最近一次 scan() 的根目录集合（供聚合逻辑识别"根歌单"的特殊层级规则）
 _SCANNED_ROOTS = set()
@@ -33,7 +35,7 @@ def _root_playlist_name(root):
 
 def _is_within(path, root):
     """判断 path 是否位于 root 目录树内（含 root 自身）"""
-    return path == root or path.startswith(root + os.sep) or path.startswith(root + "/")
+    return path == root or path.startswith((root + os.sep, root + "/"))
 
 
 def _sync_playlist(folder_path, name, parent_path, existing, stats,
@@ -149,10 +151,8 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
     has_audio = bool(audio_files)
     if has_audio:
         # 判断是否是根目录
-        if current_dir == root:
-            pl_name = _root_playlist_name(root)
-        else:
-            pl_name = os.path.basename(current_dir)
+        pl_name = (_root_playlist_name(root) if current_dir == root
+                   else os.path.basename(current_dir))
 
         counter["idx"] += 1
         try:
@@ -187,10 +187,8 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
     if not has_audio:
         child_playlists = db.list_playlists_by_parent(current_dir)
         if child_playlists:
-            if current_dir == root:
-                pl_name = _root_playlist_name(root)
-            else:
-                pl_name = os.path.basename(current_dir)
+            pl_name = (_root_playlist_name(root) if current_dir == root
+                       else os.path.basename(current_dir))
             counter["idx"] += 1
             counter["total"] += 1
             try:
@@ -202,6 +200,11 @@ def _scan_dir(root, current_dir, parent_path, existing, disk_paths, stats,
             except Exception as e:
                 print(f"[音频扫描] 同步容器歌单失败 {current_dir}: {e}")
                 traceback.print_exc()
+        elif current_dir in existing:
+            # 文件夹仍在，但最后一首音频已被移走：旧逻辑只按路径不存在清理，
+            # 导致该歌单和曲目永久残留。
+            db.delete_playlist(existing[current_dir])
+            stats["removed_playlists"] += 1
 
 
 def _update_all_container_track_counts():
@@ -240,8 +243,7 @@ def _update_all_container_track_counts():
         reverse=True,
     )
 
-    aggregate_total = {}  # 父容器聚合用（始终包含子歌单）
-    card_count = {}       # 卡片上显示的 track_count
+    aggregate_total = {}  # path -> 自身直接曲目数 + 所有后代子歌单曲目数之和（即卡片展示值）
 
     for path in sorted_paths:
         pl = all_pl[path]
@@ -258,9 +260,10 @@ def _update_all_container_track_counts():
         children_total = sum(aggregate_total.get(cp, 0) for cp in child_paths)
         aggregate_total[path] = own_count + children_total
 
-        # 卡片显示：有直接音频仅显示本级曲目，纯容器歌单显示聚合值
-        display = own_count if own_count > 0 else children_total
-        card_count[path] = display
+        # 卡片展示值 = 自身直接曲目数 + 所有后代子歌单曲目数之和。
+        # 混合型歌单（既有直接音频、又有子歌单）同样聚合 —— 与函数 docstring 一致；
+        # 父歌单的聚合也必须用这个值，否则会漏掉混合型子歌单的后代。
+        display = aggregate_total[path]
 
         # 与数据库现有值不一致才记录，最后统一批量写（避免逐条短连接更新）
         if display != pl["track_count"]:
@@ -299,6 +302,9 @@ def scan(audio_root=None, audio_roots=None, progress_callback=None,
             raise FileNotFoundError(f"音频目录不存在: {r}")
 
     _SCANNED_ROOTS = set(roots)
+    # 旧库的指纹可能完全未变，但其中已有过期曲目。规则升级时强制重扫一次。
+    if db.get_scan_data_version() < SCAN_DATA_VERSION:
+        check_fingerprint = False
 
     # 浅→深排序：嵌套根目录（在另一个根目录内部）最晚扫描，其层级规则最后写入，
     # 保证所有根目录的歌单最终都平铺在顶层
@@ -406,6 +412,8 @@ def scan(audio_root=None, audio_roots=None, progress_callback=None,
             fp.update_with_fingerprint(root, cached_fp, level="dir")
         else:
             fp.update(root, level="dir")
+    if not cancel_event or not cancel_event.is_set():
+        db.set_scan_data_version(SCAN_DATA_VERSION)
 
     # "扫描完成"放在所有耗时操作之后，保证 finished 信号发出时 UI 可立即刷新
     if progress_callback:

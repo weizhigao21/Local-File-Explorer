@@ -6,8 +6,8 @@ import sqlite3
 
 import pytest
 
-from resource_manager import database as db
 from resource_manager import config
+from resource_manager import database as db
 
 
 @pytest.fixture
@@ -284,3 +284,71 @@ def test_persistent_connection(temp_db):
     # 结束后还能正常使用短连接
     db.add_author("作者C")
     assert len(db.list_all_authors()) == 3
+
+
+def _count_orphan_works():
+    """统计 works.author_id 指向不存在作者的「悬空外键」数量"""
+    conn = sqlite3.connect(config.DB_PATH)
+    n = conn.execute(
+        "SELECT COUNT(*) FROM works w LEFT JOIN authors a ON a.id = w.author_id "
+        "WHERE a.id IS NULL"
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def test_add_author_with_works_reuses_existing_author_id(temp_db):
+    """已存在作者不能沿用 INSERT OR IGNORE 被忽略时残留的 lastrowid 作为 author_id
+
+    lastrowid 取自连接级的 sqlite3_last_insert_rowid()，含义是「本连接上一次成功
+    插入」的行 id（可能来自**另一张表**）；INSERT OR IGNORE 被忽略时它不会更新。
+    长连接扫描中先插 images 再插已存在作者，就会把 image 的 rowid 当成 author_id，
+    作品挂到不存在的作者上。而 list_works 用的是 JOIN authors，
+    这类悬空作品在 UI 上会彻底消失（比报错更难发现）。
+
+    注意用例必须先在同一长连接上插入**足够多**的 images，使残留 lastrowid
+    与真正的 author_id 数值不同 —— 否则「蒙对」会让守卫失效。
+    """
+    db.add_author("作者A")
+    aid = db.get_author_id("作者A")
+    assert aid == 1
+
+    db.begin_persistent()
+    try:
+        # 先在同一长连接上插入 images（rowid 递增到 3），制造来自**另一张表**的残留 lastrowid
+        db.add_author_with_works(
+            "作者B",
+            [("作品B", "/p/wb", None, [("/p/wb/1.jpg", 1), ("/p/wb/2.jpg", 2), ("/p/wb/3.jpg", 3)])],
+        )
+        # 再对已存在作者调用 → INSERT OR IGNORE 被忽略，残留 lastrowid=3 会冒充 author_id
+        db.add_author_with_works(
+            "作者A", [("作品1", "/p/w1", "/p/t.jpg", [("/p/w1/1.jpg", 9)])]
+        )
+    finally:
+        db.end_persistent()
+
+    works = db.list_works_by_author(aid)
+    assert "/p/w1" in works, "作品未挂到正确的 author_id 上"
+    assert _count_orphan_works() == 0, "works.author_id 指向了不存在的作者（悬空外键）"
+    # 图片也必须挂在作品1 上
+    assert db.get_work_image_mtimes(works["/p/w1"][0]) == {"/p/w1/1.jpg": 9}
+
+
+def test_add_author_idempotent_on_persistent_conn(temp_db):
+    """长连接下重复 add_author 必须返回同一个（且正确的）id"""
+    db.add_author("作者A")
+    aid = db.get_author_id("作者A")
+
+    db.begin_persistent()
+    try:
+        # 先在同一长连接上写入别的表，使残留 lastrowid 来自 images 而非 authors
+        db.add_author_with_works(
+            "作者B", [("作品B", "/p/wb", None, [("/p/wb/1.jpg", 1), ("/p/wb/2.jpg", 2)])]
+        )
+        first = db.add_author("作者A")   # 已存在 → 被忽略
+        again = db.add_author("作者A")
+    finally:
+        db.end_persistent()
+
+    assert first == aid, "幂等插入返回了残留 lastrowid 而非真实 author_id"
+    assert again == first

@@ -2,39 +2,45 @@
 主入口启动器：作为各功能模块的入口界面
 包含模块卡片网格，点击卡片打开对应模块窗口
 """
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
+    QComboBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QFrame,
-    QPushButton,
-    QSpacerItem,
-    QSizePolicy,
+    QMainWindow,
     QMessageBox,
-    QComboBox,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
-from PyQt6.QtGui import QFont, QPixmap, QPainter, QColor, QPen
 
 from resource_manager import config
+from ui.theme_base import (
+    ACCENT,
+    ACCENT_HOVER,
+    ACCENT_TINT,
+    BG_MAIN,
+    BG_SIDEBAR,
+    CARD_BG,
+    CARD_BORDER,
+    CARD_BORDER_HOVER,
+    CARD_HOVER,
+    TEXT_DIM,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    TEXT_SECONDARY,
+)
 
-
-# 配色方案（3D 黏土风 / 轻拟物新拟态）
-ACCENT = "#42B4C2"
-ACCENT_HOVER = "#48B8BC"
-ACCENT_TINT = "rgba(66, 180, 194, 0.15)"
-CARD_BG = "#FFFFFF"
-CARD_HOVER = "#FFFDF8"
-CARD_BORDER = "#E8E0D5"
-CARD_BORDER_HOVER = "#D5CDC0"
-BG_MAIN = "#F5F0E8"
-BG_SIDEBAR = "#FDF9F2"
-TEXT_PRIMARY = "#555555"
-TEXT_SECONDARY = "#777777"
-TEXT_MUTED = "#999999"
-TEXT_DIM = "#BBBBBB"
+__all__ = [
+    # 从 theme_base 转出的设计令牌（保持既有 `from ui.launcher import ACCENT` 可用）
+    "ACCENT", "ACCENT_HOVER", "ACCENT_TINT",
+    "BG_MAIN", "BG_SIDEBAR", "CARD_BG", "CARD_HOVER",
+    "CARD_BORDER", "CARD_BORDER_HOVER",
+    "TEXT_PRIMARY", "TEXT_SECONDARY", "TEXT_MUTED", "TEXT_DIM",
+    # 本模块对外接口
+    "ModuleCard", "LauncherWindow", "MODULES",
+]
 
 # 模块定义
 MODULES = [

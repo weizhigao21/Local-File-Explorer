@@ -1,32 +1,37 @@
+from contextlib import suppress
+
+from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QMainWindow,
-    QWidget,
+    QFrame,
     QHBoxLayout,
-    QVBoxLayout,
+    QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QPushButton,
-    QLineEdit,
-    QScrollArea,
-    QLabel,
+    QMainWindow,
     QMessageBox,
     QProgressBar,
-    QFrame,
-    QStackedWidget,
+    QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent
-from PyQt6.QtGui import QShortcut, QKeySequence
 
+from resource_manager import config, scanner
 from resource_manager import database as db
-from resource_manager import scanner
-from resource_manager import config
+from ui.flow_layout import FlowLayout
 from ui.grid_view import WorkCard
 from ui.image_viewer import ImageViewer
+from ui.photo_theme import ACCENT, ACCENT_TINT, BTN_QSS, GLOBAL_SCROLLBAR_QSS
+from ui.photo_widgets import ScanThread, SettingsDialog
 from ui.work_images_view import WorkImagesView
-from ui.flow_layout import FlowLayout
-from ui.photo_theme import ACCENT, ACCENT_TINT, GLOBAL_SCROLLBAR_QSS, BTN_QSS
-from ui.photo_widgets import SettingsDialog, ScanThread
+
+# 关闭窗口时若扫描线程来不及退出，仍需持有其 Python 引用：
+# QThread 没有 Qt parent，失去引用后被 GC 会销毁正在运行的线程对象，导致崩溃。
+_detached_threads = set()
 
 
 class MainWindow(QMainWindow):
@@ -213,6 +218,9 @@ class MainWindow(QMainWindow):
         self._auto_scanning = True
         QTimer.singleShot(500, self.start_scan)
 
+        # 扫描线程句柄：在 __init__ 里显式初始化，避免 closeEvent 等路径需要 getattr 兜底
+        self.scan_thread = None
+
     def _build_scan_status_bar(self):
         """构建底部扫描状态条：进度条 + 状态文本 + 取消按钮"""
         bar = QFrame()
@@ -336,9 +344,9 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         # 监听作品列表的视口 resize/show，触发懒加载
-        if obj is self.works_scroll.viewport():
-            if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
-                self._works_resize_timer.start()
+        if (obj is self.works_scroll.viewport()
+                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+            self._works_resize_timer.start()
         return super().eventFilter(obj, event)
 
     def _load_visible_work_cards(self):
@@ -453,12 +461,39 @@ class MainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
-        """窗口关闭时通知启动器恢复显示"""
+        """窗口关闭时先停掉后台扫描，再通知启动器恢复显示
+
+        扫描线程持有数据库长连接（db.begin_persistent()）。若不停就关窗口：
+          1. 线程继续向已关闭的窗口发信号；
+          2. 重新进入本模块会再起一条扫描线程，两条线程同时持有长连接；
+          3. 窗口对象失去 Python 引用后被回收，线程仍在跑 → 崩溃风险。
+        注意必须在 super().closeEvent() 之前停，否则窗口可能已经进入销毁流程。
+        """
+        self._stop_scan_thread()
         super().closeEvent(event)
         if self._on_back_to_launcher:
             cb = self._on_back_to_launcher
             self._on_back_to_launcher = None  # 防止重入
             cb()
+
+    def _stop_scan_thread(self):
+        """取消并等待扫描线程退出（幂等：线程未启动/已结束时安全）"""
+        t = self.scan_thread
+        if t is None or not t.isRunning():
+            return
+        t.cancel()
+        if t.wait(3000):
+            return
+        # 兜底：扫描线程仍在收尾（例如正在为当前作者的新作品生成缩略图，该阶段不检查取消标志）。
+        # 断开信号避免回调到已关闭的窗口，并用模块级集合持有引用防止 QThread 被 GC。
+        # 没有连接的信号 disconnect() 会抛 TypeError，逐个吞掉
+        for sig in (t.finished, t.error, t.progress, t.author_done):
+            with suppress(TypeError):
+                sig.disconnect()
+        _detached_threads.add(t)
+        # 注意：ScanThread.finished 是 pyqtSignal(dict)，槽必须能接住这个参数
+        t.finished.connect(lambda *_: _detached_threads.discard(t))
+        print("[关闭] 扫描线程未在 3 秒内退出，已断开其信号并保持引用直到结束")
 
     def on_back_clicked(self):
         if self.stack.currentIndex() == 1:

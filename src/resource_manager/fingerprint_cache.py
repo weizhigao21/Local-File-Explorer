@@ -19,7 +19,6 @@ import time
 from resource_manager import config
 from resource_manager.utils import natural_key
 
-
 # 指纹缓存文件路径（项目根目录 data/ 下）
 _FINGERPRINT_PATH = os.path.join(config.get_project_root(), "data", ".scan_fingerprint.json")
 
@@ -139,7 +138,7 @@ def _load_cache():
     if not os.path.exists(_FINGERPRINT_PATH):
         return {}
     try:
-        with open(_FINGERPRINT_PATH, "r", encoding="utf-8") as f:
+        with open(_FINGERPRINT_PATH, encoding="utf-8") as f:
             cache = json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}

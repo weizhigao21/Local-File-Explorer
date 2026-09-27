@@ -1,9 +1,8 @@
-from PyQt6.QtWidgets import QFrame, QLabel, QVBoxLayout
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtWidgets import QFrame, QLabel, QVBoxLayout
 
-from ui.image_loader import loader, get_cached
-
+from ui.image_loader import get_cached, loader
 
 # 强调色（与 main_window 保持一致）
 ACCENT = "#42B4C2"

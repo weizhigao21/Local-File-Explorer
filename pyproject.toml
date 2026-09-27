@@ -1,0 +1,37 @@
+# 代码检查配置（ruff）
+#
+# 用法：
+#   ruff check src          # 检查
+#   ruff check src --fix    # 自动修复可修项
+#
+# 说明：仓库此前没有任何 ruff/pytest 配置，规则只在 .ruff_cache 里留过痕迹，
+# 导致每次都是"临时挑规则跑一遍"。这里把选定的规则集固化下来，
+# 让 `ruff check src` 可以作为提交前的门禁（当前为零告警）。
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+exclude = ["build", "dist", "data", "__pycache__", ".workbuddy"]
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes：未使用导入/变量、未定义名、f-string 无占位符
+    "E",    # pycodestyle 错误
+    "W",    # pycodestyle 警告
+    "I",    # isort：导入顺序与分组
+    "UP",   # pyupgrade：过时写法（typing.Tuple、Optional[X] 等）
+    "B",    # flake8-bugbear：常见陷阱
+    "C4",   # flake8-comprehensions：推导式简化
+    "PIE",  # flake8-pie：多余写法
+    "RET",  # flake8-return：return 冗余
+    "SIM",  # flake8-simplify：可简化的分支/上下文
+]
+ignore = [
+    "E501",  # 行长度：中文注释按字符计长易误报，交由人工判断
+    "E402",  # 允许 import 前有语句：Qt 必须先设 QT_QPA_PLATFORM 再导入
+    "B007",  # 循环变量未使用：显式解包（for path, _ in ...）比省略更易读
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试中大量用 lambda 充当桩函数，`lambda: {}` 比内建 `dict` 更能表达"返回空值"
+"src/tests/*" = ["PIE807"]

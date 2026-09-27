@@ -5,21 +5,20 @@
 import os
 import threading
 
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
-    QVBoxLayout,
     QLabel,
-    QPushButton,
     QLineEdit,
     QMessageBox,
-    QFileDialog,
-    QCheckBox,
+    QPushButton,
+    QVBoxLayout,
 )
-from PyQt6.QtCore import QThread, pyqtSignal
 
-from resource_manager import config
-from resource_manager import scanner
+from resource_manager import config, scanner
 
 
 class SettingsDialog(QDialog):

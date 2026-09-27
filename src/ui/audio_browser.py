@@ -1,40 +1,65 @@
 """
 音频模块歌单浏览器
-层级导航（路径栈 + 面包屑）、搜索、标签过滤、网格/列表双视图、分页
+主歌单列表（搜索、标签过滤、网格/列表双视图、分页）
 """
 import os
 
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
-    QWidget, QHBoxLayout, QVBoxLayout,
-    QListWidget, QListWidgetItem, QPushButton, QLabel,
-    QScrollArea, QFrame, QSizePolicy, QMessageBox,
-    QStackedWidget, QLineEdit, QDialog, QComboBox, QMenu,
+    QComboBox,
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 
 from audio_manager import database as db
 from audio_manager import dlsite_db
 from audio_manager.dlsite import extract_rj_code
 from resource_manager import config
-from ui.flow_layout import FlowLayout
-from ui.tag_widgets import TagChip, FilterSelectorDialog, parse_tags
 from ui.audio_theme import (
-    ACCENT, ACCENT_TINT, BG_MAIN, BG_SIDEBAR,
-    TEXT_PRIMARY, TEXT_MUTED, TEXT_DIM, BTN_QSS, MENU_QSS, get_basename,
+    ACCENT,
+    ACCENT_TINT,
+    BG_MAIN,
+    BG_SIDEBAR,
+    BTN_QSS,
+    MENU_QSS,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
 )
 from ui.audio_widgets import PlaylistCard
+from ui.flow_layout import FlowLayout
+from ui.tag_widgets import FilterSelectorDialog, TagChip, parse_tags
 
 
 class PlaylistBrowser(QWidget):
-    """歌单浏览器：支持进入子文件夹、面包屑导航"""
+    """歌单浏览器：只呈现主歌单，支持搜索、筛选与双视图切换。"""
     openPlaylist = pyqtSignal(int)  # 打开歌单的曲目详情页
+    returnToPlaylist = pyqtSignal(int)  # 从筛选视图返回来源歌单详情页
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"background-color: {BG_MAIN};")
-        self._path_stack = [""]  # 路径栈，栈顶为当前 parent_path
-        self._all_playlists = []  # 当前层级全部歌单（未过滤）
+        # 浏览器只呈现根级歌单列表，子歌单由「歌单详情页」以子歌单卡片呈现。
+        # 历史上这里还有一套"路径栈 + 面包屑"下钻机制，但从未接线（无任何
+        # navigate_to 调用方），实为误导性死代码，已整体移除。
+        self._current_path = ""
+        self._return_pl_id = None  # 筛选视图的来源歌单（由详情页标签/社团点击进入时设置）
+        self._return_label = ""    # 来源歌单名（用于返回按钮文案与 tooltip）
+        self._all_playlists = []  # 主歌单（未过滤）
+        self._playlist_by_id = {}
         self._filtered_cache = []  # 当前筛选/排序后的歌单缓存
         self._page_size = 30  # 每页歌单数
         self._current_page = 0  # 当前页码（0-based）
@@ -57,19 +82,12 @@ class PlaylistBrowser(QWidget):
         nav_layout.setContentsMargins(8, 4, 8, 4)
         nav_layout.setSpacing(6)
 
-        self.back_btn = QPushButton("← 返回上级")
+        self.back_btn = QPushButton("← 返回歌单")
         self.back_btn.setStyleSheet(BTN_QSS)
-        self.back_btn.setFixedWidth(100)
+        self.back_btn.setFixedWidth(126)
         self.back_btn.clicked.connect(self._go_up)
         self.back_btn.setVisible(False)
         nav_layout.addWidget(self.back_btn)
-
-        # 面包屑
-        self._breadcrumb_widget = QWidget()
-        self._breadcrumb_layout = QHBoxLayout(self._breadcrumb_widget)
-        self._breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
-        self._breadcrumb_layout.setSpacing(2)
-        nav_layout.addWidget(self._breadcrumb_widget)
 
         # 标签芯片（水平排列，无弹性）
         self._tag_bar = QWidget()
@@ -275,55 +293,106 @@ class PlaylistBrowser(QWidget):
 
     @property
     def current_path(self):
-        return self._path_stack[-1] if self._path_stack else ""
+        """当前层级的 parent_path（浏览器仅呈现根级列表，故恒为空串）"""
+        return self._current_path
 
     def _go_up(self):
-        """返回上级目录"""
-        if len(self._path_stack) > 1:
-            self._path_stack.pop()
-            self._load_current()
+        """返回按钮：退出筛选视图并回到来源歌单（根级列表本身没有"上级"）"""
+        self._return_to_origin_playlist()
 
-    def navigate_to(self, path):
-        """导航到指定路径（作为当前 parent_path）"""
-        self._path_stack.append(path)
-        self._load_current()
+    def _update_back_button(self):
+        """同步返回按钮的文案与可见性
 
-    def refresh(self):
-        """刷新当前层级"""
+        只有"处于从歌单详情页发起的筛选视图"时才有返回目标：按钮指向来源歌单。
+        根级列表既没有上级目录、也没有来源歌单，因此该状态下隐藏返回入口。
+        """
+        if self._return_pl_id is not None:
+            name = self._return_label or "歌单"
+            self.back_btn.setToolTip(f"返回歌单：{self._return_label}" if self._return_label
+                                     else "返回来源歌单")
+            self.back_btn.setText(f"← 返回 {name[:8] + '…' if len(name) > 8 else name}")
+            self.back_btn.setVisible(True)
+            return
+        self.back_btn.setToolTip("")
+        self.back_btn.setVisible(False)
+
+    # ── 筛选视图返回上下文 ──
+
+    def set_return_target(self, pl_id, label=""):
+        """记录筛选视图的来源歌单：返回按钮将指向它而非上级目录"""
+        self._return_pl_id = pl_id
+        self._return_label = label or ""
+        self._update_back_button()
+
+    def clear_return_target(self):
+        """清除来源歌单（返回按钮恢复为"返回上级目录"语义）"""
+        self._return_pl_id = None
+        self._return_label = ""
+        self._update_back_button()
+
+    def _reset_filter_view(self):
+        """离开筛选视图：清空筛选条件与返回目标（不重绘列表）"""
+        self._return_pl_id = None
+        self._return_label = ""
+        self._active_tags.clear()
+        self._dlsite_circles.clear()
+        self._dlsite_cvs.clear()
+        self.search_box.setVisible(True)
         self.search_box.clear()
-        self.clear_tags()
-        self._load_current()
+        self._sync_tag_ui()
+        self._update_back_button()
+
+    def _return_to_origin_playlist(self):
+        """若当前处于详情页发起的筛选视图，退回来源歌单详情页；返回是否已处理"""
+        pl_id = self._return_pl_id
+        if pl_id is None:
+            return False
+        self._reset_filter_view()
+        self._apply_filter()  # 筛选条件已清除，重绘为当前层级完整列表
+        self.returnToPlaylist.emit(pl_id)
+        return True
+
+    def _return_if_filter_emptied(self):
+        """用户逐个擦除筛选芯片后：筛选项清空且来自歌单详情页时退回该歌单"""
+        if self._active_tags or self._dlsite_circles or self._dlsite_cvs:
+            return
+        self._return_to_origin_playlist()
 
     def reload_current(self):
-        """重新加载当前层级数据（保留导航/搜索/标签状态）
+        """重新加载音频歌单（保留搜索/标签状态）
 
-        供后台 mtime 迁移完成后静默刷新用，避免重置用户已导航的位置。
+        供后台 mtime 迁移完成后静默刷新用，避免重置用户已设置的条件。
         """
-        self._all_playlists = db.list_playlists_by_parent(self.current_path)
-        self._apply_filter()
+        self._load_catalog()
+        self._apply_filter(preserve_page=True)
 
     def reset(self):
         """回到根目录"""
-        self._path_stack = [""]
+        self._current_path = ""
         self.search_box.clear()
         self.clear_tags()
         self._load_current()
 
     def _load_current(self):
-        """根据当前路径加载歌单"""
-        parent = self.current_path
-        self._all_playlists = db.list_playlists_by_parent(parent)
+        """加载根级主歌单；子目录仅在相应歌单的详情页出现。"""
+        self._load_catalog()
         self._apply_filter()
 
-        # 更新导航栏
-        self.back_btn.setVisible(len(self._path_stack) > 1)
-        self._rebuild_breadcrumb()
+        self._update_back_button()
+
+    def _load_catalog(self):
+        self._all_playlists = db.list_playlists_by_parent("")
+        self._playlist_by_id = {pl["id"]: pl for pl in self._all_playlists}
+
+    def get_playlist_entry(self, pl_id):
+        """返回主歌单展示记录。"""
+        return self._playlist_by_id.get(pl_id)
 
     def _on_search_changed(self, text):
         """搜索框文本变化时防抖过滤"""
         self._search_timer.start()  # 每次变化重启300ms定时器
 
-    def _apply_filter(self):
+    def _apply_filter(self, *_signal_args, preserve_page=False):
         """根据搜索框文本 / 活动标签过滤并按排序后渲染歌单"""
         text = self.search_box.text().strip().lower() if hasattr(self, 'search_box') else ""
         if text:
@@ -338,7 +407,8 @@ class PlaylistBrowser(QWidget):
         # DLsite 社团/CV 过滤（与标签叠加跨维度 AND；无 RJ 码或未抓取的歌单不匹配）
         if self._dlsite_circles or self._dlsite_cvs:
             rjs = dlsite_db.find_rjs_by(circles=self._dlsite_circles, cvs=self._dlsite_cvs)
-            filtered = [pl for pl in filtered if extract_rj_code(pl["name"]) in rjs]
+            filtered = [pl for pl in filtered
+                        if (pl.get("rj_code") or extract_rj_code(pl["name"])) in rjs]
 
         # 排序
         idx = self.sort_selector.currentIndex() if hasattr(self, 'sort_selector') else 0
@@ -354,7 +424,8 @@ class PlaylistBrowser(QWidget):
                 filtered, key=lambda pl: pl.get("mtime", 0), reverse=reverse
             )
 
-        self._current_page = 0
+        if not preserve_page:
+            self._current_page = 0
         self._render(self._filtered_cache)
 
         total = len(self._all_playlists)
@@ -365,76 +436,6 @@ class PlaylistBrowser(QWidget):
             self.count_label.setText(f"搜索: {shown}/{total} 个歌单")
         else:
             self.count_label.setText(f"共 {shown} 个歌单" if shown else "")
-
-    def _rebuild_breadcrumb(self):
-        """重建面包屑导航"""
-        # 清除原有部件
-        while self._breadcrumb_layout.count():
-            item = self._breadcrumb_layout.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
-
-        # 生成路径分段
-        segments = []
-        # 根目录
-        segments.append(("歌单列表", ""))
-
-        # 中间路径段
-        parts = self._path_stack[1:]  # 跳过栈底 ""
-        for p in parts:
-            name = get_basename(p)
-            segments.append((name, p))
-
-        # 构建面包屑
-        for i, (name, path) in enumerate(segments):
-            is_last = (i == len(segments) - 1)
-
-            btn = QPushButton(name)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            if is_last:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: transparent; color: {ACCENT};
-                        border: none; font-size: 12px; padding: 2px 4px;
-                        font-weight: bold;
-                    }}
-                """)
-                btn.setEnabled(False)
-            else:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: transparent; color: {TEXT_MUTED};
-                        border: none; font-size: 12px; padding: 2px 4px;
-                    }}
-                    QPushButton:hover {{ color: {TEXT_PRIMARY}; }}
-                """)
-                btn.clicked.connect(lambda checked, p=path: self._jump_to(p))
-
-            self._breadcrumb_layout.addWidget(btn)
-
-            if not is_last:
-                sep = QLabel(">")
-                sep.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
-                self._breadcrumb_layout.addWidget(sep)
-
-        self._breadcrumb_layout.addStretch()
-
-    def _jump_to(self, path):
-        """跳转到指定路径（从面包屑点击）"""
-        # 重建栈：找到 path 在栈中的位置
-        if path == "":
-            self._path_stack = [""]
-        else:
-            idx = -1
-            for i, p in enumerate(self._path_stack):
-                if p == path:
-                    idx = i
-                    break
-            if idx >= 0:
-                self._path_stack = self._path_stack[:idx + 1]
-            else:
-                self._path_stack = [path]
-        self._load_current()
 
     # ── 标签过滤 ──
 
@@ -449,21 +450,17 @@ class PlaylistBrowser(QWidget):
         self.filter_by_tags(self._active_tags | {tag})
 
     def _on_tag_removed(self, tag):
-        """移除单个标签过滤"""
+        """移除单个标签过滤；筛选项被擦光时退回来源歌单"""
         self._active_tags.discard(tag)
         if not self._active_tags:
             self.search_box.clear()
         self._sync_tag_ui()
         self._apply_filter()
+        self._return_if_filter_emptied()
 
     def clear_tags(self):
-        """清除所有标签过滤（含社团/CV 过滤）"""
-        self._active_tags.clear()
-        self._dlsite_circles.clear()
-        self._dlsite_cvs.clear()
-        self.search_box.setVisible(True)
-        self.search_box.clear()
-        self._sync_tag_ui()
+        """清除所有标签过滤（含社团/CV 过滤），同时放弃筛选视图的返回目标"""
+        self._reset_filter_view()
         self._apply_filter()
 
     # ── DLsite 社团/CV 过滤（与标签叠加 AND） ──
@@ -486,11 +483,12 @@ class PlaylistBrowser(QWidget):
         self._apply_filter()
 
     def _on_dlsite_chip_removed(self, field, value):
-        """移除单个社团/CV 过滤（导航栏芯片 × 按钮）"""
+        """移除单个社团/CV 过滤（导航栏芯片 × 按钮）；筛选项被擦光时退回来源歌单"""
         target = self._dlsite_circles if field == "circle" else self._dlsite_cvs
         target.discard(value)
         self._sync_tag_ui()
         self._apply_filter()
+        self._return_if_filter_emptied()
 
     def _open_filter_selector(self):
         """打开联合筛选选择器窗口（标签/CV/社团 三个页签）"""
@@ -563,8 +561,6 @@ class PlaylistBrowser(QWidget):
 
         start = self._current_page * self._page_size
         playlists = all_playlists[start:start + self._page_size]
-
-        # 批量查询子歌单数量（一次查询替代 N 次 get_child_count）
         child_counts = db.get_child_counts_batch([pl["path"] for pl in playlists])
 
         if self._view_stack.currentIndex() == 0:
@@ -583,8 +579,7 @@ class PlaylistBrowser(QWidget):
                 item.widget().deleteLater()
 
         for pl in playlists:
-            has_children = child_counts.get(pl["path"], 0) > 0
-            card = PlaylistCard(pl, has_children=has_children)
+            card = PlaylistCard(pl, has_children=child_counts.get(pl["path"], 0) > 0)
             card.clicked.connect(self._on_card_click)
             self.flow.addWidget(card)
 
@@ -598,6 +593,7 @@ class PlaylistBrowser(QWidget):
             suffix = " 📁" if has_children else ""
             text = f"{pl['name']}    {pl['track_count']} 首曲目{suffix}"
             item = QListWidgetItem(text)
+            item.setToolTip(pl["name"])
             item.setData(Qt.ItemDataRole.UserRole, pl["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, has_children)
             item.setData(Qt.ItemDataRole.UserRole + 2, pl["path"])

@@ -1,13 +1,21 @@
 """
 写真模块主题
 配色常量、全局滚动条样式、通用按钮样式
-"""
 
-# ---- 主题配色（3D 黏土风 / 轻拟物新拟态） ----
-ACCENT = "#42B4C2"                 # 强调色（青蓝）
-ACCENT_HOVER = "#48B8BC"           # 强调色悬停
+配色令牌统一来自 ui.theme_base（见该模块说明），此处继续对外导出，
+保持 `from ui.photo_theme import ACCENT` 这类既有写法不变。
+"""
+from ui.theme_base import ACCENT, ACCENT_HOVER, ACCENT_TINT
+
+__all__ = [
+    # 从 theme_base 转出的设计令牌
+    "ACCENT", "ACCENT_HOVER", "ACCENT_TINT",
+    # 写真模块自有
+    "ACCENT_PRESSED", "ACCENT_TINT_LIGHT", "GLOBAL_SCROLLBAR_QSS", "BTN_QSS",
+]
+
+# ---- 写真模块特有的强调色档位 ----
 ACCENT_PRESSED = "#3DA0AE"         # 强调色按下
-ACCENT_TINT = "rgba(66, 180, 194, 0.15)"   # 半透明 accent 背景
 ACCENT_TINT_LIGHT = "rgba(66, 180, 194, 0.08)"
 
 # 全局滚动条样式（窄条 + 圆角 + 悬停变亮）

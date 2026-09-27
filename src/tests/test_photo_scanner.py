@@ -7,17 +7,16 @@
 
 使用临时 PHOTO_ROOT、临时 DB、临时指纹缓存，避免污染真实数据。
 """
-import os
 import shutil
+import sqlite3
 import time
 
 import pytest
 from PIL import Image
 
-from resource_manager import config
+from resource_manager import config, scanner
 from resource_manager import database as db
 from resource_manager import fingerprint_cache as fp
-from resource_manager import scanner
 
 
 @pytest.fixture
@@ -154,3 +153,78 @@ def test_dir_level_ignores_file_content_change(temp_photo_env):
     # file level 应能检测到（mtime 或 size 变化）
     unchanged_file, _ = fp.is_unchanged(str(photo_root), level="file")
     assert unchanged_file is False
+
+
+# ==================== 长连接写锁（回归守卫） ====================
+# 背景：scan() 用 begin_persistent() 开长连接，写事务一直持有到扫描结束才提交；
+# 而 database.py 里的 add_author / get_author_id / add_author_with_works 曾走
+# get_conn() 短连接，与长连接争抢 SQLite 写锁 → 短连接抛 `database is locked`。
+# 该异常被 scan() 外层 per-author try/except 吞掉（只打印），于是：
+#   1. 受影响作者的作品整批丢失；
+#   2. stats["added"] 仍照常累加（假成功）；
+#   3. 扫描结尾照样 fp.update() 写指纹 → 下次扫描判定"无变化"直接跳过，
+#      新作品长期不出现且用户看不到任何报错。
+# 因此断言必须落在「数据库真实内容」上，不能依赖异常传播。
+
+def _scan_once_no_unchanged():
+    stats = scanner.scan(check_fingerprint=True)
+    assert "unchanged" not in stats, "本轮扫描应真实执行而非被指纹跳过"
+    return stats
+
+
+def _count_orphan_works():
+    """统计 works.author_id 指向不存在作者的「悬空外键」数量"""
+    conn = sqlite3.connect(config.DB_PATH)
+    n = conn.execute(
+        "SELECT COUNT(*) FROM works w LEFT JOIN authors a ON a.id = w.author_id "
+        "WHERE a.id IS NULL"
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def test_scan_new_work_alongside_image_add_not_lost(temp_photo_env):
+    """同一轮扫描里既有「已有作品追加图片」(长连接写) 又有「新增作品」时，两者都要落库"""
+    photo_root = temp_photo_env
+    work1 = _make_work(photo_root, "作者A", "作品1", img_count=1)
+    _scan_once_no_unchanged()
+
+    # 同一轮扫描内：作品1 追加一张图（触发长连接写事务）+ 新增作品2（短连接写）
+    _make_image(work1 / "001.jpg")
+    time.sleep(0.02)
+    _make_work(photo_root, "作者A", "作品2", img_count=1)
+
+    stats = _scan_once_no_unchanged()
+
+    works = db.list_works_by_author(db.get_author_id("作者A"))
+    assert str(work1) in works, "已有作品1 被误删"
+    assert str(photo_root / "作者A" / "作品2") in works, (
+        "作品2 未入库 —— 长连接持写锁时短连接写入失败且异常被吞掉"
+    )
+    # 作品1 追加的图片也必须落库
+    assert len(db.get_work_image_mtimes(works[str(work1)][0])) == 2
+    # stats 与实际落库一致（旧实现下 stats 会虚报）
+    assert stats["added"] == 2
+    assert _count_orphan_works() == 0, "作品的 author_id 指向了不存在的作者"
+
+
+def test_scan_new_author_alongside_image_add_not_lost(temp_photo_env):
+    """作者A 持写锁时新增「作者B」——add_author 走短连接会让整个新作者丢失"""
+    photo_root = temp_photo_env
+    work_a = _make_work(photo_root, "作者A", "作品1", img_count=1)
+    _scan_once_no_unchanged()
+
+    # 同一轮扫描内：给作者A 的作品追加图片 + 新增作者B
+    _make_image(work_a / "001.jpg")
+    time.sleep(0.02)
+    _make_work(photo_root, "作者B", "作品1", img_count=1)
+
+    _scan_once_no_unchanged()
+
+    authors = [name for _, name in db.list_all_authors()]
+    assert "作者A" in authors
+    assert "作者B" in authors, (
+        "作者B 整个丢失 —— add_author 短连接写入被长连接写锁挡住且异常被吞掉"
+    )
+    works_b = db.list_works_by_author(db.get_author_id("作者B"))
+    assert str(photo_root / "作者B" / "作品1") in works_b

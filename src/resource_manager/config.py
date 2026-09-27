@@ -1,7 +1,6 @@
+import json
 import os
 import sys
-import json
-
 
 # ==================== 项目根路径（兼容 PyInstaller 打包） ====================
 
@@ -10,8 +9,7 @@ def get_project_root():
     if getattr(sys, "frozen", False):
         # PyInstaller 打包后：data/ 目录放在 exe 同级
         return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 
 # 项目根目录
@@ -41,7 +39,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -79,7 +77,7 @@ def _load_user_config():
     global _user_config
     if os.path.exists(USER_CONFIG_PATH):
         try:
-            with open(USER_CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(USER_CONFIG_PATH, encoding="utf-8") as f:
                 data = json.load(f)
             # 仅接受已知字段，忽略未知键
             merged = dict(_DEFAULT_USER_CONFIG)
