@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -39,7 +40,7 @@ from ui.audio_theme import (
     TEXT_MUTED,
     TEXT_PRIMARY,
 )
-from ui.audio_widgets import PlaylistCard
+from ui.audio_widgets import AudioTaskStatus, PlaylistCard
 from ui.flow_layout import FlowLayout
 from ui.tag_widgets import FilterSelectorDialog, TagChip, parse_tags
 
@@ -227,34 +228,41 @@ class PlaylistBrowser(QWidget):
         self._view_stack.setCurrentIndex(0)
 
         # ---- 分页栏 ----
-        page_bar = QFrame()
+        self.page_bar = page_bar = QFrame()
         page_bar.setFixedHeight(40)
         page_bar.setStyleSheet(f"background-color: {BG_SIDEBAR}; border: none;")
-        page_layout = QHBoxLayout(page_bar)
+        page_layout = QGridLayout(page_bar)
         page_layout.setContentsMargins(8, 4, 8, 4)
         page_layout.setSpacing(6)
 
-        page_layout.addStretch()
+        self.background_status = AudioTaskStatus()
+        page_layout.addWidget(self.background_status, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        self.pagination_controls = QWidget()
+        pagination_layout = QHBoxLayout(self.pagination_controls)
+        pagination_layout.setContentsMargins(0, 0, 0, 0)
+        pagination_layout.setSpacing(6)
+        page_layout.addWidget(self.pagination_controls, 0, 1)
+        page_layout.addWidget(QWidget(), 0, 2)
+        page_layout.setColumnStretch(0, 1)
+        page_layout.setColumnStretch(2, 1)
 
         self._prev_btn = QPushButton("上一页")
         self._prev_btn.setStyleSheet(BTN_QSS)
         self._prev_btn.setFixedWidth(80)
         self._prev_btn.clicked.connect(lambda: self._go_page(-1))
-        page_layout.addWidget(self._prev_btn)
+        pagination_layout.addWidget(self._prev_btn)
 
         self._page_label = QLabel("第 1 页 / 共 1 页")
         self._page_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
         self._page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._page_label.setFixedWidth(140)
-        page_layout.addWidget(self._page_label)
+        pagination_layout.addWidget(self._page_label)
 
         self._next_btn = QPushButton("下一页")
         self._next_btn.setStyleSheet(BTN_QSS)
         self._next_btn.setFixedWidth(80)
         self._next_btn.clicked.connect(lambda: self._go_page(1))
-        page_layout.addWidget(self._next_btn)
-
-        page_layout.addStretch()
+        pagination_layout.addWidget(self._next_btn)
         layout.addWidget(page_bar)
 
         # 恢复上次使用的配置

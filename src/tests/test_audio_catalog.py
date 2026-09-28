@@ -13,6 +13,7 @@ from audio_manager import dlsite  # noqa: E402
 from audio_manager.catalog import build_audio_catalog
 from resource_manager import config  # noqa: E402
 from ui.audio_view import AudioMainWindow  # noqa: E402
+from ui.audio_widgets import SubPlaylistCard  # noqa: E402
 
 
 def test_folder_name_dot_is_distinct_from_path_separator(tmp_path):
@@ -28,6 +29,27 @@ def test_folder_name_dot_is_distinct_from_path_separator(tmp_path):
     assert len(catalog) == 2
     assert len({pl["name"] for pl in catalog}) == 2
     assert {pl["name"] for pl in catalog} == {"A.B", "A > B"}
+
+
+def test_long_subplaylist_path_stays_inside_card_and_keeps_full_tooltip():
+    app = QApplication.instance() or QApplication([])
+    name = "非常非常长的上级文件夹名称 > 另一个很长的中间文件夹 > 最终文件夹名称"
+    card = SubPlaylistCard({"id": 1, "name": name, "track_count": 12})
+    card.resize(300, 32)
+    card.show()
+    app.processEvents()
+
+    label = card.name_label
+    assert label.toolTip() == name
+    assert label.text() != name
+    assert "最终文件夹" in label.text()
+    assert label.fontMetrics().horizontalAdvance(label.text()) <= label.width()
+    assert card.layout().itemAt(1).widget().geometry().right() < card.width()
+
+    card.resize(1100, 32)
+    app.processEvents()
+    assert label.text() == name
+    card.close()
 
 
 def test_main_playlist_contains_flat_audio_subplaylists(tmp_path, monkeypatch):

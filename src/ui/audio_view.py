@@ -13,11 +13,9 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
-    QLabel,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -35,7 +33,6 @@ from ui.audio_theme import (
     BG_MAIN,
     BG_SIDEBAR,
     BTN_QSS,
-    TEXT_PRIMARY,
 )
 from ui.audio_threads import AudioScanThread, DlsiteWorker, MtimeMigrationThread
 from ui.audio_widgets import AudioSettingsDialog
@@ -195,6 +192,14 @@ class AudioMainWindow(QMainWindow):
         self.detail.trackDoubleClicked.connect(self._on_track_double_clicked)
         self.page_stack.addWidget(self.detail)  # index 1
 
+        # 复用浏览器的分页栏，详情页也能在同一位置显示后台任务。
+        layout.addWidget(self.browser.page_bar)
+        self.background_status = self.browser.background_status
+        self.background_status.cancelRequested.connect(self._cancel_scan)
+        self.background_status.logRequested.connect(self._show_dlsite_log)
+        self.background_status.activityChanged.connect(self._update_footer_visibility)
+        self.page_stack.currentChanged.connect(self._update_footer_visibility)
+
         # ---- 播放栏 ----
         self.player_bar = AudioPlayerBar()
         self.player_bar.prevClicked.connect(self.play_previous)
@@ -206,85 +211,25 @@ class AudioMainWindow(QMainWindow):
         layout.addWidget(self.player_bar)
         self.player_bar.setVisible(False)
 
-        # 扫描状态栏
-        self._scan_bar = self._build_scan_bar()
-        layout.addWidget(self._scan_bar)
-        self._scan_bar.setVisible(False)
-
-        # DLsite 抓取状态栏（进度 + 日志入口）
-        self._dlsite_bar = self._build_dlsite_bar()
-        layout.addWidget(self._dlsite_bar)
-        self._dlsite_bar.setVisible(False)
         self._dlsite_logs = []            # 抓取日志缓冲（带时间戳）
         self._dlsite_log_dialog = None    # 日志窗口（懒创建）
+        self._scan_hide_timer = QTimer(self)
+        self._scan_hide_timer.setSingleShot(True)
+        self._scan_hide_timer.timeout.connect(self._clear_scan_status)
         self._dlsite_hide_timer = QTimer(self)
         self._dlsite_hide_timer.setSingleShot(True)
-        self._dlsite_hide_timer.timeout.connect(self._dlsite_bar.hide)
+        self._dlsite_hide_timer.timeout.connect(self._clear_dlsite_status)
 
-    def _build_dlsite_bar(self):
-        bar = QFrame()
-        bar.setFixedHeight(36)
-        bar.setStyleSheet(f"""
-            QFrame {{ background-color: {BG_SIDEBAR}; border-top: 1px solid #EDE6DA; }}
-            QLabel {{ color: #777; font-size: 11px; padding: 2px; }}
-            QProgressBar {{
-                border: none; background: #EDE6DA; border-radius: 2px;
-                text-align: center; color: {TEXT_PRIMARY}; font-size: 10px; height: 12px;
-            }}
-            QProgressBar::chunk {{ background-color: #8FA9C2; border-radius: 2px; }}
-        """)
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(8, 4, 8, 4)
-        row.setSpacing(8)
-        self.dlsite_status_label = QLabel("DLsite 信息抓取中...")
-        self.dlsite_status_label.setFixedWidth(340)
-        self.dlsite_progress_bar = QProgressBar()
-        self.dlsite_progress_bar.setFixedWidth(260)
-        self.dlsite_progress_bar.setRange(0, 1)
-        self.dlsite_progress_bar.setValue(0)
-        log_btn = QPushButton("日志")
-        log_btn.setStyleSheet(BTN_QSS)
-        log_btn.setFixedWidth(50)
-        log_btn.clicked.connect(self._show_dlsite_log)
-        row.addWidget(self.dlsite_status_label)
-        row.addWidget(self.dlsite_progress_bar)
-        row.addStretch()
-        row.addWidget(log_btn)
-        return bar
+    def _clear_scan_status(self):
+        self.background_status.clear_task("scan")
 
-    def _build_scan_bar(self):
-        bar = QFrame()
-        bar.setFixedHeight(36)
-        from PyQt6.QtWidgets import QHBoxLayout, QProgressBar
+    def _clear_dlsite_status(self):
+        self.background_status.clear_task("dlsite")
 
-        from ui.audio_theme import ACCENT
-        bar.setStyleSheet(f"""
-            QFrame {{ background-color: {BG_SIDEBAR}; border-top: 1px solid #EDE6DA; }}
-            QLabel {{ color: #777; font-size: 11px; padding: 2px; }}
-            QProgressBar {{
-                border: none; background: #EDE6DA; border-radius: 2px;
-                text-align: center; color: {TEXT_PRIMARY}; font-size: 10px; height: 12px;
-            }}
-            QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 2px; }}
-        """)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(8, 4, 8, 4)
-        layout.setSpacing(8)
-        self.scan_label = QLabel("准备扫描...")
-        self.scan_label.setFixedWidth(340)
-        self.scan_progress = QProgressBar()
-        self.scan_progress.setFixedWidth(260)
-        self.scan_progress.setRange(0, 100)
-        self.scan_progress.setValue(0)
-        self.scan_cancel = QPushButton("取消")
-        self.scan_cancel.setStyleSheet(BTN_QSS)
-        self.scan_cancel.setFixedWidth(50)
-        self.scan_cancel.clicked.connect(self._cancel_scan)
-        layout.addWidget(self.scan_label)
-        layout.addWidget(self.scan_progress)
-        layout.addStretch()
-        layout.addWidget(self.scan_cancel)
-        return bar
+    def _update_footer_visibility(self):
+        browsing = self.page_stack.currentIndex() == 0
+        self.browser.pagination_controls.setVisible(browsing)
+        self.browser.page_bar.setVisible(browsing or self.background_status.has_tasks())
 
     # ==================== 数据加载 ====================
     def _refresh_playlists(self):
@@ -539,23 +484,20 @@ class AudioMainWindow(QMainWindow):
 
     # ── DLsite 进度与日志 ──
     def _on_dlsite_progress(self, done, total, action):
-        """更新底部 DLsite 抓取进度条"""
+        """在分页栏更新信息抓取进度。"""
         if total <= 0:
             return
-        self._dlsite_bar.setVisible(True)
         if done >= total:
-            self.dlsite_status_label.setText(f"DLsite 信息全部完成（{total} 个）")
-            self.dlsite_progress_bar.setRange(0, 1)
-            self.dlsite_progress_bar.setValue(1)
+            self.background_status.set_task(
+                "dlsite", 100, "信息就绪", f"DLsite 信息全部完成（{total} 个）",
+            )
             self._dlsite_hide_timer.start(4000)  # 完成后停留 4 秒再隐藏
         else:
             self._dlsite_hide_timer.stop()
-            text = f"DLsite 信息: {done}/{total}"
-            if action:
-                text += f"  {action}"
-            self.dlsite_status_label.setText(text)
-            self.dlsite_progress_bar.setRange(0, total)
-            self.dlsite_progress_bar.setValue(done)
+            self.background_status.set_task(
+                "dlsite", int(done * 100 / total), "拉取信息",
+                f"DLsite 信息: {done}/{total}\n{action}",
+            )
 
     def _on_dlsite_log(self, line):
         """接收 worker 日志行（带时间戳缓冲，日志窗口打开时实时追加）"""
@@ -777,14 +719,10 @@ class AudioMainWindow(QMainWindow):
     def start_scan(self):
         if getattr(self, "scan_thread", None) and self.scan_thread.isRunning():
             return
-        auto = getattr(self, "_auto_scanning", False)
-        # auto 模式延迟显示扫描条：仅当检测到真实进度（current<total）时才显示；
-        # unchanged 时扫描条从头到尾不出现，用户无感。manual 模式立即显示。
-        self.scan_progress.setValue(0)
-        self.scan_label.setText("准备扫描...")
-        self.scan_cancel.setEnabled(True)
-        if not auto:
-            self._scan_bar.setVisible(True)
+        self._scan_hide_timer.stop()
+        self._scan_cancelling = False
+        self._scan_percent = 0
+        self.background_status.set_task("scan", 0, "准备扫描", "正在检查音频目录", True)
 
         self.scan_thread = AudioScanThread(config.AUDIO_ROOTS)
         self.scan_thread.finished.connect(self._on_scan_finished)
@@ -795,27 +733,19 @@ class AudioMainWindow(QMainWindow):
     def _cancel_scan(self):
         if self.scan_thread and self.scan_thread.isRunning():
             self.scan_thread.cancel()
-            self.scan_cancel.setEnabled(False)
-            self.scan_label.setText("正在取消...")
             self._scan_cancelling = True
-            # 等待扫描线程真正结束，期间"正在取消..."文本保持可见
-            self.scan_thread.wait(3000)
-        self._scan_bar.setVisible(False)
+            self.background_status.set_task(
+                "scan", self._scan_percent, "正在取消", "等待扫描线程结束",
+            )
 
     def _on_scan_progress(self, current, total, msg):
-        auto = getattr(self, "_auto_scanning", False)
-        # auto 模式且扫描条未显示：仅真实进度（current<total）才弹出扫描条；
-        # unchanged 收尾信号 (1,1) 等无效信号直接吞掉，保持静默。
-        if auto and not self._scan_bar.isVisible():
-            if total <= 0 or current >= total:
-                return
-            self._scan_bar.setVisible(True)
-        if total > 0:
-            self.scan_progress.setValue(int(current / total * 100))
-        # 截断过长的文件/文件夹名称，保持标签宽度稳定
-        if len(msg) > 42:
-            msg = msg[:39] + "..."
-        self.scan_label.setText(msg)
+        if getattr(self, "_scan_cancelling", False):
+            return
+        self._scan_percent = int(current * 100 / total) if total > 0 else 0
+        # 收尾仍有数据库整理工作，线程完成前保留最后 1%。
+        self._scan_percent = max(0, min(99, self._scan_percent))
+        text = "正在整理" if "整理" in msg or "扫描完成" in msg else "正在扫描"
+        self.background_status.set_task("scan", self._scan_percent, text, msg, True)
 
     def _on_scan_finished(self, stats):
         auto = getattr(self, "_auto_scanning", False)
@@ -826,18 +756,19 @@ class AudioMainWindow(QMainWindow):
         # 指纹未变化，跳过扫描
         if stats.get("unchanged"):
             if auto:
-                # auto 模式：扫描条从未显示，保持隐藏，完全静默
-                pass
+                self.background_status.clear_task("scan")
             else:
-                # manual 模式：扫描条已可见，显示"目录无变化"2秒后隐藏
-                self.scan_progress.setValue(100)
-                self.scan_label.setText("目录无变化，已跳过扫描")
-                QTimer.singleShot(2000, self._scan_bar.hide)
+                self.background_status.set_task("scan", 100, "目录未变", "目录无变化，已跳过扫描")
+                self._scan_hide_timer.start(2000)
             self._start_mtime_migration()
             self._start_dlsite_prefetch()
             return
 
-        self._scan_bar.setVisible(False)
+        if cancelling:
+            self.background_status.clear_task("scan")
+        else:
+            self.background_status.set_task("scan", 100, "扫描完成", "音频目录扫描完成")
+            self._scan_hide_timer.start(2000)
         self._refresh_playlists()
         self._start_mtime_migration()
         self._start_dlsite_prefetch()
@@ -852,7 +783,8 @@ class AudioMainWindow(QMainWindow):
         QMessageBox.information(self, "扫描完成", msg)
 
     def _on_scan_error(self, msg):
-        self._scan_bar.setVisible(False)
+        self.background_status.set_task("scan", 0, "扫描失败", msg)
+        self._scan_hide_timer.start(4000)
         auto = getattr(self, "_auto_scanning", False)
         self._auto_scanning = False
         if auto:
@@ -883,6 +815,8 @@ class AudioMainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
+        self._scan_hide_timer.stop()
+        self._dlsite_hide_timer.stop()
         if self._player_initialized:
             self._player.stop()
         # 先停扫描线程：它持有数据库长连接，且会向即将关闭的窗口发信号

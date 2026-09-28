@@ -91,6 +91,7 @@ class PlaylistDetailPage(QWidget):
         info_col.setSpacing(6)
         self.playlist_title = QLabel()
         self.playlist_title.setWordWrap(True)
+        self.playlist_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.playlist_title.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 20px; font-weight: bold;")
         info_col.addWidget(self.playlist_title)
         self.playlist_tags = QLabel()
@@ -277,6 +278,7 @@ class PlaylistDetailPage(QWidget):
         self._sub_playlists = sub_playlists
 
         self.playlist_title.setText(pl_name)
+        self.playlist_title.setToolTip(pl_name)
         self._rebuild_tag_buttons(tags_str)
         self._set_cover(cover_path)
         self.clear_dlsite()
