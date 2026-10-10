@@ -26,12 +26,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # 必须在导入 Qt 之�
 pytest.importorskip("PyQt6.QtWidgets")
 
 from PyQt6.QtCore import QSize  # noqa: E402
-from PyQt6.QtGui import QPixmap  # noqa: E402
+from PyQt6.QtGui import QImage  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from audio_manager import database as audio_db  # noqa: E402
 from audio_manager import dlsite_db  # noqa: E402
-from ui import image_loader  # noqa: E402
+from ui import (
+    image_loader,  # noqa: E402
+    thread_guard,  # noqa: E402
+)
 from ui import main_window as mw_mod  # noqa: E402
 
 
@@ -65,14 +68,16 @@ def test_get_cached_survives_concurrent_eviction(qapp, monkeypatch):
             return super().pop(key, *args)
 
     monkeypatch.setattr(image_loader, "_cache", _EvictOnPop())
-    image_loader._cache[("/x.jpg", 64, 64)] = QPixmap(2, 2)  # 先放入，模拟"命中判断通过"
+    # 键格式：(path, mtime 签名, 标准化宽, 标准化高)；文件不存在时签名为 0
+    key = ("/x.jpg", image_loader._file_sig("/x.jpg"), 64, 64)
+    image_loader._cache[key] = QImage(2, 2, QImage.Format.Format_RGB32)  # 先放入，模拟"命中判断通过"
 
     # 不应抛异常，应视为缓存未命中
     assert image_loader.get_cached("/x.jpg", QSize(64, 64)) is None
 
 
 def test_image_load_task_swallows_decode_error(qapp, monkeypatch):
-    """解码抛异常时任务必须兜住并发射空 pixmap（而不是让异常逃出 run()）"""
+    """解码抛异常时任务必须兜住并发射空 image（而不是让异常逃出 run()）"""
     def _boom(path, target):
         raise RuntimeError("模拟解码失败")
 
@@ -84,16 +89,16 @@ def test_image_load_task_swallows_decode_error(qapp, monkeypatch):
 
     task.run()  # 旧实现下这里会把 RuntimeError 抛出 run() → PyQt6 abort
 
-    assert len(got) == 1, "解码失败时也应以空 pixmap 回调一次，调用方才能收尾"
-    path, target, pixmap, token = got[0]
+    assert len(got) == 1, "解码失败时也应以空 image 回调一次，调用方才能收尾"
+    path, target, image, token = got[0]
     assert path == "/tmp/broken.jpg"
     assert token == 7
-    assert pixmap.isNull(), "失败时应回调空 pixmap（调用方统一判 isNull 并保持占位）"
+    assert image.isNull(), "失败时应回调空 image（调用方统一判 isNull 并保持占位）"
 
 
 def test_cache_thread_safety_stress(qapp):
-    """多线程并发 put/get 不应抛异常，且缓存长度受 _CACHE_MAX 约束"""
-    pixmap = QPixmap(4, 4)  # 在主线程创建，避免 QPixmap 跨线程构造
+    """多线程并发 put/get 不应抛异常，且缓存总量受字节上限 _CACHE_MAX_BYTES 约束"""
+    image = QImage(4, 4, QImage.Format.Format_RGB32)  # QImage 跨线程安全（QPixmap 不是）
     size = QSize(128, 128)
     errors = []
 
@@ -101,7 +106,7 @@ def test_cache_thread_safety_stress(qapp):
         try:
             for i in range(300):
                 path = f"/tmp/stress_{base}_{i}.jpg"
-                image_loader.put_cache(path, size, pixmap)
+                image_loader.put_cache(path, size, image)
                 image_loader.get_cached(path, size)
                 # 故意访问可能已被淘汰的旧 key
                 image_loader.get_cached(f"/tmp/stress_{base}_{i - 5}.jpg", size)
@@ -115,10 +120,14 @@ def test_cache_thread_safety_stress(qapp):
         t.join(timeout=30)
 
     assert errors == [], f"并发访问缓存出现异常: {errors[:3]}"
-    assert len(image_loader._cache) <= image_loader._CACHE_MAX
+    assert image_loader._cache_bytes <= image_loader._CACHE_MAX_BYTES
+    assert image_loader._cache_bytes == sum(
+        img.sizeInBytes() for img in image_loader._cache.values()
+    ), "字节计数与缓存内容不一致"
 
     image_loader.clear_cache()
     assert len(image_loader._cache) == 0
+    assert image_loader._cache_bytes == 0
 
 
 # ─────────────────────── 窗口关闭 ───────────────────────
@@ -154,8 +163,8 @@ class FakeScanThread:
         self._wait_result = wait_result
         self.cancelled = False
         self.waits = []
-        # finished 是 pyqtSignal(dict)，槽必须能接住参数
-        self.finished = FakeSignal()
+        # scan_finished 是 pyqtSignal(dict)，槽必须能接住参数
+        self.scan_finished = FakeSignal()
         self.error = FakeSignal()
         self.progress = FakeSignal()
         self.author_done = FakeSignal(raise_on_disconnect=True)
@@ -196,7 +205,7 @@ def test_photo_close_cancels_and_waits_scan_thread(qapp, monkeypatch):
 
     assert fake.cancelled is True, "关闭窗口未取消扫描线程"
     assert fake.waits == [3000], "关闭窗口未等待扫描线程退出"
-    assert mw_mod._detached_threads == set(), "线程已正常退出，不应进入悬挂集合"
+    assert thread_guard.detached_threads == set(), "线程已正常退出，不应进入悬挂集合"
 
 
 def test_photo_close_detaches_thread_that_outlives_wait(qapp, monkeypatch):
@@ -208,15 +217,15 @@ def test_photo_close_detaches_thread_that_outlives_wait(qapp, monkeypatch):
     win.close()
 
     assert fake.cancelled is True
-    assert fake.finished.disconnected is True, "未断开 finished，仍会回调已关闭的窗口"
+    assert fake.scan_finished.disconnected is True, "未断开 scan_finished，仍会回调已关闭的窗口"
     assert fake.error.disconnected is True
     assert fake.author_done.disconnected is False, "无连接时抛的 TypeError 应被吞掉"
-    assert fake in mw_mod._detached_threads, "未持有引用，QThread 可能被 GC 导致崩溃"
+    assert fake in thread_guard.detached_threads, "未持有引用，QThread 可能被 GC 导致崩溃"
 
     # 线程真正结束后应从悬挂集合中移除（验证接上的回收槽带了参数占位）
-    fake.finished.connections[0]({})
-    assert fake not in mw_mod._detached_threads
-    assert mw_mod._detached_threads == set()
+    fake.scan_finished.connections[0]({})
+    assert fake not in thread_guard.detached_threads
+    assert thread_guard.detached_threads == set()
 
 
 def test_photo_close_without_scan_is_safe(qapp, monkeypatch):
@@ -251,7 +260,7 @@ def _make_audio_window(monkeypatch):
 
 def test_audio_close_cancels_and_waits_scan_thread(qapp, monkeypatch):
     """关闭音频窗口同样必须取消并等待扫描线程"""
-    win, av_mod = _make_audio_window(monkeypatch)
+    win, _av_mod = _make_audio_window(monkeypatch)
     fake = FakeScanThread()
     win.scan_thread = fake
 
@@ -259,4 +268,4 @@ def test_audio_close_cancels_and_waits_scan_thread(qapp, monkeypatch):
 
     assert fake.cancelled is True, "关闭音频窗口未取消扫描线程"
     assert fake.waits == [3000]
-    assert av_mod._detached_threads == set()
+    assert thread_guard.detached_threads == set()

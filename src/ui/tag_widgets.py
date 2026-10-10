@@ -3,7 +3,7 @@
 """
 import re
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QStyle,
+    QStyleOptionViewItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -164,6 +166,40 @@ _BTN_QSS = f"""
 """
 
 
+class _CheckListWidget(QListWidget):
+    """可勾选列表：点击整行任意位置切换勾选状态。
+
+    Qt 本身只在点击指示器（小方块）时切换勾选，点行内其他位置不切换。
+    过去用 itemClicked 无条件翻转，点小方块时 Qt 已翻转一次、代码再翻转一次，
+    两次抵消表现为「点复选框没反应」。这里改为：仅当点击位置不在指示器上时才手动切换，
+    点在指示器上则交还给 Qt 自行切换。
+    """
+
+    def mouseReleaseEvent(self, event):
+        pos = event.position().toPoint()
+        item = self.itemAt(pos)
+        if (
+            item is not None
+            and item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+            and not self._on_check_indicator(item, pos)
+        ):
+            item.setCheckState(
+                Qt.CheckState.Unchecked
+                if item.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+        super().mouseReleaseEvent(event)
+
+    def _on_check_indicator(self, item, pos) -> bool:
+        """判断点击位置是否落在勾选指示器方块上（外扩 4px 容差）"""
+        opt = QStyleOptionViewItem()
+        self.initStyleOption(opt, item)
+        rect = self.style().subElementRect(
+            QStyle.SubElement.SE_ItemViewItemCheckIndicator, opt, self
+        )
+        return rect.adjusted(-4, -4, 4, 4).contains(pos)
+
+
 class _CheckListTab(QWidget):
     """选择器单个页签：搜索框 + 可勾选列表（显示文本带计数，UserRole 存实际筛选值）"""
 
@@ -176,12 +212,16 @@ class _CheckListTab(QWidget):
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText(placeholder)
         self.search_box.setStyleSheet(_SEARCH_QSS)
-        self.search_box.textChanged.connect(self._filter)
+        # 搜索防抖：逐键过滤会对整个列表逐项 setHidden，条目多时明显卡顿
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(150)
+        self._filter_timer.timeout.connect(self._filter)
+        self.search_box.textChanged.connect(lambda _t: self._filter_timer.start())
         layout.addWidget(self.search_box)
 
-        self.list_widget = QListWidget()
+        self.list_widget = _CheckListWidget()
         self.list_widget.setStyleSheet(_LIST_QSS)
-        self.list_widget.itemClicked.connect(self._toggle_item)  # 点击整行即切换勾选
         layout.addWidget(self.list_widget, 1)
 
     def set_items(self, display_items):
@@ -204,15 +244,8 @@ class _CheckListTab(QWidget):
             if self.list_widget.item(i).checkState() == Qt.CheckState.Checked
         ]
 
-    def _toggle_item(self, item):
-        """单击行内任意位置切换勾选状态（无需精确点中小方框）"""
-        if item.checkState() == Qt.CheckState.Checked:
-            item.setCheckState(Qt.CheckState.Unchecked)
-        else:
-            item.setCheckState(Qt.CheckState.Checked)
-
-    def _filter(self, text):
-        text = text.strip().lower()
+    def _filter(self):
+        text = self.search_box.text().strip().lower()
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             item.setHidden(bool(text) and text not in item.text().lower())

@@ -143,14 +143,17 @@ class SettingsDialog(QDialog):
 
 
 class ScanThread(QThread):
-    finished = pyqtSignal(dict)   # stats
+    # 不命名为 finished：会遮蔽 QThread 内建的 finished 信号（无参数），
+    # 与线程自身的生命周期语义混淆
+    scan_finished = pyqtSignal(dict)   # stats
     error = pyqtSignal(str)
     progress = pyqtSignal(str, str, str, int, int, int)   # stage, author, work, count, current, total
     author_done = pyqtSignal(str, int)  # author_name, work_count
 
-    def __init__(self, total_authors=0):
+    def __init__(self, total_authors=0, check_fingerprint=True):
         super().__init__()
         self.total_authors = total_authors
+        self.check_fingerprint = check_fingerprint
         self.cancel_event = threading.Event()
 
     def cancel(self):
@@ -163,8 +166,9 @@ class ScanThread(QThread):
                 author_done_callback=self._emit_author_done,
                 cancel_event=self.cancel_event,
                 total_authors=self.total_authors,
+                check_fingerprint=self.check_fingerprint,
             )
-            self.finished.emit(stats or {})
+            self.scan_finished.emit(stats or {})
         except Exception as e:
             self.error.emit(str(e))
 

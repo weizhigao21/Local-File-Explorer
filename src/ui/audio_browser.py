@@ -57,6 +57,7 @@ class PlaylistBrowser(QWidget):
         # 历史上这里还有一套"路径栈 + 面包屑"下钻机制，但从未接线（无任何
         # navigate_to 调用方），实为误导性死代码，已整体移除。
         self._current_path = ""
+        self._render_suspended = False  # reset() 重建期间抑制 _apply_filter 中间渲染
         self._return_pl_id = None  # 筛选视图的来源歌单（由详情页标签/社团点击进入时设置）
         self._return_label = ""    # 来源歌单名（用于返回按钮文案与 tooltip）
         self._all_playlists = []  # 主歌单（未过滤）
@@ -280,6 +281,9 @@ class PlaylistBrowser(QWidget):
         self.view_selector.blockSignals(True)
         self.view_selector.setCurrentIndex(saved_view)
         self.view_selector.blockSignals(False)
+        # blockSignals 阻断了 _switch_view，视图容器仍停在网格页，
+        # 需显式切换一次，否则下拉框显示「列表视图」而实际是网格
+        self._switch_view(saved_view)
 
     def _save_sort_pref(self, index):
         """保存当前排序偏好到配置文件"""
@@ -369,16 +373,46 @@ class PlaylistBrowser(QWidget):
     def reload_current(self):
         """重新加载音频歌单（保留搜索/标签状态）
 
-        供后台 mtime 迁移完成后静默刷新用，避免重置用户已设置的条件。
+        供后台 mtime 迁移完成、DLsite 封面/标签回填后静默刷新用，
+        避免重置用户已设置的条件。
+        刷新前先做快照比对：数据无变化时跳过全量重建——
+        每次重建都要销毁并重做 30 张卡片（含逐卡 os.stat），
+        后台回填密集时会形成可见的闪烁与卡顿。
         """
+        before = self._catalog_fingerprint()
         self._load_catalog()
+        if self._catalog_fingerprint() == before and self._filtered_cache:
+            return  # 数据未变化，现有视图仍然有效
         self._apply_filter(preserve_page=True)
 
+    def _catalog_fingerprint(self):
+        """当前歌单目录中影响渲染/筛选/排序的字段指纹（有序元组）"""
+        return tuple(
+            (
+                pl["id"],
+                pl["name"],
+                pl["path"],
+                pl.get("cover") or "",
+                pl.get("track_count"),
+                pl.get("mtime", 0),
+                pl.get("tags") or "",
+                pl.get("rj_code") or "",
+            )
+            for pl in self._all_playlists
+        )
+
     def reset(self):
-        """回到根目录"""
+        """回到根目录（一次性重绘：clear 过程中的中间 _apply_filter 全部抑制）"""
         self._current_path = ""
-        self.search_box.clear()
-        self.clear_tags()
+        self._render_suspended = True
+        try:
+            # blockSignals 避免 clear 触发防抖搜索过滤又排一次渲染
+            self.search_box.blockSignals(True)
+            self.search_box.clear()
+            self.search_box.blockSignals(False)
+            self.clear_tags()
+        finally:
+            self._render_suspended = False
         self._load_current()
 
     def _load_current(self):
@@ -402,6 +436,8 @@ class PlaylistBrowser(QWidget):
 
     def _apply_filter(self, *_signal_args, preserve_page=False):
         """根据搜索框文本 / 活动标签过滤并按排序后渲染歌单"""
+        if self._render_suspended:
+            return  # reset() 收尾时统一渲染一次
         text = self.search_box.text().strip().lower() if hasattr(self, 'search_box') else ""
         if text:
             filtered = [pl for pl in self._all_playlists if text in pl["name"].lower()]

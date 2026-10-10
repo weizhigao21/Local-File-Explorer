@@ -1,5 +1,3 @@
-from contextlib import suppress
-
 from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
@@ -27,11 +25,8 @@ from ui.grid_view import WorkCard
 from ui.image_viewer import ImageViewer
 from ui.photo_theme import ACCENT, ACCENT_TINT, BTN_QSS, GLOBAL_SCROLLBAR_QSS
 from ui.photo_widgets import ScanThread, SettingsDialog
+from ui.thread_guard import stop_scan_thread
 from ui.work_images_view import WorkImagesView
-
-# 关闭窗口时若扫描线程来不及退出，仍需持有其 Python 引用：
-# QThread 没有 Qt parent，失去引用后被 GC 会销毁正在运行的线程对象，导致崩溃。
-_detached_threads = set()
 
 
 class MainWindow(QMainWindow):
@@ -95,7 +90,8 @@ class MainWindow(QMainWindow):
 
         scan_btn = QPushButton("扫描")
         scan_btn.setStyleSheet(BTN_QSS)
-        scan_btn.clicked.connect(self.start_scan)
+        # 手动扫描绕过指纹预检，强制全量核对（自动扫描才按指纹跳过）
+        scan_btn.clicked.connect(lambda: self.start_scan(force=True))
 
         settings_btn = QPushButton("设置")
         settings_btn.setStyleSheet(BTN_QSS)
@@ -146,7 +142,7 @@ class MainWindow(QMainWindow):
             }}
             """
         )
-        self.search_box.textChanged.connect(self.load_works)
+        self.search_box.textChanged.connect(self._on_search_changed)
         top.addWidget(self.back_btn)
         top.addWidget(self.search_box)
         content_layout.addLayout(top)
@@ -186,6 +182,18 @@ class MainWindow(QMainWindow):
         self._works_resize_timer.setSingleShot(True)
         self._works_resize_timer.setInterval(150)
         self._works_resize_timer.timeout.connect(self._load_visible_work_cards)
+
+        # 搜索防抖：输入停顿后只做显隐过滤，不重建卡片、不查库
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(self._apply_search_filter)
+
+        # 扫描期间逐作者刷新合并：每个作者完成都重建列表+网格会拖慢扫描进度显示
+        self._scan_refresh_timer = QTimer()
+        self._scan_refresh_timer.setSingleShot(True)
+        self._scan_refresh_timer.setInterval(700)
+        self._scan_refresh_timer.timeout.connect(self._refresh_during_scan)
 
         self._work_cards = []
 
@@ -314,12 +322,9 @@ class MainWindow(QMainWindow):
 
         current = self.author_list.currentItem()
         author_id = current.data(Qt.ItemDataRole.UserRole) if current else None
-        keyword = self.search_box.text().strip().lower()
 
+        # 建立该作者的全部卡片，搜索只做显隐过滤（输入时无需重建）
         works = db.list_works(author_id)
-        if keyword:
-            works = [w for w in works if keyword in w["name"].lower()]
-
         for work in works:
             card = WorkCard(work)
             card.clicked.connect(self.open_work)
@@ -336,8 +341,22 @@ class MainWindow(QMainWindow):
         self.grid_container.adjustSize()
         # 设置滚动条步进为单行卡片高度
         self.works_scroll.verticalScrollBar().setSingleStep(self._work_card_h)
+        self._apply_search_filter()
         # 延迟触发首次懒加载，确保布局已经计算完毕
         QTimer.singleShot(0, self._load_visible_work_cards)
+
+    def _on_search_changed(self, _text):
+        """搜索框输入防抖：停顿后仅做显隐过滤，不查库、不重建卡片"""
+        self._search_timer.start()
+
+    def _apply_search_filter(self):
+        """按搜索关键字显示/隐藏卡片（FlowLayout 会跳过隐藏卡片重排）"""
+        keyword = self.search_box.text().strip().lower()
+        for card in self._work_cards:
+            card.setVisible(not keyword or keyword in card.work["name"].lower())
+        # 显隐变化后重排并让滚动区域重新计算高度
+        self.grid_layout.invalidate()
+        self.grid_container.updateGeometry()
 
     def _on_works_scroll(self, _value):
         self._works_scroll_timer.start()
@@ -362,7 +381,7 @@ class MainWindow(QMainWindow):
         for card in self._work_cards:
             if loaded >= 32:
                 break
-            if card._thumb_loaded:
+            if card._thumb_loaded or card.isHidden():
                 continue
             if viewport_valid:
                 top_left = card.mapTo(viewport, QPoint(0, 0))
@@ -388,7 +407,7 @@ class MainWindow(QMainWindow):
         # Backspace：返回（备选）
         QShortcut(QKeySequence("Backspace"), self, self._handle_backspace)
         # Ctrl+S：扫描
-        QShortcut(QKeySequence("Ctrl+S"), self, self.start_scan)
+        QShortcut(QKeySequence("Ctrl+S"), self, lambda: self.start_scan(force=True))
         # Ctrl+R：刷新列表
         QShortcut(QKeySequence("Ctrl+R"), self, self._refresh)
         # F5：刷新列表（Windows 习惯）
@@ -477,23 +496,14 @@ class MainWindow(QMainWindow):
             cb()
 
     def _stop_scan_thread(self):
-        """取消并等待扫描线程退出（幂等：线程未启动/已结束时安全）"""
-        t = self.scan_thread
-        if t is None or not t.isRunning():
-            return
-        t.cancel()
-        if t.wait(3000):
-            return
-        # 兜底：扫描线程仍在收尾（例如正在为当前作者的新作品生成缩略图，该阶段不检查取消标志）。
-        # 断开信号避免回调到已关闭的窗口，并用模块级集合持有引用防止 QThread 被 GC。
-        # 没有连接的信号 disconnect() 会抛 TypeError，逐个吞掉
-        for sig in (t.finished, t.error, t.progress, t.author_done):
-            with suppress(TypeError):
-                sig.disconnect()
-        _detached_threads.add(t)
-        # 注意：ScanThread.finished 是 pyqtSignal(dict)，槽必须能接住这个参数
-        t.finished.connect(lambda *_: _detached_threads.discard(t))
-        print("[关闭] 扫描线程未在 3 秒内退出，已断开其信号并保持引用直到结束")
+        """取消并等待扫描线程退出（幂等，兜底逻辑见 thread_guard.stop_scan_thread）"""
+        # 扫描线程可能仍在收尾（例如正在为当前作者的新作品生成缩略图，
+        # 该阶段不检查取消标志），超时后的悬挂处理统一交给 thread_guard
+        stop_scan_thread(
+            self.scan_thread,
+            ("scan_finished", "error", "progress", "author_done"),
+            log_name="扫描线程",
+        )
 
     def on_back_clicked(self):
         if self.stack.currentIndex() == 1:
@@ -506,7 +516,7 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self)
         dialog.exec()
 
-    def start_scan(self):
+    def start_scan(self, force=False):
         # 防止重复启动扫描
         if getattr(self, "scan_thread", None) and self.scan_thread.isRunning():
             return
@@ -521,8 +531,10 @@ class MainWindow(QMainWindow):
         if not auto:
             self.scan_status_bar.setVisible(True)
 
-        self.scan_thread = ScanThread(total_authors=total)
-        self.scan_thread.finished.connect(self.on_scan_finished)
+        # force=True（手动扫描）绕过指纹预检，强制全量核对，
+        # 作为数据库状态异常（如中断/误删）时的恢复入口
+        self.scan_thread = ScanThread(total_authors=total, check_fingerprint=not force)
+        self.scan_thread.scan_finished.connect(self.on_scan_finished)
         self.scan_thread.error.connect(self.on_scan_error)
         self.scan_thread.progress.connect(self.on_scan_progress)
         self.scan_thread.author_done.connect(self.on_author_done)
@@ -553,12 +565,17 @@ class MainWindow(QMainWindow):
             self.scan_label.setText("正在清理孤儿缩略图...")
 
     def on_author_done(self, author_name, work_count):
-        # 每扫完一个作者，实时刷新左侧作者列表和右侧网格
-        self.load_authors()
-        current = self.author_list.currentItem()
-        author_id = current.data(Qt.ItemDataRole.UserRole) if current else None
-        if author_id is None:
-            self.load_works()
+        # 每扫完一个作者会连发信号，逐个重建列表+网格会拖慢扫描并造成闪烁，
+        # 这里只重启合并定时器，静默期后统一刷新一次
+        self._scan_refresh_timer.start()
+
+    def _refresh_during_scan(self):
+        if getattr(self, "scan_thread", None) and self.scan_thread.isRunning():
+            self.load_authors()
+            current = self.author_list.currentItem()
+            author_id = current.data(Qt.ItemDataRole.UserRole) if current else None
+            if author_id is None:
+                self.load_works()
 
     def on_scan_finished(self, stats):
         auto = getattr(self, "_auto_scanning", False)
@@ -568,6 +585,11 @@ class MainWindow(QMainWindow):
             self._hide_scan_status_bar()
             if not auto:
                 QMessageBox.information(self, "完成", "扫描完成")
+            return
+
+        # 用户取消：扫描只做了部分同步，静默收起状态条即可
+        if stats.get("cancelled"):
+            self._hide_scan_status_bar()
             return
 
         # 指纹未变化，跳过扫描

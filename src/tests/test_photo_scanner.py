@@ -9,6 +9,7 @@
 """
 import shutil
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -228,3 +229,96 @@ def test_scan_new_author_alongside_image_add_not_lost(temp_photo_env):
     )
     works_b = db.list_works_by_author(db.get_author_id("作者B"))
     assert str(photo_root / "作者B" / "作品1") in works_b
+
+
+# ==================== 取消/读取失败安全（回归守卫） ====================
+# 背景：旧实现取消扫描后仍用不完整的 disk_author_names 执行删除循环、
+# 仍写"干净"指纹；作品目录读取失败也被当成"已删除"。后果都是
+# 「数据被误删 + 指纹标记已同步 + 永不自愈」，必须锁死。
+
+def test_cancelled_scan_skips_delete_gc_and_fingerprint(temp_photo_env):
+    """取消的扫描：不删除、不清理缩略图、不写指纹，stats 标记 cancelled"""
+    photo_root = temp_photo_env
+    _make_work(photo_root, "作者A", "作品1")
+    _make_work(photo_root, "作者B", "作品1")
+    scanner.scan(check_fingerprint=False)
+
+    # 目录变化（新增作者C）后"扫描一开始就被取消"：
+    # 此时 disk_author_names 为空，旧实现会把作者A/B 整批误删并写干净指纹
+    _make_work(photo_root, "作者C", "作品1")
+    cancel_event = threading.Event()
+    cancel_event.set()
+    stats = scanner.scan(check_fingerprint=False, cancel_event=cancel_event)
+
+    assert stats.get("cancelled") is True
+    assert stats.get("deleted_authors", 0) == 0
+    assert stats.get("deleted_works", 0) == 0
+    authors = {name for _, name in db.list_all_authors()}
+    assert {"作者A", "作者B"} <= authors, "取消扫描误删了未遍历到的作者"
+    # 指纹未被更新，下次自动扫描仍会真正执行
+    unchanged, _ = fp.is_unchanged(str(photo_root), level="dir")
+    assert unchanged is False
+
+
+def test_unreadable_work_dir_keeps_record(temp_photo_env, monkeypatch):
+    """作品目录读取失败（权限/占用）≠ 已删除：记录和图片都必须保留"""
+    photo_root = temp_photo_env
+    work1 = _make_work(photo_root, "作者A", "作品1", img_count=2)
+    scanner.scan(check_fingerprint=False)
+
+    def _raise(work_path):
+        raise OSError(13, "模拟权限不足")
+
+    monkeypatch.setattr(scanner, "_collect_images_with_mtime", _raise)
+    stats = scanner.scan(check_fingerprint=False)
+
+    assert stats.get("deleted_works", 0) == 0
+    works = db.list_works_by_author(db.get_author_id("作者A"))
+    assert str(work1) in works, "读取失败的作品被误删"
+    assert len(db.get_work_image_mtimes(works[str(work1)][0])) == 2, "读取失败导致图片记录被误删"
+
+
+def test_partial_read_error_disables_delete_sync(temp_photo_env, monkeypatch):
+    """递归读取有错误（结果不完整）时只增不删，防止"没读到"当成"已删除" """
+    photo_root = temp_photo_env
+    work1 = _make_work(photo_root, "作者A", "作品1", img_count=2)
+    scanner.scan(check_fingerprint=False)
+
+    # 模拟深层目录读取失败：只看到一张图，且 read_errors > 0
+    monkeypatch.setattr(
+        scanner, "_collect_images_with_mtime",
+        lambda work_path: ([(str(work1 / "000.jpg"), 1)], 3),
+    )
+    stats = scanner.scan(check_fingerprint=False)
+
+    assert stats.get("deleted", 0) == 0, "结果不完整时不应删除图片"
+    works = db.list_works_by_author(db.get_author_id("作者A"))
+    assert len(db.get_work_image_mtimes(works[str(work1)][0])) == 2
+
+
+def test_image_moved_between_works_stays_in_db(temp_photo_env):
+    """跨作品移动的图片必须在库里保留：旧路径行清理、新路径行入库，归属正确
+
+    注：移动会改变绝对路径，新旧路径互不相同，插入不会撞 UNIQUE(path)；
+    真正要守住的是"移动后图片既不丢失也不重复"。
+    """
+    photo_root = temp_photo_env
+    work_src = _make_work(photo_root, "作者A", "作品Z", img_count=2)
+    work_dst = _make_work(photo_root, "作者A", "作品A", img_count=1)
+    scanner.scan(check_fingerprint=False)
+
+    src = work_src / "001.jpg"
+    dst = work_dst / "001.jpg"
+    shutil.move(str(src), str(dst))
+    time.sleep(0.02)
+
+    scanner.scan(check_fingerprint=False)
+
+    all_paths = {}
+    for w in db.list_works():
+        for p in db.get_work_image_mtimes(w["id"]):
+            all_paths[p] = w["name"]
+    assert str(dst) in all_paths, "移动后的图片从库里消失"
+    assert all_paths[str(dst)] == "作品A", "移动后归属未更新"
+    assert str(src) not in all_paths, "旧路径行未清理"
+    assert len(all_paths) == 3, "移动后图片丢失或重复"

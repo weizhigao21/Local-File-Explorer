@@ -160,8 +160,13 @@ class ModuleCard(QFrame):
         layout.addWidget(desc)
         layout.addStretch()
 
-    def mousePressEvent(self, event):
-        self.clicked.emit(self._module_id)
+    def mouseReleaseEvent(self, event):
+        # 仅左键在卡片内释放才进入模块（原先 mousePressEvent 不判按键，右键也会误触发）
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._module_id)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def module_id(self):
         return self._module_id

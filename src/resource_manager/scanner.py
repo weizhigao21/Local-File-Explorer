@@ -22,9 +22,15 @@ def _is_image(path):
 def _collect_images_with_mtime(work_path):
     """递归收集作品目录下所有图片及其 mtime，按路径自然排序
     使用 os.scandir 替代 os.walk，DirEntry 自带 stat 缓存，减少系统调用
-    返回 [(path, mtime), ...]
+    返回 ([(path, mtime), ...], read_errors)
+    read_errors: 深层目录/文件读取失败次数，>0 时本次结果可能不完整
+
+    根目录本身读取失败时抛 OSError —— 调用方必须据此区分
+    "目录不可读"（应保留数据库记录）与"目录已清空/已删除"（应清理记录），
+    否则权限/网络盘抖动会把整个作品连图带记录误删。
     """
     images = []
+    read_errors = 0
     stack = [work_path]
     while stack:
         current = stack.pop()
@@ -39,15 +45,20 @@ def _collect_images_with_mtime(work_path):
                             try:
                                 mtime = int(entry.stat().st_mtime)
                             except OSError:
+                                read_errors += 1
                                 continue
                             images.append((entry.path, mtime))
                     except OSError:
+                        read_errors += 1
                         continue
         except OSError:
+            if current == work_path:
+                raise
+            read_errors += 1
             continue
     # 自然排序
     images.sort(key=lambda x: natural_key(x[0]))
-    return images
+    return images, read_errors
 
 
 def _thumbnail_path(work_path):
@@ -82,10 +93,12 @@ def count_authors():
     )
 
 
-def _sync_work_images(work_id, current_images, stats):
+def _sync_work_images(work_id, current_images, stats, allow_delete=True):
     """同步单个作品的图片：增、改、删
     current_images: [(path, mtime), ...]
     stats: 累计统计 dict
+    allow_delete: 目录读取有错误（结果不完整）时禁止删除同步，
+                  防止把"没读到"当成"已删除"
     """
     current_map = dict(current_images)
     db_map = db.get_work_image_mtimes(work_id)
@@ -94,10 +107,11 @@ def _sync_work_images(work_id, current_images, stats):
     db_paths = set(db_map.keys())
 
     # 删除：数据库有但磁盘没有
-    to_delete = db_paths - current_paths
-    if to_delete:
-        db.delete_images_by_paths(list(to_delete))
-        stats["deleted"] += len(to_delete)
+    if allow_delete:
+        to_delete = db_paths - current_paths
+        if to_delete:
+            db.delete_images_by_paths(list(to_delete))
+            stats["deleted"] += len(to_delete)
 
     # 新增：磁盘有但数据库没有
     to_add = current_paths - db_paths
@@ -141,12 +155,24 @@ def _scan_author(author_name, author_path, stats, progress_callback, cancel_even
             continue
 
         try:
-            current_images = _collect_images_with_mtime(work_path)
-            if not current_images:
-                continue
+            current_images, read_errors = _collect_images_with_mtime(work_path)
+        except OSError as e:
+            # 根目录读取失败 ≠ 目录已删除：计入磁盘存在集合，防止作品记录被误删
+            print(f"[扫描作品跳过] 无法读取 {author_name}/{work_name}: {e}")
+            disk_work_paths.add(work_path)
+            continue
         except Exception as e:
             print(f"[扫描作品失败] {author_name}/{work_name}: {e}")
             traceback.print_exc()
+            disk_work_paths.add(work_path)
+            continue
+
+        if read_errors:
+            # 递归过程中有目录/文件读取失败，本次结果不完整：
+            # 计入磁盘存在集合，并在同步时禁止删除
+            disk_work_paths.add(work_path)
+
+        if not current_images:
             continue
 
         disk_work_paths.add(work_path)
@@ -154,7 +180,7 @@ def _scan_author(author_name, author_path, stats, progress_callback, cancel_even
         if work_path in existing_works:
             # 已存在作品，同步图片变化
             work_id, _, _ = existing_works[work_path]
-            _sync_work_images(work_id, current_images, stats)
+            _sync_work_images(work_id, current_images, stats, allow_delete=(read_errors == 0))
         else:
             # 新作品：暂存，缩略图稍后并行生成
             thumbnail = _thumbnail_path(work_path)
@@ -248,6 +274,7 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
 
     # 开启长连接，所有 db 操作复用同一个 connection
     db.begin_persistent()
+    cancelled = False
     try:
         # 1. 数据库现有作者 {name: id}
         existing_authors = {name: aid for aid, name in db.list_all_authors()}
@@ -258,6 +285,7 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
         for author_name in sorted(os.listdir(config.PHOTO_ROOT)):
             if cancel_event and cancel_event.is_set():
                 print("扫描已取消")
+                cancelled = True
                 break
 
             author_path = os.path.join(config.PHOTO_ROOT, author_name)
@@ -288,15 +316,27 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
             print(f"[作者] {author_name} 已同步")
 
         # 2. 删除数据库中存在但磁盘不存在的作者
-        for author_name, author_id in existing_authors.items():
-            if author_name not in disk_author_names:
-                db.delete_author(author_id)
-                stats["deleted_authors"] += 1
-                print(f"[删除作者] {author_name}")
+        # 取消时不执行：disk_author_names 只含已遍历到的作者，
+        # 拿它当删除基准会把尚未扫描的作者连同数据整批误删
+        if not cancelled:
+            for author_name, author_id in existing_authors.items():
+                if author_name not in disk_author_names:
+                    db.delete_author(author_id)
+                    stats["deleted_authors"] += 1
+                    print(f"[删除作者] {author_name}")
 
     finally:
         # 提交事务并关闭长连接
         db.end_persistent()
+
+    if cancelled:
+        # 取消 = 只做部分增量同步，不做任何清理/删除/指纹写入：
+        # 否则不完整的扫描结果会被指纹标记为"已同步"，漏扫内容不再自愈
+        stats["cancelled"] = True
+        if progress_callback:
+            progress_callback("done", "", None, 0, author_count, total_authors)
+        print("扫描已取消：跳过删除同步、缩略图清理与指纹更新")
+        return stats
 
     # 3. 缩略图垃圾回收（不需要长连接）
     removed_thumbs = _gc_thumbnails()

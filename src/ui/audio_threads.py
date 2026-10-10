@@ -20,7 +20,9 @@ from resource_manager import config
 
 
 class AudioScanThread(QThread):
-    finished = pyqtSignal(dict)
+    # 不命名为 finished：会遮蔽 QThread 内建的 finished 信号（无参数），
+    # 与线程自身的生命周期语义混淆
+    scan_finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int, str)
 
@@ -39,7 +41,7 @@ class AudioScanThread(QThread):
                 progress_callback=self._emit_progress,
                 cancel_event=self.cancel_event,
             )
-            self.finished.emit(stats or {})
+            self.scan_finished.emit(stats or {})
         except Exception as e:
             self.error.emit(str(e))
 

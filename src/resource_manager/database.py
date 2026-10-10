@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from contextlib import contextmanager
 
 import resource_manager.config as config
@@ -16,39 +17,45 @@ def get_conn():
         conn.close()
 
 
-# 全局长连接：用于扫描等大批量操作场景，避免频繁 connect/close
-_persistent_conn = None
+# 长连接按线程隔离：用于扫描等大批量操作场景，避免频繁 connect/close。
+# 必须 thread-local 而非全局单例——扫描线程超时 detach 后仍在跑、仍持有连接，
+# 此时新扫描线程若复用同一连接，先结束者 end_persistent() 会把对方正在用的
+# 连接 close 掉（"Cannot operate on a closed database" 或事务交错）。
+_local = threading.local()
 
 
 def begin_persistent():
-    """开启一个长连接供批量操作复用，调用方需调用 end_persistent() 释放"""
-    global _persistent_conn
-    if _persistent_conn is None:
-        _persistent_conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
-        _persistent_conn.row_factory = sqlite3.Row
-        _persistent_conn.execute("PRAGMA journal_mode = WAL")
-        _persistent_conn.execute("PRAGMA synchronous = NORMAL")
-        _persistent_conn.execute("PRAGMA cache_size = -65536")  # 64MB cache
-    return _persistent_conn
+    """在当前线程开启一个长连接供批量操作复用，调用方需在同一线程调用 end_persistent() 释放"""
+    conn = getattr(_local, "persistent_conn", None)
+    if conn is None:
+        # 线程私有连接，同线程访问，默认 check_same_thread=True 即可
+        conn = sqlite3.connect(config.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA cache_size = -65536")  # 64MB cache
+        _local.persistent_conn = conn
+    return conn
 
 
 def end_persistent():
-    """释放长连接"""
-    global _persistent_conn
-    if _persistent_conn is not None:
-        _persistent_conn.commit()
-        _persistent_conn.close()
-        _persistent_conn = None
+    """释放当前线程的长连接"""
+    conn = getattr(_local, "persistent_conn", None)
+    if conn is not None:
+        conn.commit()
+        conn.close()
+        _local.persistent_conn = None
 
 
 @contextmanager
 def _active_conn():
-    """获取活动连接：长连接模式下复用，否则新建短连接"""
-    if _persistent_conn is not None:
-        yield _persistent_conn
+    """获取活动连接：当前线程有长连接则复用，否则新建短连接"""
+    conn = getattr(_local, "persistent_conn", None)
+    if conn is not None:
+        yield conn
     else:
-        with get_conn() as conn:
-            yield conn
+        with get_conn() as short_conn:
+            yield short_conn
 
 
 def init_db():
@@ -202,8 +209,10 @@ def add_author_with_works(author_name, works, progress_callback=None):
 
             if images:
                 # images: [(path, mtime), ...]
+                # ON CONFLICT 改写归属而非静默忽略（同 upsert_images）
                 conn.executemany(
-                    "INSERT OR IGNORE INTO images (work_id, path, mtime) VALUES (?, ?, ?)",
+                    "INSERT INTO images (work_id, path, mtime) VALUES (?, ?, ?) "
+                    "ON CONFLICT(path) DO UPDATE SET work_id = excluded.work_id, mtime = excluded.mtime",
                     [(work_id, p, m) for p, m in images],
                 )
 
@@ -267,12 +276,18 @@ def get_work_image_mtimes(work_id):
 
 
 def upsert_images(work_id, image_mtimes):
-    """批量插入新图片 [(path, mtime), ...]"""
+    """批量插入新图片 [(path, mtime), ...]
+
+    ON CONFLICT(path) DO UPDATE 而非 INSERT OR IGNORE：万一同一 path
+    已挂在其他作品下（异常数据），改写归属而不是静默丢弃插入——
+    IGNORE 会丢数据且让 stats["added"] 虚报。
+    """
     if not image_mtimes:
         return
     with _active_conn() as conn:
         conn.executemany(
-            "INSERT OR IGNORE INTO images (work_id, path, mtime) VALUES (?, ?, ?)",
+            "INSERT INTO images (work_id, path, mtime) VALUES (?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET work_id = excluded.work_id, mtime = excluded.mtime",
             [(work_id, p, m) for p, m in image_mtimes],
         )
 

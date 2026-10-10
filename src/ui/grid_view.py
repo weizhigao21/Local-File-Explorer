@@ -1,5 +1,5 @@
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QFrame, QLabel, QVBoxLayout
 
 from ui.image_loader import get_cached, loader
@@ -72,22 +72,27 @@ class WorkCard(QFrame):
         # 缓存命中则直接显示
         cached = get_cached(thumb_path, target)
         if cached is not None and not cached.isNull():
-            self._apply_pixmap(cached, target)
+            self._apply_image(cached, target)
             self._thumb_loaded = True
             return
 
         self._token = loader().request(thumb_path, target, self._on_loaded)
 
-    def _on_loaded(self, path, target, pixmap, token):
+    def _on_loaded(self, path, target, image, token):
         if token != self._token:
             return False
-        self._apply_pixmap(pixmap, target)
+        if image.isNull():
+            # 解码失败：不置 _thumb_loaded，下次滚回视口时可重试
+            return False
+        self._apply_image(image, target)
         self._thumb_loaded = True
         return True
 
-    def _apply_pixmap(self, pixmap: QPixmap, target: QSize):
-        if pixmap.isNull():
+    def _apply_image(self, image: QImage, target: QSize):
+        if image.isNull():
             return
+        # QImage → QPixmap 只能在 GUI 线程做（本方法即在主线程回调中执行）
+        pixmap = QPixmap.fromImage(image)
         # 防御：切换作者时旧卡片可能已被销毁
         try:
             # 检查底层 C++ 对象是否还存在

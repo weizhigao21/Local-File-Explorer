@@ -2,6 +2,8 @@
 音频模块播放条控件
 固定于主窗口底部的播放控制栏：当前曲目、上一首/播放/下一首、进度条、时间、音量
 """
+import time
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
@@ -30,6 +32,7 @@ class SeekSlider(QSlider):
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
         self._seeking = False  # 当前是否处于"点击轨道"模式
+        self._last_seek_emit = 0.0  # 拖动期间 seek 信号节流时间戳
 
     def _value_from_pos(self, x: float) -> int:
         """把鼠标横坐标换算为滑块值（秒）"""
@@ -43,22 +46,29 @@ class SeekSlider(QSlider):
             # 点击在轨道上 → 直接跳到点击位置；不调用 super()，避免默认 pageStep 逻辑覆盖
             self._seeking = True
             self.setValue(self._value_from_pos(event.position().x()))
+            self._last_seek_emit = time.monotonic()
             self.clickedSeek.emit(self.value())
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        # 点击轨道后按住拖动：持续跟随鼠标位置跳转
+        # 点击轨道后按住拖动：滑块持续跟随鼠标，seek 信号按 100ms 节流
+        # （原实现逐像素发 seek，每个信号都触发一次 QMediaPlayer.setPosition）
         if self._seeking and (event.buttons() & Qt.MouseButton.LeftButton):
             self.setValue(self._value_from_pos(event.position().x()))
-            self.clickedSeek.emit(self.value())
+            now = time.monotonic()
+            if now - self._last_seek_emit >= 0.1:
+                self._last_seek_emit = now
+                self.clickedSeek.emit(self.value())
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self._seeking = False
+        if self._seeking:
+            self._seeking = False
+            self.clickedSeek.emit(self.value())  # 补发拖动终点的最终位置
         super().mouseReleaseEvent(event)
 
     def _on_handle(self, pos) -> bool:

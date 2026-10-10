@@ -1,5 +1,5 @@
 from PyQt6.QtCore import QRectF, Qt, QTimer
-from PyQt6.QtGui import QKeySequence, QPixmap, QShortcut, QWheelEvent
+from PyQt6.QtGui import QImage, QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PyQt6.QtWidgets import (
     QDialog,
     QGraphicsScene,
@@ -82,7 +82,7 @@ class ImageViewer(QDialog):
         # 缓存命中直接显示
         cached = get_cached(path, target)
         if cached is not None and not cached.isNull():
-            self._show_pixmap(cached)
+            self._show_image(cached)
             self._preload()
             return
 
@@ -94,19 +94,21 @@ class ImageViewer(QDialog):
 
         self._token = loader().request(path, target, self._on_loaded)
 
-    def _on_loaded(self, path, target, pixmap, token):
+    def _on_loaded(self, path, target, image, token):
         """异步回调：token 不匹配则丢弃"""
         if token != self._token:
             return False
         if path != self.image_paths[self.current_index]:
             return False
-        if pixmap.isNull():
+        if image.isNull():
             return False
-        self._show_pixmap(pixmap)
+        self._show_image(image)
         self._preload()
         return True
 
-    def _show_pixmap(self, pixmap: QPixmap):
+    def _show_image(self, image: QImage):
+        # QImage → QPixmap 只能在 GUI 线程做（本方法即在主线程回调中执行）
+        pixmap = QPixmap.fromImage(image)
         # 防御：窗口关闭后回调可能还在执行
         try:
             self.scene.clear()

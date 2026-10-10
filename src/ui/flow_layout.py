@@ -72,6 +72,10 @@ class FlowLayout(QLayout):
     def minimumSize(self):
         size = QSize()
         for item in self._items:
+            # 跳过被显隐过滤隐藏的卡片（isHidden 只看显式隐藏标志，不受父级可见性影响）
+            w = item.widget()
+            if w is not None and w.isHidden():
+                continue
             size = size.expandedTo(item.minimumSize())
         margins = self.contentsMargins()
         size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
@@ -85,7 +89,10 @@ class FlowLayout(QLayout):
         line_height = 0
 
         for item in self._items:
-            hint = item.widget().sizeHint() if item.widget() else item.sizeHint()
+            widget = item.widget()
+            if widget is not None and widget.isHidden():
+                continue  # 搜索过滤隐藏的卡片不占位
+            hint = widget.sizeHint() if widget else item.sizeHint()
             space_x = self._h_space
             space_y = self._v_space
             next_x = x + hint.width() + space_x

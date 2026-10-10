@@ -10,14 +10,18 @@ from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
     QDialog,
     QFrame,
     QHBoxLayout,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QStackedWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -36,10 +40,7 @@ from ui.audio_theme import (
 )
 from ui.audio_threads import AudioScanThread, DlsiteWorker, MtimeMigrationThread
 from ui.audio_widgets import AudioSettingsDialog
-
-# 关闭窗口时若扫描线程来不及退出，仍需持有其 Python 引用：
-# QThread 没有 Qt parent，失去引用后被 GC 会销毁正在运行的线程对象，导致崩溃。
-_detached_threads = set()
+from ui.thread_guard import stop_scan_thread
 
 
 class AudioMainWindow(QMainWindow):
@@ -59,9 +60,17 @@ class AudioMainWindow(QMainWindow):
         self._play_queue = []  # 独立播放队列（导航/切歌单时保持播放）
         self._mtime_thread = None  # 后台 mtime 迁移线程
         self._dlsite_thread = None  # DLsite 信息后台抓取线程
+        self._dlsite_sync_batch = set()  # 待批量同步的 RJ 码（攒批避免刷新风暴）
+        self._dlsite_sync_timer = QTimer(self)  # 攒批静默期定时器
+        self._dlsite_sync_timer.setSingleShot(True)
+        self._dlsite_sync_timer.setInterval(2000)
+        self._dlsite_sync_timer.timeout.connect(self._flush_dlsite_sync_batch)
         self.scan_thread = None  # 音频扫描线程（沿用既有命名）
         self._current_dlsite_rj = None  # 当前详情页歌单对应的 RJ 码
         self._browser_refresh_deferred = False  # 详情页期间推迟的列表刷新
+        # 关窗标志：closeEvent 等待线程期间排队的信号会在关窗后才投递，
+        # 各回调槽需据此短路，避免操作已销毁的窗口/再起无人回收的线程
+        self._closing = False
 
         db.init_db()
         if dlsite.AVAILABLE:
@@ -401,7 +410,7 @@ class AudioMainWindow(QMainWindow):
         本地批量校验：与 dlsite.db 已成功缓存的全量 RJ 码集合做差集，
         只把缺失的 ID 入队——已获取过的绝不重复请求。
         """
-        if not dlsite.AVAILABLE:
+        if getattr(self, "_closing", False) or not dlsite.AVAILABLE:
             return
         # 启动即同步：dlsite.db 里已有的封面/标签立即应用到主列表（不依赖抓取信号）
         if self._sync_dlsite_info():
@@ -528,25 +537,45 @@ class AudioMainWindow(QMainWindow):
         self._dlsite_log_dialog.raise_()
 
     def _on_dlsite_fetched(self, rj):
-        """后台抓取完成回调：封面回填主列表 + 刷新当前详情页"""
-        try:
-            info = dlsite_db.get_work(rj)
-        except Exception:
-            info = None
-        ok = bool(info and info.get("title") and not info.get("error"))
+        """后台抓取完成回调
 
-        # 新抓到的封面/标签立即精准同步到主列表（只处理该 RJ，批量写库不卡 UI）
-        if ok and self._sync_dlsite_info(rj, info):
-            self._schedule_browser_refresh()
-
-        # 若抓取的正是当前展示的歌单，立即刷新详情页信息区与封面
-        if rj != self._current_dlsite_rj or self.page_stack.currentIndex() != 1:
+        当前详情页对应的 RJ 立即刷新信息区与封面，保证用户可见反馈；
+        其余结果（预取期间密集回填）攒批 2 秒后一次性同步写库并刷新列表，
+        避免每条回调都触发主线程查库/写库与歌单列表全量重建。
+        """
+        if getattr(self, "_closing", False):
             return
-        if ok:
-            self.detail.show_dlsite_info(info)
-            self.detail.try_dlsite_cover(info.get("cover_path"))
-        else:
-            self.detail.show_dlsite_error()
+        if rj == self._current_dlsite_rj and self.page_stack.currentIndex() == 1:
+            try:
+                info = dlsite_db.get_work(rj)
+            except Exception:
+                info = None
+            ok = bool(info and info.get("title") and not info.get("error"))
+            if ok:
+                self.detail.show_dlsite_info(info)
+                self.detail.try_dlsite_cover(info.get("cover_path"))
+            else:
+                self.detail.show_dlsite_error()
+        # 主列表的封面/标签回填统一走攒批通道（含当前详情页的 RJ）
+        self._dlsite_sync_batch.add(rj)
+        self._dlsite_sync_timer.start()
+
+    def _flush_dlsite_sync_batch(self):
+        """批量同步攒下的抓取结果：一次循环写库，仅在有变更时刷新列表"""
+        if getattr(self, "_closing", False):
+            return
+        rjs, self._dlsite_sync_batch = self._dlsite_sync_batch, set()
+        changed = False
+        for rj in rjs:
+            try:
+                info = dlsite_db.get_work(rj)
+            except Exception:
+                info = None
+            ok = bool(info and info.get("title") and not info.get("error"))
+            if ok and self._sync_dlsite_info(rj, info):
+                changed = True
+        if changed:
+            self._schedule_browser_refresh()
 
     def _schedule_browser_refresh(self):
         """合并短时间内的多次刷新请求（预取期间会连续回填多个封面）
@@ -563,6 +592,8 @@ class AudioMainWindow(QMainWindow):
 
         def _do():
             self._browser_refresh_pending = False
+            if getattr(self, "_closing", False):
+                return  # 1 秒延迟期间窗口已关闭
             self.browser.reload_current()
 
         QTimer.singleShot(1000, _do)
@@ -717,6 +748,8 @@ class AudioMainWindow(QMainWindow):
 
     # ==================== 扫描 ====================
     def start_scan(self):
+        if getattr(self, "_closing", False):
+            return  # 窗口已关闭：忽略 500ms 延迟自动扫描等迟到触发
         if getattr(self, "scan_thread", None) and self.scan_thread.isRunning():
             return
         self._scan_hide_timer.stop()
@@ -725,7 +758,7 @@ class AudioMainWindow(QMainWindow):
         self.background_status.set_task("scan", 0, "准备扫描", "正在检查音频目录", True)
 
         self.scan_thread = AudioScanThread(config.AUDIO_ROOTS)
-        self.scan_thread.finished.connect(self._on_scan_finished)
+        self.scan_thread.scan_finished.connect(self._on_scan_finished)
         self.scan_thread.error.connect(self._on_scan_error)
         self.scan_thread.progress.connect(self._on_scan_progress)
         self.scan_thread.start()
@@ -739,7 +772,7 @@ class AudioMainWindow(QMainWindow):
             )
 
     def _on_scan_progress(self, current, total, msg):
-        if getattr(self, "_scan_cancelling", False):
+        if getattr(self, "_closing", False) or getattr(self, "_scan_cancelling", False):
             return
         self._scan_percent = int(current * 100 / total) if total > 0 else 0
         # 收尾仍有数据库整理工作，线程完成前保留最后 1%。
@@ -748,6 +781,8 @@ class AudioMainWindow(QMainWindow):
         self.background_status.set_task("scan", self._scan_percent, text, msg, True)
 
     def _on_scan_finished(self, stats):
+        if getattr(self, "_closing", False):
+            return  # 关窗期间排队的迟到信号：不再更新 UI/启动后续线程
         auto = getattr(self, "_auto_scanning", False)
         self._auto_scanning = False
         cancelling = getattr(self, "_scan_cancelling", False)
@@ -783,6 +818,8 @@ class AudioMainWindow(QMainWindow):
         QMessageBox.information(self, "扫描完成", msg)
 
     def _on_scan_error(self, msg):
+        if getattr(self, "_closing", False):
+            return
         self.background_status.set_task("scan", 0, "扫描失败", msg)
         self._scan_hide_timer.start(4000)
         auto = getattr(self, "_auto_scanning", False)
@@ -794,6 +831,8 @@ class AudioMainWindow(QMainWindow):
     # ==================== mtime 后台迁移 ====================
     def _start_mtime_migration(self):
         """启动后台 mtime 迁移线程（若已在运行则跳过）"""
+        if getattr(self, "_closing", False):
+            return  # 关窗后不再创建无人回收的后台线程
         if self._mtime_thread and self._mtime_thread.isRunning():
             return
         self._mtime_thread = MtimeMigrationThread()
@@ -802,6 +841,8 @@ class AudioMainWindow(QMainWindow):
 
     def _on_mtime_migrated(self, count):
         """mtime 迁移完成后静默刷新当前视图（仅当有迁移发生时）"""
+        if getattr(self, "_closing", False):
+            return
         if count > 0:
             self.browser.reload_current()
 
@@ -815,8 +856,15 @@ class AudioMainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
+        self._closing = True
+        # 焦点监听挂在 QApplication 上，不主动断开会让已关闭窗口无法回收
+        app = QApplication.instance()
+        if app is not None:
+            with suppress(TypeError):
+                app.focusChanged.disconnect(self._on_focus_changed)
         self._scan_hide_timer.stop()
         self._dlsite_hide_timer.stop()
+        self._dlsite_sync_timer.stop()
         if self._player_initialized:
             self._player.stop()
         # 先停扫描线程：它持有数据库长连接，且会向即将关闭的窗口发信号
@@ -835,26 +883,30 @@ class AudioMainWindow(QMainWindow):
             cb()
 
     def _stop_scan_thread(self):
-        """取消并等待扫描线程退出（幂等：线程未启动/已结束时安全）"""
-        t = self.scan_thread
-        if t is None or not t.isRunning():
-            return
-        t.cancel()
-        if t.wait(3000):
-            return
-        # 兜底：扫描仍未在 3 秒内收尾。断开信号避免回调到已关闭的窗口，
-        # 并用模块级集合持有引用防止 QThread 被 GC（见 _detached_threads 注释）。
-        # 没有连接的信号 disconnect() 会抛 TypeError，逐个吞掉
-        for sig in (t.finished, t.error, t.progress):
-            with suppress(TypeError):
-                sig.disconnect()
-        _detached_threads.add(t)
-        # 注意：AudioScanThread.finished 是 pyqtSignal(dict)，槽必须能接住这个参数
-        t.finished.connect(lambda *_: _detached_threads.discard(t))
-        print("[关闭] 音频扫描线程未在 3 秒内退出，已断开其信号并保持引用直到结束")
+        """取消并等待扫描线程退出（幂等，兜底逻辑见 thread_guard.stop_scan_thread）"""
+        stop_scan_thread(
+            self.scan_thread,
+            ("scan_finished", "error", "progress"),
+            log_name="音频扫描线程",
+        )
 
     def _setup_shortcuts(self):
-        QShortcut(QKeySequence("Space"), self, self.toggle_play)
-        QShortcut(QKeySequence("Left"), self, self.play_previous)
-        QShortcut(QKeySequence("Right"), self, self.play_next)
+        # Space/Left/Right 是单键快捷键，会被窗口级 QShortcut 截获，
+        # 导致搜索框无法输入空格、无法用方向键移动光标。
+        # 故焦点落在文本输入控件时临时禁用它们（见 _on_focus_changed）。
+        self._typing_shortcuts = (
+            QShortcut(QKeySequence("Space"), self, self.toggle_play),
+            QShortcut(QKeySequence("Left"), self, self.play_previous),
+            QShortcut(QKeySequence("Right"), self, self.play_next),
+        )
         QShortcut(QKeySequence("Ctrl+S"), self, self.start_scan)
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_focus_changed)
+            self._on_focus_changed(None, app.focusWidget())
+
+    def _on_focus_changed(self, _old, new):
+        """焦点进入文本输入控件时禁用单键快捷键，避免吞掉空格/方向键输入"""
+        typing = isinstance(new, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox))
+        for sc in self._typing_shortcuts:
+            sc.setEnabled(not typing)

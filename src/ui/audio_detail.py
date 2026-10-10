@@ -5,7 +5,7 @@
 import os
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QImageReader, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -204,6 +204,7 @@ class PlaylistDetailPage(QWidget):
         self._track_types = []           # 每首曲目的文件类型（大写扩展名）
         self._durations = {}             # 原始序 -> 秒数（数据库 + 后台探测）
         self._visible_orig = []          # 当前表行对应的原始序号（受类型筛选影响）
+        self._visible_row = {}           # 原始序号 → 表行号（O(1) 反查）
         self._selected_type = ""         # 当前类型筛选（""=全部）
         self._probe_thread = None        # 曲目时长后台探测线程
         self._probe_gen = 0              # 探测代数，切换歌单后丢弃过期结果
@@ -351,10 +352,12 @@ class PlaylistDetailPage(QWidget):
         """按当前类型筛选重建表格内容（# / 标题 / 类型 / 时长）"""
         self.track_list.setRowCount(0)
         self._visible_orig = []
+        self._visible_row = {}
         shown = []
         for i, tr in enumerate(self._tracks_paths):
             if self._selected_type and self._track_types[i] != self._selected_type:
                 continue
+            self._visible_row[i] = len(self._visible_orig)
             self._visible_orig.append(i)
             title = tr.get("title") or os.path.basename(tr["path"])
             shown.append((i, title))
@@ -389,11 +392,12 @@ class PlaylistDetailPage(QWidget):
 
     def _start_probe(self, tracks):
         """启动后台时长探测线程，仅对缺少时长的曲目逐条回填（按原始序）"""
-        missing = [t for i, t in enumerate(tracks) if i not in self._durations]
+        missing_orig = [i for i, t in enumerate(tracks) if i not in self._durations]
         self._stop_probe()
-        if not missing:
+        if not missing_orig:
             return
-        self._missing_orig = [i for i, t in enumerate(tracks) if i not in self._durations]
+        self._missing_orig = missing_orig
+        missing = [tracks[i] for i in missing_orig]
         self._probe_gen += 1
         gen = self._probe_gen
         self._probe_thread = DurationProbeThread(missing, gen=gen)
@@ -409,8 +413,8 @@ class PlaylistDetailPage(QWidget):
             return
         orig = self._missing_orig[pos]
         self._durations[orig] = int(secs)
-        if orig in self._visible_orig:
-            row = self._visible_orig.index(orig)
+        row = self._visible_row.get(orig)
+        if row is not None:
             self.track_list.item(row, 3).setText(self._fmt_time(secs))
 
 
@@ -547,31 +551,38 @@ class PlaylistDetailPage(QWidget):
         """当前无封面时用 DLsite 封面补位（异步抓取完成后回调）"""
         if getattr(self, "_has_cover", False):
             return
-        if cover_path and os.path.exists(cover_path):
-            pix = QPixmap(cover_path)
-            if not pix.isNull():
-                self.cover_label.setPixmap(
-                    pix.scaled(160, 160, Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
-                )
-                self.cover_label.setText("")
-                self._has_cover = True
+        self._has_cover = self._apply_cover(cover_path)
 
     def _set_cover(self, cover_path):
-        got = False
-        if cover_path and os.path.exists(cover_path):
-            pix = QPixmap(cover_path)
-            if not pix.isNull():
-                self.cover_label.setPixmap(
-                    pix.scaled(160, 160, Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
-                )
-                self.cover_label.setText("")
-                got = True
+        got = self._apply_cover(cover_path)
         self._has_cover = got
         if not got:
             self.cover_label.setPixmap(QPixmap())
             self.cover_label.setText("无封面")
+
+    def _apply_cover(self, cover_path) -> bool:
+        """把封面文件按 160px 解码并应用到封面位，成功返回 True
+
+        用 QImageReader 按目标尺寸缩小解码，避免整张大图先全量解码再缩放。
+        """
+        if not (cover_path and os.path.exists(cover_path)):
+            return False
+        reader = QImageReader(cover_path)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid() and (size.width() > 160 or size.height() > 160):
+            reader.setScaledSize(
+                size.scaled(160, 160, Qt.AspectRatioMode.KeepAspectRatio)
+            )
+        pix = QPixmap.fromImage(reader.read())
+        if pix.isNull():
+            return False
+        self.cover_label.setPixmap(
+            pix.scaled(160, 160, Qt.AspectRatioMode.KeepAspectRatio,
+                       Qt.TransformationMode.SmoothTransformation)
+        )
+        self.cover_label.setText("")
+        return True
 
     def _rebuild_tag_buttons(self, tags_str):
         """根据标签字符串重建可点击标签按钮"""

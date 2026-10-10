@@ -6,7 +6,7 @@
 - 视口检测通过 visualItemRect 高效获取
 """
 from PyQt6.QtCore import QModelIndex, QRect, QSize, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -221,6 +221,28 @@ class WorkImagesView(QWidget):
             self._ensure_item_loaded(item)
             loaded += 1
 
+        self._release_offscreen(viewport_valid, vrect)
+
+    def _release_offscreen(self, viewport_valid, vrect):
+        """释放滚出视口 item 的 pixmap，限制图片墙内存驻留
+
+        数百张图的 QPixmap 全部驻留可达数百 MB；滚回时
+        _ensure_item_loaded 会从 image_loader 的 LRU 缓存快速恢复（仅 QImage→QPixmap 转换）。
+        上下各留一屏缓冲，避免小幅滚动引起反复释放/重建。
+        """
+        if not viewport_valid:
+            return
+        margin = vrect.height()
+        keep = vrect.adjusted(0, -margin, 0, margin)
+        list_widget = self.list_widget
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if item is None or not getattr(item, "_loaded", False):
+                continue
+            if not keep.intersects(list_widget.visualItemRect(item)):
+                item.setData(ROLE_PIXMAP, None)
+                item._loaded = False
+
     def _ensure_item_loaded(self, item: QListWidgetItem):
         """触发单个 item 的异步加载"""
         if getattr(item, "_loaded", False):
@@ -229,28 +251,32 @@ class WorkImagesView(QWidget):
         # 缓存命中直接设置
         cached = get_cached(item._image_path, target)
         if cached is not None and not cached.isNull():
-            self._apply_pixmap(item, cached)
+            self._apply_image(item, cached)
             item._loaded = True
             return
         item._token = loader().request(
             item._image_path, target,
-            lambda path, t, pix, tk, it=item: self._on_loaded(it, path, t, pix, tk),
+            lambda path, t, img, tk, it=item: self._on_loaded(it, path, t, img, tk),
         )
 
-    def _on_loaded(self, item, path, target, pixmap, token):
+    def _on_loaded(self, item, path, target, image, token):
         """异步回调：token 不匹配或 item 已销毁则丢弃"""
         if token != getattr(item, "_token", -1):
             return False
         if path != item._image_path:
             return False
-        self._apply_pixmap(item, pixmap)
+        if image.isNull():
+            # 解码失败：不置 _loaded，下次滚回视口时可重试
+            return False
+        self._apply_image(item, image)
         item._loaded = True
         return True
 
-    def _apply_pixmap(self, item: QListWidgetItem, pixmap: QPixmap):
-        """把 pixmap 写入 item 数据，触发重绘"""
-        if pixmap.isNull():
+    def _apply_image(self, item: QListWidgetItem, image: QImage):
+        """把解码结果写入 item 数据，触发重绘（QImage → QPixmap 只能在 GUI 线程做）"""
+        if image.isNull():
             return
+        pixmap = QPixmap.fromImage(image)
         try:
             item.setData(ROLE_PIXMAP, pixmap)
             row = self.list_widget.row(item)
