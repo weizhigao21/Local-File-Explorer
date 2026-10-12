@@ -13,8 +13,6 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
-    QStyle,
-    QStyleOptionViewItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -171,33 +169,35 @@ class _CheckListWidget(QListWidget):
 
     Qt 本身只在点击指示器（小方块）时切换勾选，点行内其他位置不切换。
     过去用 itemClicked 无条件翻转，点小方块时 Qt 已翻转一次、代码再翻转一次，
-    两次抵消表现为「点复选框没反应」。这里改为：仅当点击位置不在指示器上时才手动切换，
-    点在指示器上则交还给 Qt 自行切换。
+    两次抵消表现为「点复选框没反应」。
+
+    实现方式不依赖指示器几何计算：先让 Qt 走完默认处理（super 内部会把指示器
+    点击转交 item delegate 自行翻转），再比较点击前后的勾选状态——
+    - 状态已变：说明点在指示器上且 Qt 已翻转，交还 Qt，不重复翻；
+    - 状态不变：点的是行内其他位置，由我们补上这次翻转。
+    无论 Qt 风格/版本对指示器点击是否自动翻转，最终都恰好翻转一次。
+
+    历史教训：此处曾用 QListView.initStyleOption 计算指示器矩形来区分点击
+    位置，但 PyQt6 未暴露该方法（唯一可见的重载是祖先类 QFrame 的，参数类型
+    不匹配），每次调用必抛 TypeError；该异常从 C++ 事件循环直接调用的
+    mouseReleaseEvent 里逃出会直接终止进程——表现为「点列表项即闪退」。
     """
 
     def mouseReleaseEvent(self, event):
-        pos = event.position().toPoint()
-        item = self.itemAt(pos)
+        item = self.itemAt(event.position().toPoint())
+        before = item.checkState() if item is not None else None
+        super().mouseReleaseEvent(event)
         if (
             item is not None
             and item.flags() & Qt.ItemFlag.ItemIsUserCheckable
-            and not self._on_check_indicator(item, pos)
+            and item.checkState() == before
         ):
+            # Qt 未处理这次翻转（点的是行内非指示器位置），由我们补上
             item.setCheckState(
                 Qt.CheckState.Unchecked
-                if item.checkState() == Qt.CheckState.Checked
+                if before == Qt.CheckState.Checked
                 else Qt.CheckState.Checked
             )
-        super().mouseReleaseEvent(event)
-
-    def _on_check_indicator(self, item, pos) -> bool:
-        """判断点击位置是否落在勾选指示器方块上（外扩 4px 容差）"""
-        opt = QStyleOptionViewItem()
-        self.initStyleOption(opt, item)
-        rect = self.style().subElementRect(
-            QStyle.SubElement.SE_ItemViewItemCheckIndicator, opt, self
-        )
-        return rect.adjusted(-4, -4, 4, 4).contains(pos)
 
 
 class _CheckListTab(QWidget):
