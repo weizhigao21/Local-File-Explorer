@@ -9,28 +9,35 @@ launcher 独有 CARD_BORDER 而 audio_theme 独有 PLAYER_BG），属于"改一�
 
 只放「颜色/尺寸令牌」，不放 QSS 文本 —— 各模块的样式表仍留在各自主题文件里，
 避免把不同模块的排版意图混在一起。
+
+v1.8.5 起全应用统一为「陶色 · 温润卡片」：强调色由青蓝换赤陶，与播放器窗口
+（ui/player_theme.py 的 P_* 令牌，取值同源）一套观感；暖奶油底 + 米白卡片。
 """
 
-# ---- 强调色（3D 黏土风 / 轻拟物新拟态） ----
-ACCENT = "#42B4C2"                        # 强调色（青蓝）
-ACCENT_HOVER = "#48B8BC"                  # 强调色悬停
-ACCENT_TINT = "rgba(66, 180, 194, 0.15)"  # 半透明 accent 背景
+# ---- 强调色（陶色 · 温润卡片 / 赤陶） ----
+ACCENT = "#B85C3E"                        # 强调色（赤陶，= player P_ACCENT）
+ACCENT_HOVER = "#D4886A"                  # 强调色悬停（= player P_ACCENT_LIGHT）
+# 半透明 accent 背景的「预混色」。
+# 不能写 rgba(184,92,62,0.15)：Qt 的 QSS 会丢弃带 alpha 的 background-color，
+# 整条声明失效后回落到系统高亮蓝（#389EC9），选中行会变成刺眼的蓝色。
+# 这里按 15% 叠在 BG_MAIN(#F4EFE7) 上算好，得到一个不透明等价色。
+ACCENT_TINT = "#EBD9CE"                   # ≈ 15% accent over BG_MAIN
 
 # ---- 背景 ----
-BG_MAIN = "#F5F0E8"
-BG_SIDEBAR = "#FDF9F2"
-CARD_BG = "#FFFFFF"
-CARD_HOVER = "#FFFDF8"
-INPUT_BG = "#EDE6DA"
-PLAYER_BG = "#EDE6DA"
+BG_MAIN = "#F4EFE7"                       # 暖奶油窗底（= player P_BG）
+BG_SIDEBAR = "#FBF7F0"                    # 侧栏：米白（= player P_CARD）
+CARD_BG = "#FBF7F0"                       # 卡片面
+CARD_HOVER = "#FFFCF7"
+INPUT_BG = "#EDE2CE"                      # 输入/按钮面（暖砂，= player P_TRACK）
+PLAYER_BG = "#EDE2CE"
 
 # ---- 文本 ----
-TEXT_PRIMARY = "#555555"
-TEXT_SECONDARY = "#777777"
-TEXT_MUTED = "#999999"
-TEXT_DIM = "#BBBBBB"
+TEXT_PRIMARY = "#3D3830"                  # 正文（深咖，= player P_TEXT）
+TEXT_SECONDARY = "#7A6E5C"                # 按钮/次要文字（= player P_TEXT_BTN）
+TEXT_MUTED = "#A89880"                    # 弱化信息（= player P_TEXT_DIM）
+TEXT_DIM = "#C4B394"                      # 最弱信息（= player P_TEXT_FAINT）
 
 # ---- 描边 ----
-BORDER_COLOR = "#D5CDC0"
-CARD_BORDER = "#E8E0D5"
-CARD_BORDER_HOVER = "#D5CDC0"
+BORDER_COLOR = "#E0D5C2"                  # = player P_EDGE_STRONG
+CARD_BORDER = "#E8DECB"                   # = player P_CARD_EDGE
+CARD_BORDER_HOVER = "#D4C5A8"

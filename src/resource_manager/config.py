@@ -39,7 +39,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.8.6"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -56,6 +56,8 @@ _DEFAULT_USER_CONFIG = {
     # UI 状态记忆
     "AUDIO_SORT_INDEX": 0,       # 音频排序: 0=名称A-Z, 1=名称Z-A, 2=时间新→旧, 3=时间旧→新
     "AUDIO_VIEW_MODE": 0,        # 音频视图: 0=网格, 1=列表
+    # DLsite 抓取代理：空 = 自动（系统代理 → 直连 → 环境变量）
+    "DL_PROXY": "",
 }
 
 # 当前生效的用户配置（运行时可改，通过 save_user_config() 写盘）
@@ -86,6 +88,8 @@ def _load_user_config():
                     continue
                 if k == "AUDIO_ROOTS":
                     v = _normalize_audio_roots(v)
+                elif k == "DL_PROXY":
+                    v = str(v or "").strip()
                 merged[k] = v
             # 兼容旧版单路径配置 AUDIO_ROOT → 迁移为 AUDIO_ROOTS
             if "AUDIO_ROOTS" not in data and "AUDIO_ROOT" in data:
@@ -110,6 +114,8 @@ def set_user_config(key: str, value):
         raise KeyError(f"未知配置项: {key}")
     if key == "AUDIO_ROOTS":
         value = _normalize_audio_roots(value)
+    elif key == "DL_PROXY":
+        value = str(value or "").strip()
     _user_config[key] = value
     globals()[key] = value  # 同步模块级变量，方便 config.XXX 直接访问
     if key == "AUDIO_ROOTS":
@@ -129,3 +135,4 @@ GPU_FRIENDLY_FORMAT = _user_config["GPU_FRIENDLY_FORMAT"]
 UI_SCALE = _user_config["UI_SCALE"]
 AUDIO_SORT_INDEX = _user_config["AUDIO_SORT_INDEX"]
 AUDIO_VIEW_MODE = _user_config["AUDIO_VIEW_MODE"]
+DL_PROXY = _user_config["DL_PROXY"]

@@ -12,7 +12,16 @@ from resource_manager import fingerprint_cache as fp
 from resource_manager.config import AUDIO_ROOT, AUDIO_ROOTS
 from resource_manager.utils import natural_key
 
-AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".aac", ".ogg", ".wma", ".m4a"}
+AUDIO_EXTENSIONS = {
+    # 常用有损/无损
+    ".mp3", ".mp2", ".flac", ".wav", ".ape", ".wv",
+    # MPEG-4 家族（m4b 有声书、m4r 铃声与 m4a 同容器）
+    ".m4a", ".m4b", ".m4r", ".aac",
+    # Ogg 家族（Vorbis / Opus / Speex）
+    ".ogg", ".oga", ".opus", ".spx",
+    # 其他
+    ".wma", ".aiff", ".aif", ".mka", ".ac3", ".amr", ".dsf", ".dff",
+}
 
 # 根目录歌单名称（兜底：根目录名称为空时使用）
 ROOT_PLAYLIST_NAME = "音频根目录"

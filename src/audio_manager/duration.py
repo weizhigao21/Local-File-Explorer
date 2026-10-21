@@ -23,23 +23,29 @@ _ASF_FILE_PROPERTIES_GUID = bytes.fromhex("A1DCAB8C47A9CF118EE400C00C205365")
 
 
 def get_duration(path):
-    """返回音频文件时长（秒）。不支持或解析失败时返回 0。"""
+    """返回音频文件时长（秒）。不支持或解析失败时返回 0。
+
+    0 不是错误：播放时 QMediaPlayer 的 durationChanged 会给出真实时长，
+    曲目列表用播放结果回填即可。新增格式优先保证可播放，再补解析器。
+    """
     try:
         ext = os.path.splitext(path)[1].lower()
         if ext == ".wav":
             return _wav_duration(path)
         if ext == ".flac":
             return _flac_duration(path)
-        if ext in (".m4a", ".mp4", ".aac"):
-            if ext in (".m4a", ".mp4"):
-                return _m4a_duration(path)
+        if ext in (".m4a", ".mp4", ".m4b", ".m4r"):
+            return _m4a_duration(path)
+        if ext == ".aac":
             return _adts_duration(path)
-        if ext == ".ogg":
+        if ext in (".ogg", ".oga", ".opus", ".spx"):
             return _ogg_duration(path)
         if ext == ".mp3":
             return _mp3_duration(path)
         if ext == ".wma":
             return _asf_duration(path)
+        if ext in (".aiff", ".aif"):
+            return _aiff_duration(path)
     except Exception:
         return 0
     return 0
@@ -268,14 +274,18 @@ def _ogg_duration(path):
     head = _read_head(path, 64 * 1024)
     if head[:4] != b"OggS":
         return 0
-    # 首个 logical bitstream 的 Vorbis identification header 里含采样率
+    # 首个 logical bitstream 的识别头里含采样率
     sample_rate = 0
-    # identification header packet: ogg 页头(27 字节) + 段表后，包开头为 "\x01vorbis"
-    # Vorbis identification header：0x01 + "vorbis"(6) + version(4) + channels(1) + sample_rate(4 LE)
+    # identification header packet: ogg 页头(27 字节) + 段表后，包开头为识别头
+    # Vorbis: 0x01 + "vorbis"(6) + version(4) + channels(1) + sample_rate(4 LE)
+    # Opus:   "OpusHead" + version(1) + channels(1) + preskip(2 LE) ...
+    #         Opus 的 granule position 恒以 48kHz 计，与原始采样率无关
     nseg = head[26] if len(head) > 26 else 0
     if nseg > 0:
         seg_start = 27 + nseg
-        if (head[seg_start:seg_start + 7] == b"\x01vorbis"
+        if head[seg_start:seg_start + 8] == b"OpusHead":
+            sample_rate = 48000
+        elif (head[seg_start:seg_start + 7] == b"\x01vorbis"
                 and seg_start + 7 + 4 + 1 + 4 <= len(head)):
             sample_rate = struct.unpack_from("<I", head, seg_start + 13)[0]
     # 读取文件末尾，找到最后一个 Ogg 页的 granule position（未设置残留位）
@@ -302,6 +312,40 @@ def _read_head_gen(path, size):
         if size > 64 * 1024:
             f.seek(size - 64 * 1024)
         return f.read()
+
+
+# ── AIFF / AIFF-C ──
+def _extended80(raw):
+    """解析 80 位 IEEE 754 扩展精度浮点（AIFF 的采样率字段）"""
+    if len(raw) < 10:
+        return 0.0
+    (exponent,) = struct.unpack_from(">H", raw, 0)
+    mantissa = int.from_bytes(raw[2:10], "big")
+    if exponent == 0 or mantissa == 0:
+        return 0.0
+    sign = -1.0 if exponent & 0x8000 else 1.0
+    exponent = (exponent & 0x7FFF) - 16383
+    return sign * mantissa * 2.0 ** (exponent - 63)
+
+
+def _aiff_duration(path):
+    """COMM 块：channels(2) numSampleFrames(4) sampleSize(2) sampleRate(10)"""
+    data = _read_head(path, 4096)
+    if data[:4] != b"FORM" or data[8:12] not in (b"AIFF", b"AIFC"):
+        return 0
+    pos = 12
+    while pos + 8 <= len(data):
+        (size,) = struct.unpack_from(">I", data, pos + 4)
+        if data[pos:pos + 4] == b"COMM" and pos + 26 <= len(data):
+            (frames,) = struct.unpack_from(">I", data, pos + 10)
+            rate = _extended80(data[pos + 16:pos + 26])
+            if rate <= 0:
+                return 0
+            return _round_sec(frames / rate)
+        if size <= 0:
+            break
+        pos += 8 + size + (size & 1)
+    return 0
 
 
 # ── WMA (ASF) ──

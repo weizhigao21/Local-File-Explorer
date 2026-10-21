@@ -18,13 +18,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ui.theme_base import ACCENT, ACCENT_TINT, TEXT_DIM, TEXT_PRIMARY
+
 # ---- 配色（与主窗口黏土风统一） ----
-ACCENT = "#42B4C2"
-ACCENT_TINT = "rgba(66, 180, 194, 0.15)"
-TEXT_PRIMARY = "#555555"
-TEXT_MUTED = "#999999"
-TEXT_DIM = "#BBBBBB"
-TAG_BG = "#EDE6DA"
+# 令牌来自 theme_base，避免这里再复制一份导致改一处漏一处。
+TAG_BG = "#EDE2CE"
 
 
 def parse_tags(tags_str: str) -> list[str]:
@@ -127,8 +125,8 @@ class TagChip(QFrame):
 # =============================================================
 #  FilterSelectorDialog — 联合筛选选择窗口（标签 / CV / 社团 三个页签）
 # =============================================================
-BG_SIDEBAR = "#FDF9F2"
-BORDER_COLOR = "#D5CDC0"
+BG_SIDEBAR = "#FBF7F0"
+BORDER_COLOR = "#E0D5C2"
 
 _LIST_QSS = f"""
     QListWidget {{
@@ -137,7 +135,7 @@ _LIST_QSS = f"""
         outline: none;
     }}
     QListWidget::item {{
-        padding: 6px 8px; border-bottom: 1px solid #E8E0D5;
+        padding: 6px 8px; border-bottom: 1px solid #E8DECB;
     }}
     QListWidget::item:hover {{ background-color: {ACCENT_TINT}; }}
     QListWidget::item:selected {{
@@ -147,7 +145,7 @@ _LIST_QSS = f"""
 
 _SEARCH_QSS = f"""
     QLineEdit {{
-        background-color: #EDE6DA; color: {TEXT_PRIMARY};
+        background-color: #EDE2CE; color: {TEXT_PRIMARY};
         border: 1px solid {BORDER_COLOR}; border-radius: 4px;
         padding: 4px 8px; font-size: 12px;
     }}
@@ -347,7 +345,7 @@ class FilterSelectorDialog(QDialog):
                 border: none; border-radius: 4px;
                 padding: 4px 20px; font-size: 12px;
             }}
-            QPushButton:hover {{ background-color: #48B8BC; }}
+            QPushButton:hover {{ background-color: #D4886A; }}
         """)
         ok_btn.clicked.connect(self.accept)
         btn_layout.addWidget(ok_btn)

@@ -51,7 +51,7 @@ class MainWindow(QMainWindow):
         # 左侧栏
         sidebar = QWidget()
         sidebar.setFixedWidth(220)
-        sidebar.setStyleSheet("background-color: #FDF9F2; color: #555555;")
+        sidebar.setStyleSheet("background-color: #FBF7F0; color: #3D3830;")
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(10, 10, 10, 10)
 
@@ -59,8 +59,8 @@ class MainWindow(QMainWindow):
         self.author_list.setStyleSheet(
             f"""
             QListWidget {{
-                background-color: #FDF9F2;
-                color: #555555;
+                background-color: #FBF7F0;
+                color: #3D3830;
                 border: none;
                 outline: none;
             }}
@@ -70,7 +70,7 @@ class MainWindow(QMainWindow):
                 border-left: 2px solid transparent;
             }}
             QListWidget::item:hover {{
-                background-color: #E8E0D5;
+                background-color: #E8DECB;
             }}
             QListWidget::item:selected {{
                 background-color: {ACCENT_TINT};
@@ -101,7 +101,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(settings_btn)
 
         sidebar_label = QLabel("作者列表")
-        sidebar_label.setStyleSheet("color: #999999; font-size: 11px; padding: 4px 2px;")
+        sidebar_label.setStyleSheet("color: #A89880; font-size: 11px; padding: 4px 2px;")
         back_launcher_btn = QPushButton("← 返回主界面")
         back_launcher_btn.setStyleSheet(BTN_QSS)
         back_launcher_btn.clicked.connect(self._back_to_launcher)
@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
 
         # 右侧内容
         content = QWidget()
-        content.setStyleSheet("background-color: #F5F0E8;")
+        content.setStyleSheet("background-color: #F4EFE7;")
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -129,10 +129,10 @@ class MainWindow(QMainWindow):
         self.search_box.setStyleSheet(
             f"""
             QLineEdit {{
-                background-color: #EDE6DA;
-                color: #555555;
+                background-color: #EDE2CE;
+                color: #3D3830;
                 padding: 6px 10px;
-                border: 1px solid #D5CDC0;
+                border: 1px solid #E0D5C2;
                 border-radius: 4px;
                 selection-background-color: {ACCENT};
             }}
@@ -154,7 +154,7 @@ class MainWindow(QMainWindow):
         self.works_scroll = QScrollArea()
         self.works_scroll.setWidgetResizable(True)
         self.works_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.works_scroll.setStyleSheet("QScrollArea { border: none; background-color: #F5F0E8; }")
+        self.works_scroll.setStyleSheet("QScrollArea { border: none; background-color: #F4EFE7; }")
         self.works_scroll.verticalScrollBar().valueChanged.connect(self._on_works_scroll)
         self.works_scroll.viewport().installEventFilter(self)
 
@@ -235,20 +235,20 @@ class MainWindow(QMainWindow):
         bar.setStyleSheet(
             f"""
             QFrame {{
-                background-color: #FDF9F2;
-                border-top: 1px solid #E8E0D5;
+                background-color: #FBF7F0;
+                border-top: 1px solid #E8DECB;
             }}
             QLabel {{
-                color: #555555;
+                color: #3D3830;
                 font-size: 12px;
                 padding: 2px;
             }}
             QProgressBar {{
                 border: none;
-                background-color: #EDE6DA;
+                background-color: #EDE2CE;
                 border-radius: 3px;
                 text-align: center;
-                color: #555555;
+                color: #3D3830;
                 font-size: 11px;
                 height: 14px;
             }}

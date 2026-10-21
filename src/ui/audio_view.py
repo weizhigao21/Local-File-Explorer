@@ -6,9 +6,8 @@ import os
 from contextlib import suppress
 from datetime import datetime
 
-from PyQt6.QtCore import QTimer, QUrl
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
-from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -37,13 +36,17 @@ from ui.audio_theme import (
     BG_MAIN,
     BG_SIDEBAR,
     BTN_QSS,
+    CARD_BORDER,
 )
 from ui.audio_threads import AudioScanThread, DlsiteWorker, MtimeMigrationThread
 from ui.audio_widgets import AudioSettingsDialog
+from ui.playback_controller import get_playback_controller
 from ui.thread_guard import stop_scan_thread
 
 
 class AudioMainWindow(QMainWindow):
+    playerRequested = pyqtSignal()
+
     def __init__(self, on_back_to_launcher=None):
         super().__init__()
         self._on_back_to_launcher = on_back_to_launcher
@@ -51,13 +54,11 @@ class AudioMainWindow(QMainWindow):
         self.resize(1080, 700)
 
         self._current_playlist_id = None
-        self._current_track_index = -1
         self._detail_history = []  # 详情页导航栈
         self._detail_group_id = None
         self._detail_entries = {}  # 当前主歌单下含直接音频的子目录
         self._filter_origin = None  # 从详情页进入筛选视图时的导航历史快照（返回时还原）
         self._tracks_data = []
-        self._play_queue = []  # 独立播放队列（导航/切歌单时保持播放）
         self._mtime_thread = None  # 后台 mtime 迁移线程
         self._dlsite_thread = None  # DLsite 信息后台抓取线程
         self._dlsite_sync_batch = set()  # 待批量同步的 RJ 码（攒批避免刷新风暴）
@@ -79,10 +80,11 @@ class AudioMainWindow(QMainWindow):
             except Exception as e:
                 print(f"[DLsite] 数据库初始化失败: {e}")
 
-        # 播放器（延迟初始化，避免阻塞窗口显示）
-        self._player = None
-        self._audio_output = None
-        self._player_initialized = False
+        # 播放控制器（app 级单例）：队列、播放器、音量统一管理，窗口只做订阅与展示。
+        # 播放器本身延迟创建，这里不会初始化音频设备。
+        self.playback = get_playback_controller()
+        self.playback.trackChanged.connect(self._on_track_changed)
+        self.playback.errorOccurred.connect(self._on_playback_error)
 
         self.setStyleSheet(f"QMainWindow {{ background-color: {BG_MAIN}; }}")
         self._setup_ui()
@@ -97,57 +99,6 @@ class AudioMainWindow(QMainWindow):
         self._auto_scanning = True
         QTimer.singleShot(500, self.start_scan)
 
-    # ==================== 播放器（延迟初始化） ====================
-    @property
-    def player(self):
-        self._ensure_player()
-        return self._player
-
-    @property
-    def audio_output(self):
-        self._ensure_player()
-        return self._audio_output
-
-    def _ensure_player(self):
-        """延迟初始化 QMediaPlayer（首次使用时创建，避免阻塞窗口显示）"""
-        if self._player_initialized:
-            return
-        self._player_initialized = True
-        self._player = QMediaPlayer()
-        self._audio_output = QAudioOutput()
-        self._player.setAudioOutput(self._audio_output)
-        self._player.positionChanged.connect(self._on_position_changed)
-        self._player.durationChanged.connect(self._on_duration_changed)
-        self._player.mediaStatusChanged.connect(self._on_media_status)
-        self._player.errorOccurred.connect(self._on_player_error)
-        self._audio_output.setVolume(0.8)
-        # 记录当前绑定的播放设备，并监听系统音频设备变化（切换默认设备后重建输出）
-        self._bound_device_id = QMediaDevices.defaultAudioOutput().id()
-        self._media_devices = QMediaDevices(self)
-        self._media_devices.audioOutputsChanged.connect(self._on_audio_devices_changed)
-
-    def _on_audio_devices_changed(self):
-        """系统音频设备列表变化（拔插/切换设备）：重建音频输出以跟随新设备"""
-        if not self._player_initialized:
-            return
-        self._rebind_audio_output(force=True)
-
-    def _rebind_audio_output(self, force=False):
-        """把 QAudioOutput 重绑到系统当前默认播放设备
-
-        Windows 上 Qt 的 WMF 后端会把音频流绑定到开播时的设备端点，
-        不会跟随系统默认播放设备切换，导致切换设备后声音仍发往旧设备（表现为无声）。
-        因此在设备列表变化或每次开播前，显式把输出重绑到当前默认设备。
-        注：不能通过新建 QAudioOutput 替换（Qt 6.11 实测替换会丢绑定），
-        直接对现有输出 setDevice 即可，播放中重绑不中断。
-        """
-        self._ensure_player()  # 首次开播时播放器可能尚未初始化
-        default_dev = QMediaDevices.defaultAudioOutput()
-        if not force and default_dev.id() == self._bound_device_id:
-            return
-        self._audio_output.setDevice(default_dev)
-        self._bound_device_id = default_dev.id()
-
     # ==================== UI 构建 ====================
     def _setup_ui(self):
         central = QWidget()
@@ -158,8 +109,13 @@ class AudioMainWindow(QMainWindow):
 
         # ---- 顶部栏 ----
         toolbar = QFrame()
+        toolbar.setObjectName("audioToolbar")  # #audioToolbar 选择器防级联到内部 QLabel
         toolbar.setFixedHeight(44)
-        toolbar.setStyleSheet(f"background-color: {BG_SIDEBAR}; border: none;")
+        # 发丝分隔线对齐播放器 header 语言；必须带选择器，
+        # QFrame {} 型底色会级联给子 QLabel（QLabel 是 QFrame 子类，坑 #9）。
+        toolbar.setStyleSheet(
+            f"QFrame#audioToolbar {{ background-color: {BG_SIDEBAR};"
+            f" border-bottom: 1px solid {CARD_BORDER}; }}")
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(8, 4, 8, 4)
         toolbar_layout.setSpacing(8)
@@ -179,6 +135,12 @@ class AudioMainWindow(QMainWindow):
         settings_btn.setStyleSheet(BTN_QSS)
         settings_btn.clicked.connect(self.open_settings)
         toolbar_layout.addWidget(settings_btn)
+
+        player_btn = QPushButton("♪ 播放器")
+        player_btn.setStyleSheet(BTN_QSS)
+        player_btn.setToolTip("打开独立播放器窗口（字幕 / 队列 / 迷你模式）")
+        player_btn.clicked.connect(self.playerRequested.emit)
+        toolbar_layout.addWidget(player_btn)
         toolbar_layout.addStretch()
         layout.addWidget(toolbar)
 
@@ -210,12 +172,9 @@ class AudioMainWindow(QMainWindow):
         self.page_stack.currentChanged.connect(self._update_footer_visibility)
 
         # ---- 播放栏 ----
+        # 控制按钮与进度/音量全部由控制器驱动；这里只保留「点曲名跳歌单」的库内导航
         self.player_bar = AudioPlayerBar()
-        self.player_bar.prevClicked.connect(self.play_previous)
-        self.player_bar.toggleClicked.connect(self.toggle_play)
-        self.player_bar.nextClicked.connect(self.play_next)
-        self.player_bar.seekRequested.connect(self._seek)
-        self.player_bar.volumeChanged.connect(self._on_volume_changed)
+        self.player_bar.bind_controller(self.playback)
         self.player_bar.nowPlayingClicked.connect(self._on_now_playing_clicked)
         layout.addWidget(self.player_bar)
         self.player_bar.setVisible(False)
@@ -526,7 +485,7 @@ class AudioMainWindow(QMainWindow):
             txt = QPlainTextEdit()
             txt.setReadOnly(True)
             txt.setMaximumBlockCount(5000)
-            txt.setStyleSheet("QPlainTextEdit { background: #FFFFFF; color: #555; font-size: 12px; border: none; }")
+            txt.setStyleSheet("QPlainTextEdit { background: #FFFFFF; color: #3D3830; font-size: 12px; border: none; }")
             v.addWidget(txt)
             self._dlsite_log_dialog = dlg
             self._dlsite_log_text = txt
@@ -642,97 +601,53 @@ class AudioMainWindow(QMainWindow):
         self._play_track(index)
 
     def _play_track(self, index):
-        # 用户显式双击某首歌：以当前展示列表快照为独立播放队列起点
+        # 用户显式双击某首歌：以当前展示列表快照为播放队列
         if index < 0 or index >= len(self._tracks_data):
             return
-        self._play_queue = list(self._tracks_data)
-        self._play_from_queue(index)
+        self.playback.play_tracks(list(self._tracks_data), index)
 
-    def _play_from_queue(self, index):
-        """从独立播放队列播放指定位置的曲目（供双击/上一首/下一首/恢复共用）"""
-        if index < 0 or index >= len(self._play_queue):
+    def _on_track_changed(self, track):
+        """控制器切歌回调：显示播放条并高亮当前曲目"""
+        if getattr(self, "_closing", False):
             return
-        self._current_track_index = index
-        track = self._play_queue[index]
-        path = track["path"]
-        if not os.path.exists(path):
-            QMessageBox.warning(self, "文件不存在", f"找不到文件: {path}")
-            return
-        self._rebind_audio_output()  # 开播前校验默认播放设备是否已切换
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
-        self.player_bar.set_playing(True)
-        title = track["title"] or os.path.basename(path)
-        display = title[:10] + "..." if len(title) > 10 else title
-        self.player_bar.set_now_playing(f"♪ {display}")
         self.player_bar.setVisible(True)
         self._highlight_current_in_list()
 
+    def _on_playback_error(self, message):
+        """播放失败（文件缺失/解码错误）：错误文本由播放条显示，这里只保证它可见"""
+        if getattr(self, "_closing", False):
+            return
+        self.player_bar.setVisible(True)
+
     def _highlight_current_in_list(self):
         """高亮展示列表中当前正在播放的曲目"""
-        if not self._play_queue or self._current_track_index < 0 \
-                or self._current_track_index >= len(self._play_queue):
+        track = self.playback.current_track
+        if not track or not track.get("path"):
             return
-        playing_path = self._play_queue[self._current_track_index]["path"]
-        self.detail.set_highlight_by_path(playing_path)
+        self.detail.set_highlight_by_path(track["path"])
 
     def toggle_play(self):
-        state = self.player.playbackState()
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-            self.player_bar.set_playing(False)
-        elif state == QMediaPlayer.PlaybackState.PausedState:
-            self.player.play()
-            self.player_bar.set_playing(True)
-        else:
-            if self._play_queue and self._current_track_index >= 0:
-                self._play_from_queue(self._current_track_index)
-            elif self._tracks_data:
-                self._play_track(0)
+        # 队列为空时按空格：以当前展示列表从头播放（保持旧行为）
+        if not self.playback.queue and self._tracks_data:
+            self._play_track(0)
+            return
+        self.playback.toggle()
 
     def play_next(self):
-        if not self._play_queue:
-            return
-        idx = self._current_track_index + 1
-        if idx >= len(self._play_queue):
-            idx = 0
-        self._play_from_queue(idx)
+        self.playback.next()
 
     def play_previous(self):
-        if not self._play_queue:
-            return
-        idx = self._current_track_index - 1
-        if idx < 0:
-            idx = len(self._play_queue) - 1
-        self._play_from_queue(idx)
-
-    def _on_position_changed(self, pos_ms):
-        self.player_bar.set_position(pos_ms // 1000)
-
-    def _on_duration_changed(self, dur_ms):
-        self.player_bar.set_duration(int(dur_ms // 1000))
-
-    def _on_media_status(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.play_next()
-
-    def _on_player_error(self, error, error_string):
-        if error != QMediaPlayer.Error.NoError:
-            self.player_bar.set_now_playing(f"播放错误: {error_string}")
+        self.playback.previous()
 
     def _seek(self, pos):
-        """拖动/点击进度条时跳转"""
-        self.player.setPosition(pos * 1000)
-
-    def _on_volume_changed(self, val):
-        self.audio_output.setVolume(val / 100.0)
+        """拖动/点击进度条时跳转（pos 单位：秒）"""
+        self.playback.seek(pos * 1000)
 
     def _on_now_playing_clicked(self):
         """点击播放条曲目名 → 回到当前歌单，或按层级跳转到曲目所属歌单"""
-        if not self._play_queue or self._current_track_index < 0 \
-                or self._current_track_index >= len(self._play_queue):
+        track = self.playback.current_track
+        if not track:
             return
-        track = self._play_queue[self._current_track_index]
         target = db.get_playlist(track.get("playlist_id")) if track.get("playlist_id") else None
         if not target:
             return  # 歌单已被删除等脏数据，忽略
@@ -849,10 +764,14 @@ class AudioMainWindow(QMainWindow):
     # ==================== 设置 / 返回 ====================
     def open_settings(self):
         AudioSettingsDialog(self).exec()
+        # 代理/目录可能刚改过：重新校验缺失的 DLsite 信息并立即入队，
+        # 避免用户改完代理还要重启或等下一轮扫描。
+        if not getattr(self, "_closing", False):
+            self._start_dlsite_prefetch()
 
     def _back_to_launcher(self):
-        if self._player_initialized:
-            self._player.stop()
+        # 不停止播放：播放器是 app 级的，回到启动器/关闭库窗口后音乐继续，
+        # 用户可从任务栏切回独立播放器窗口控制。
         self.close()
 
     def closeEvent(self, event):
@@ -862,11 +781,17 @@ class AudioMainWindow(QMainWindow):
         if app is not None:
             with suppress(TypeError):
                 app.focusChanged.disconnect(self._on_focus_changed)
+        # 播放控制器是 app 级单例，必须主动断开本窗口的订阅，否则已销毁的窗口
+        # 仍会被信号命中（RuntimeError: wrapped C/C++ object has been deleted）
+        for signal, slot in (
+            (self.playback.trackChanged, self._on_track_changed),
+            (self.playback.errorOccurred, self._on_playback_error),
+        ):
+            with suppress(TypeError):
+                signal.disconnect(slot)
         self._scan_hide_timer.stop()
         self._dlsite_hide_timer.stop()
         self._dlsite_sync_timer.stop()
-        if self._player_initialized:
-            self._player.stop()
         # 先停扫描线程：它持有数据库长连接，且会向即将关闭的窗口发信号
         self._stop_scan_thread()
         # 等待后台 mtime 迁移线程结束，避免向已删除的窗口发射信号

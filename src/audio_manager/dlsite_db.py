@@ -114,6 +114,15 @@ def set_error(rj: str, error: str):
         )
 
 
+def clear_errors():
+    """清除所有失败记录，让它们下次扫描后立即重试（改完代理后使用）"""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE works SET error = NULL, fetched_at = 0 WHERE error IS NOT NULL"
+        )
+    return cur.rowcount
+
+
 def get_work(rj: str) -> dict | None:
     """查询单条作品记录（无则 None）；genres/description 反序列化为列表"""
     with get_conn() as conn:

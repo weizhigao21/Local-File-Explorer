@@ -15,45 +15,50 @@ from ui.theme_base import (
     BG_SIDEBAR,
     BORDER_COLOR,
     CARD_BG,
+    CARD_BORDER,
     CARD_HOVER,
     INPUT_BG,
     PLAYER_BG,
     TEXT_DIM,
     TEXT_MUTED,
     TEXT_PRIMARY,
+    TEXT_SECONDARY,
 )
 
 __all__ = [
     # 从 theme_base 转出的设计令牌
     "ACCENT", "ACCENT_HOVER", "ACCENT_TINT",
-    "BG_MAIN", "BG_SIDEBAR", "CARD_BG", "CARD_HOVER", "INPUT_BG", "PLAYER_BG",
-    "TEXT_PRIMARY", "TEXT_MUTED", "TEXT_DIM", "BORDER_COLOR",
+    "BG_MAIN", "BG_SIDEBAR", "CARD_BG", "CARD_BORDER", "CARD_HOVER",
+    "INPUT_BG", "PLAYER_BG",
+    "TEXT_PRIMARY", "TEXT_SECONDARY", "TEXT_MUTED", "TEXT_DIM", "BORDER_COLOR",
     # 本模块自有的样式与工具
     "BTN_QSS", "MENU_QSS", "format_time", "get_basename",
 ]
 
-BTN_QSS = """
-QPushButton {
-    background-color: #EDE6DA; color: #555;
-    padding: 6px 14px; border: 1px solid #D5CDC0; border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #F3EFE8; border: 1px solid """ + ACCENT + """; color: #444;
-}
-QPushButton:pressed {
-    background-color: #48B8BC; border: 1px solid #48B8BC; color: #fff;
-}
+# 通用按钮（工具栏 / 分页 / 返回）：26~27px 高的胶囊。
+# radius 13 = 半高，恰成胶囊；再大 1px Qt 就退化成直角（坑 #13）。
+BTN_QSS = f"""
+QPushButton {{
+    background-color: {INPUT_BG}; color: {TEXT_PRIMARY};
+    padding: 6px 14px; border: 1px solid {BORDER_COLOR}; border-radius: 13px;
+}}
+QPushButton:hover {{
+    background-color: {CARD_HOVER}; border: 1px solid {ACCENT}; color: {TEXT_PRIMARY};
+}}
+QPushButton:pressed {{
+    background-color: {ACCENT_HOVER}; border: 1px solid {ACCENT_HOVER}; color: #fff;
+}}
 """
 
 # 右键菜单样式：悬停时背景与文字颜色同时变化，避免浅底浅字看不清
 MENU_QSS = f"""
 QMenu {{
     background-color: {BG_SIDEBAR}; color: {TEXT_PRIMARY};
-    border: 1px solid {BORDER_COLOR}; border-radius: 6px;
+    border: 1px solid {BORDER_COLOR}; border-radius: 8px;
     padding: 4px;
 }}
 QMenu::item {{
-    padding: 6px 24px; border-radius: 4px; font-size: 12px;
+    padding: 6px 24px; border-radius: 6px; font-size: 12px;
 }}
 QMenu::item:selected {{
     background-color: {ACCENT}; color: #FFFFFF;

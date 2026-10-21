@@ -23,3 +23,10 @@ Thumbs.db
 
 # PyInstaller
 *.spec.bak
+
+# Versioned build outputs (dist_v171/, dist_v183_prev/ …)
+dist_v*/
+
+# Working artifacts (screenshots, design drafts)
+_shots/
+artifacts/

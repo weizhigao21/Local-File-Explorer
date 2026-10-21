@@ -20,21 +20,21 @@ class ImageViewer(QDialog):
         self.current_index = start_index
         self._token = -1  # 当前请求的 token
         self.setWindowTitle("图片查看")
-        self.setStyleSheet("background-color: #F5F0E8; color: #555555;")
+        self.setStyleSheet("background-color: #F4EFE7; color: #3D3830;")
 
         self.scene = QGraphicsScene(self)
         self.view = QGraphicsView(self.scene)
-        self.view.setStyleSheet("border: none; background-color: #F5F0E8;")
+        self.view.setStyleSheet("border: none; background-color: #F4EFE7;")
         self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.counter = QLabel(self)
-        self.counter.setStyleSheet("color: #555555; font-size: 14px; padding: 6px;")
+        self.counter.setStyleSheet("color: #3D3830; font-size: 14px; padding: 6px;")
 
         prev_btn = QPushButton("上一张 (←)")
         next_btn = QPushButton("下一张 (→)")
-        BTN_STYLE = "background-color: #EDE6DA; color: #555555; padding: 6px 14px; border: 1px solid #D5CDC0; border-radius: 4px;"
-        BTN_HOVER = "QPushButton:hover { background-color: #F3EFE8; border: 1px solid #42B4C2; color: #444; }"
-        BTN_PRESSED = "QPushButton:pressed { background-color: #48B8BC; border: 1px solid #48B8BC; color: #fff; }"
+        BTN_STYLE = "background-color: #EDE2CE; color: #3D3830; padding: 6px 14px; border: 1px solid #E0D5C2; border-radius: 4px;"
+        BTN_HOVER = "QPushButton:hover { background-color: #F3EFE8; border: 1px solid #B85C3E; color: #3D3830; }"
+        BTN_PRESSED = "QPushButton:pressed { background-color: #D4886A; border: 1px solid #D4886A; color: #fff; }"
         for btn in [prev_btn, next_btn]:
             btn.setStyleSheet(BTN_STYLE + BTN_HOVER + BTN_PRESSED)
         prev_btn.clicked.connect(self.show_previous)

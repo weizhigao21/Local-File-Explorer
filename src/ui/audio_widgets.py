@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from audio_manager import database as db
+from audio_manager import dlsite_db
 from resource_manager import config
 from ui.audio_theme import (
     ACCENT,
@@ -175,11 +177,11 @@ class PlaylistCard(QFrame):
                 background-color: {CARD_BG};
                 border: 1px solid {BORDER_COLOR};
                 border-top: 2px solid transparent;
-                border-radius: 6px;
+                border-radius: 10px;
             }}
             PlaylistCard:hover {{
                 background-color: {CARD_HOVER};
-                border: 1px solid #D5CDC0;
+                border: 1px solid #E0D5C2;
                 border-top: 2px solid {ACCENT};
             }}
         """)
@@ -193,7 +195,7 @@ class PlaylistCard(QFrame):
         self.cover_label = QLabel()
         self.cover_label.setFixedSize(160, 140)
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cover_label.setStyleSheet("background-color: #F5F0E8; border-radius: 4px;")
+        self.cover_label.setStyleSheet("background-color: #F4EFE7; border-radius: 8px;")
         self.cover_label.setText("...")
         layout.addWidget(self.cover_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -322,12 +324,12 @@ class SubPlaylistCard(QFrame):
             SubPlaylistCard {
                 background-color: transparent;
                 border: 1px solid transparent;
-                border-radius: 4px;
+                border-radius: 8px;
                 padding: 2px 8px;
             }
             SubPlaylistCard:hover {
-                background-color: #EDE6DA;
-                border: 1px solid #D5CDC0;
+                background-color: #EDE2CE;
+                border: 1px solid #E0D5C2;
             }
         """)
         layout = QHBoxLayout(self)
@@ -344,7 +346,7 @@ class SubPlaylistCard(QFrame):
         layout.addWidget(cnt)
 
         arrow = QLabel("▶")
-        arrow.setStyleSheet("color: #555; font-size: 10px;")
+        arrow.setStyleSheet("color: #3D3830; font-size: 10px;")
         layout.addWidget(arrow)
 
     def mouseReleaseEvent(self, event):
@@ -359,8 +361,8 @@ class AudioSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("音频设置")
-        self.setFixedSize(540, 430)
-        self.setStyleSheet(f"AudioSettingsDialog {{ background-color: #FDF9F2; color: {TEXT_PRIMARY}; }}")
+        self.setFixedSize(540, 560)
+        self.setStyleSheet(f"AudioSettingsDialog {{ background-color: #FBF7F0; color: {TEXT_PRIMARY}; }}")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
@@ -373,7 +375,7 @@ class AudioSettingsDialog(QDialog):
         self.path_list.setStyleSheet(f"""
             QListWidget {{
                 background-color: {INPUT_BG}; color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 4px;
+                border: 1px solid {BORDER_COLOR}; border-radius: 8px;
                 padding: 4px;
             }}
         """)
@@ -384,11 +386,11 @@ class AudioSettingsDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         add_btn = QPushButton("添加目录")
-        add_btn.setStyleSheet(f"background-color: {ACCENT}; color: #fff; padding: 6px 14px; border-radius: 4px;")
+        add_btn.setStyleSheet(f"background-color: {ACCENT}; color: #fff; padding: 6px 14px; border-radius: 13px;")
         add_btn.clicked.connect(self._add_path)
         btn_row.addWidget(add_btn)
         remove_btn = QPushButton("移除选中")
-        remove_btn.setStyleSheet(f"background-color: {BORDER_COLOR}; color: {TEXT_PRIMARY}; padding: 6px 14px; border-radius: 4px;")
+        remove_btn.setStyleSheet(f"background-color: {BORDER_COLOR}; color: {TEXT_PRIMARY}; padding: 6px 14px; border-radius: 13px;")
         remove_btn.clicked.connect(self._remove_path)
         btn_row.addWidget(remove_btn)
         btn_row.addStretch()
@@ -399,11 +401,47 @@ class AudioSettingsDialog(QDialog):
         desc.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(desc)
 
+        proxy_label = QLabel("DLsite 网络代理")
+        proxy_label.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 13px; font-weight: bold;")
+        layout.addWidget(proxy_label)
+
+        self.proxy_input = QLineEdit()
+        self.proxy_input.setPlaceholderText("留空 = 自动（系统代理 → 直连 → 环境变量）")
+        self.proxy_input.setText(getattr(config, "DL_PROXY", ""))
+        self.proxy_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {INPUT_BG}; color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER_COLOR}; border-radius: 8px;
+                padding: 6px 8px; font-size: 12px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+        """)
+        layout.addWidget(self.proxy_input)
+
+        proxy_hint = QLabel(
+            "例：http://127.0.0.1:7897（Clash / v2ray 的 HTTP 端口）。"
+            "抓取失败时会自动尝试系统代理与直连；修改后清除失败记录并重新抓取。"
+        )
+        proxy_hint.setWordWrap(True)
+        proxy_hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        layout.addWidget(proxy_hint)
+
+        retry_row = QHBoxLayout()
+        retry_btn = QPushButton("清除失败记录并重试")
+        retry_btn.setStyleSheet(
+            f"background-color: {BORDER_COLOR}; color: {TEXT_PRIMARY};"
+            f" padding: 5px 12px; border-radius: 12px; font-size: 11px;"
+        )
+        retry_btn.clicked.connect(self._clear_failed)
+        retry_row.addWidget(retry_btn)
+        retry_row.addStretch()
+        layout.addLayout(retry_row)
+
         btn_layout = QHBoxLayout()
         delete_btn = QPushButton("删除当前数据库")
         delete_btn.setStyleSheet("""
             QPushButton { background-color: #D4736E; color: #fff;
-                padding: 8px 16px; border-radius: 4px; }
+                padding: 8px 16px; border-radius: 13px; }
             QPushButton:hover { background-color: #E08580; }
         """)
         delete_btn.clicked.connect(self._delete_db)
@@ -412,7 +450,7 @@ class AudioSettingsDialog(QDialog):
         save_btn = QPushButton("保存")
         save_btn.setStyleSheet("""
             QPushButton { background-color: #CCC0B0; color: #fff;
-                padding: 8px 24px; border-radius: 4px; }
+                padding: 8px 24px; border-radius: 13px; }
             QPushButton:hover { background-color: #BBB0A0; }
         """)
         save_btn.clicked.connect(self.on_save)
@@ -447,6 +485,18 @@ class AudioSettingsDialog(QDialog):
         if row >= 0:
             self.path_list.takeItem(row)
 
+    def _clear_failed(self):
+        """清除失败记录：改好代理后不用等 24 小时重试窗口"""
+        try:
+            count = dlsite_db.clear_errors()
+        except Exception as e:
+            QMessageBox.warning(self, "操作失败", f"清除失败记录时出错：{e}")
+            return
+        QMessageBox.information(
+            self, "提示",
+            f"已清除 {count} 条失败记录。\n重新进入音频模块或点击「扫描」后会再次尝试抓取。",
+        )
+
     def on_save(self):
         paths = [self.path_list.item(i).text().strip()
                  for i in range(self.path_list.count())]
@@ -458,7 +508,24 @@ class AudioSettingsDialog(QDialog):
             if not os.path.isdir(p):
                 QMessageBox.warning(self, "路径无效", f"目录不存在: {p}")
                 return
+
+        proxy = self.proxy_input.text().strip()
+        if proxy and "://" not in proxy:
+            proxy = "http://" + proxy
+        old_proxy = getattr(config, "DL_PROXY", "")
         config.set_user_config("AUDIO_ROOTS", paths)
+        config.set_user_config("DL_PROXY", proxy)
         config.save_user_config()
+
+        message = "设置已保存。音频目录修改在重启程序后生效。"
+        if proxy != old_proxy:
+            # 代理变了：清空探测缓存与失败记录，否则失败条目会被 24h 冷却挡住
+            from audio_manager import dlsite
+            dlsite.reset_network_state()
+            try:
+                dlsite_db.clear_errors()
+            except Exception as e:
+                print(f"[DLsite] 清除失败记录失败: {e}")
+            message = "设置已保存。\n代理已更新，失败条目会重新抓取。"
         self.accept()
-        QMessageBox.information(self, "提示", "设置已保存，重启程序后生效。")
+        QMessageBox.information(self, "提示", message)

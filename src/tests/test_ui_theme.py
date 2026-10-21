@@ -61,7 +61,7 @@ def test_theme_modules_reexport_tokens():
         assert mod.ACCENT == theme_base.ACCENT
 
     # photo_theme 的模块独有令牌
-    assert photo_theme.ACCENT_PRESSED == "#3DA0AE"
+    assert photo_theme.ACCENT_PRESSED == "#9E4B30"
     # audio_theme 的模块独有样式
     assert "QPushButton" in audio_theme.BTN_QSS
 
@@ -94,3 +94,46 @@ def test_core_layers_do_not_import_qt():
             if "PyQt6" in src or "PySide6" in src:
                 offenders.append(f"{pkg}/{name}")
     assert offenders == [], f"核心层出现 Qt 依赖（分层被破坏）: {offenders}"
+
+
+# ==================== QSS 透明度陷阱 ====================
+def test_accent_tint_is_opaque():
+    """ACCENT_TINT 必须是预混好的不透明色
+
+    回归背景：原值为 "rgba(66, 180, 194, 0.15)"。Qt 的 QSS 会丢弃带 alpha 的
+    background-color，整条声明失效后回落到系统高亮蓝，选中行变成刺眼的纯蓝，
+    青蓝色图标在选中行里直接融进背景看不见。
+    """
+    from ui import theme_base
+
+    for name in ("ACCENT_TINT",):
+        value = getattr(theme_base, name)
+        assert not value.startswith("rgba("), f"{name} 不能带 alpha：{value}"
+        assert len(value) in (4, 7), f"{name} 应为 #RGB / #RRGGBB（不能是 #AARRGGBB）：{value}"
+
+
+def test_no_alpha_background_color_in_qss():
+    """全量扫描 ui/*.py：background-color 不得使用 rgba() 或 #AARRGGBB
+
+    这两种写法在本项目的 Qt 版本下都会被静默丢弃，外观回落到系统调色板，
+    而且不报错 —— 只能靠静态守卫兜住。
+    """
+    import re
+
+    pattern = re.compile(r"background-color\s*:\s*([^;\"'}\n]+)", re.IGNORECASE)
+    offenders = []
+    for name in sorted(os.listdir(UI_DIR)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(UI_DIR, name), encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                for match in pattern.finditer(line):
+                    value = match.group(1).strip()
+                    if value.startswith("rgba(") or re.fullmatch(r"#[0-9a-fA-F]{8}", value):
+                        offenders.append(f"ui/{name}:{lineno} → {value}")
+    assert offenders == [], (
+        "以下 QSS 背景色带 alpha，会被 Qt 静默丢弃（请改用预混的不透明色）:\n"
+        + "\n".join(offenders)
+    )

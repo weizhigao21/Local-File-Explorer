@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import QFrame, QLabel, QVBoxLayout
 from ui.image_loader import get_cached, loader
 
 # 强调色（与 main_window 保持一致）
-ACCENT = "#42B4C2"
+ACCENT = "#B85C3E"
 
 
 class WorkCard(QFrame):
@@ -23,13 +23,13 @@ class WorkCard(QFrame):
             f"""
             WorkCard {{
                 background-color: #FFFFFF;
-                border: 1px solid #E8E0D5;
+                border: 1px solid #E8DECB;
                 border-top: 2px solid transparent;
                 border-radius: 6px;
             }}
             WorkCard:hover {{
-                background-color: #FFFDF8;
-                border: 1px solid #D5CDC0;
+                background-color: #FFFCF7;
+                border: 1px solid #E0D5C2;
                 border-top: 2px solid {ACCENT};
             }}
         """
@@ -42,17 +42,17 @@ class WorkCard(QFrame):
         self.img_label = QLabel()
         self.img_label.setFixedSize(200, 200)
         self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.img_label.setStyleSheet("background-color: #F5F0E8; border-radius: 4px;")
+        self.img_label.setStyleSheet("background-color: #F4EFE7; border-radius: 4px;")
         self.img_label.setText("...")
         layout.addWidget(self.img_label)
 
         title = QLabel(work["name"])
         title.setWordWrap(True)
-        title.setStyleSheet("color: #555555; font-size: 13px;")
+        title.setStyleSheet("color: #3D3830; font-size: 13px;")
         layout.addWidget(title)
 
         meta = QLabel(f"{work['author']} · {work['image_count']} 张")
-        meta.setStyleSheet("color: #999999; font-size: 11px;")
+        meta.setStyleSheet("color: #A89880; font-size: 11px;")
         layout.addWidget(meta)
 
     def load_thumbnail(self):

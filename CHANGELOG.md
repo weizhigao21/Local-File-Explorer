@@ -4,6 +4,232 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.8.6] - 2026-10-22
+
+修复播放器界面文字显示不全（字形头脚被裁掉）。
+
+### 修复
+- **队列曲名裁切**（用户截图实锤）— `queue_list_qss()` 的 `QListWidget::item`
+  曾带 `padding: 7px 8px`。Qt 会把 item padding 从 item 矩形里扣掉，再把
+  `setItemWidget` 的行控件塞进剩余内容区（34 − 7×2 = 20px），行内 margin 再吃
+  12px，标签只剩 8px——12px 字体墨盒 14px，字形头脚被砍掉。移除 item padding
+  （行内间距由行控件自己的 contentsMargins 负责），行控件恢复完整 34px。
+- **17px 标题顶部触边** — `title_label` 开了 word-wrap 后 sizeHint 按浮点行高
+  向下取整（17px 字体只报 18px），而墨盒 ascent+descent=19px，字形顶部被裁 1px。
+  改用显式 `setFont` + `setMinimumHeight(QFontMetrics(...).height())` 顶住。
+  同类字幕列表是纯文本 item（高度自适应），无此病。
+
+### 守卫
+- `test_queue_list_item_qss_has_no_padding`（静态）：`QListWidget::item` 规则禁止 padding。
+- `test_no_visible_label_clips_glyphs`（运行时）：全窗可见 QLabel 高度必须 ≥ 字体墨盒
+  （ascent+descent），完整态 + 迷你态都扫；队列曲名另做像素取证——墨迹不得触碰
+  标签上下边。含 2 次注入式验证（padding 塞回 / 拆标题最小高度 → 均精准失败）。
+  296 项全绿。
+
+## [v1.8.5] - 2026-10-22
+
+主界面整体换陶色赤陶（与播放器窗口同一套温润卡片风），底部播放条重做，并修复关窗后进程驻留。
+
+### 新增
+- **全应用统一陶色** — `theme_base.py` 配色令牌整体重写为陶色取值（赤陶强调 `#B85C3E`、
+  暖奶油底 `#F4EFE7`、米白卡片 `#FBF7F0`），侧栏 / 曲目表 / 工具栏 / 详情页 / 设置对话框 /
+  启动器 / 相册全部随令牌换色（17 个文件字面量扫换，映射表见提交记录）。`P_*` 与 `theme_base`
+  令牌现已同值同源，两套主题模块仍不互相引用。
+- **底部播放条重做**（`AudioPlayerBar`）— emoji ⏮▶⏭🔊 全部换 `media_icons` 矢量图标；
+  播放键换 `GlowPlayButton`（赤陶渐变圆面 + 柔光，42×42）；传输 / 音量收进双胶囊
+  （`QFrame#transportPill` 50px 高 radius 25、`#volPill` 30px 高 radius 15，objectName
+  选择器防级联）；滑杆换陶色轨道（5px 槽 + 赤陶渐变已播段 + 白底描边圆柄）；曲名用
+  QFontMetrics 省略号截断，时间标签 / seek 语义保持不变。
+- **chrome 圆角体系** — 对齐设计稿 C：卡片 10px、行 / 小件 8px、按钮胶囊（`BTN_QSS`
+  参数化半高圆角）。搜索框 / 下拉框 / 路径列表 / 代理输入框 / 设置对话框按钮全部按体系统一。
+- **发丝分隔线** — 工具栏 `border-bottom`、分页栏 `border-top`（`CARD_BORDER` 1px），
+  与播放器 header 同语言。
+- **守卫** — `test_last_visible_window_closes_for_real`（关窗驻留回归）、
+  `test_pills_render_as_true_capsules`（像素验型，含 mini 防拉伸断言）、
+  `test_no_border_radius_exceeds_half_height`（静态扫超半高 radius）。294 项全绿。
+
+### 修复
+- **关窗进程驻留** — 播放器非独立模式 `closeEvent` 原先一律 `event.ignore(); self.hide()`，
+  当它是最后一个可见窗口时 `quitOnLastWindowClosed` 永不触发 → 任务栏图标消失但进程驻留、
+  单实例锁挡住下次启动（需任务管理器杀进程）。现在「主界面还在」才隐藏；**最后一个可见
+  窗口则真关**（`_other_visible_window_exists()` 判定，最小化也算可见）。含 1 次注入式验证
+  （恢复 bug 原状 → 守卫精准失败）。
+- **chrome 级联残余** — `nav_bar` / `detail_toolbar` / 页面根 widget 的裸底色样式改
+  objectName / 类名选择器（坑 #11：裸 `background-color` 会被 Qt 级联给纯 QWidget 容器，
+  在卡片上成横贯浅色带）。设置对话框按钮由 4px 直角改胶囊，与主界面统一。
+
+## [v1.8.4] - 2026-10-21
+
+播放器窗口换成「陶色 · 温润卡片」新外观（UI 重构方向稿的版本 C），并补齐迷你态信息密度。
+
+### 新增
+- **陶色卡片主题** — 新增 `ui/player_theme.py`（`P_*` 令牌 + QSS 构建函数，取值对齐
+  `artifacts/player-ui-redesign/player-ui-3versions.html` 版本 C）：暖奶油底 `#F4EFE7`、
+  米白卡片 `#FBF7F0`、赤陶强调 `#B85C3E`。封面信息 / 字幕 / 队列 / 进度各占一张圆角卡片，
+  传输按钮与音量收进胶囊容器，消除"裸滑杆漂在背景上"的随意感。主界面 / 相册 / 启动器
+  仍用 `theme_base` 米色系（青蓝强调），两套外观并存、令牌不混用。
+- **顶栏层级拆分** — 产品名「播放器」带赤陶品牌标，曲目路径降级为灰色面包屑「艺术家 / 曲名」；
+  队列 / 置顶 / 迷你改为图标+文字胶囊，激活态整颗变赤陶。
+- **迷你态重做** — 44px 封面缩略 + 曲名 + `当前 / 总时长` + 传输胶囊 + 进度条（原先只剩一条光秃进度）。
+- **陶色播放键** — `GlowPlayButton` 渐变圆面（`#D4886A→#B85C3E`）+ 柔光，完整态与迷你态各一。
+- **胶囊小图标** — `media_icons.glyph_icon()`：队列 / 置顶 / 迷你三枚矢量图标，选中态换白色。
+- **守卫** — `tests/test_player_theme.py` 11 项 + `test_player_window.py` 细节守卫：令牌与
+  设计稿取值一致、深咖正文压奶油底对比度、**容器 QSS 必须带类型选择器**、**window_qss 必须带
+  `#playerCentral` 选择器**、**禁止超半高 border-radius（Qt 会退化成直角）**、QSS 不带透明度、
+  播放键像素级验证圆面/柔光、迷你态字段齐全、迷你态藏整个 controls 容器、队列曲名省略号、
+  **像素验型胶囊真胶囊（最左填充起点过圆弧下界）**、字幕面板主题注入。含 6 次注入式验证
+  （card_qss 裸声明 / window_qss 裸声明 / _toggle_mini 漏藏 controls / 曲名不截断 /
+  圆角改回 100px / 迷你胶囊撤 Fixed → 均精准失败）。
+
+### 修复
+- **QSS 裸声明级联** — 卡片容器的样式若写成裸声明（或用 `QFrame {}` 选择器），会连带给
+  内部标签描边/上底色（**QLabel 是 QFrame 子类**，`QFrame {}` 照样命中标签）。现在容器用
+  `QFrame{}`/`QLabel{}` 选择器 + 信息标签显式 `background: transparent; border: none;` 双保险。
+- **QSS 花括号拼接** — f-string 与普通字符串拼接时，普通串里的 `}}` 不会转义，会让最终
+  QSS 多出一个游离 `}`（`test_ui_qss` 静态守卫拦下）。闭括号写在哪个串里必须区分。
+- **window_qss 级联色带**（细节轮）— `window_qss()` 曾是裸 `background-color`，被 Qt 级联给
+  纯 QWidget 容器（meta_row / cover_wrap / badge_holder），在米白卡片上形成横贯浅色带。
+  改为 `#playerCentral { ... }` 选择器 + central 命名。
+- **迷你态方形光斑**（细节轮）— `_toggle_mini` 只藏了 seek_card/secondary_row，`controls`
+  容器的上下边距仍占 32px，把 mini_body 压到 56px，42px 播放键溢出 32px 高的传输胶囊，
+  柔光被胶囊边界齐底截成方块。现在整个 `controls` 容器随迷你态显隐。
+- **vol_pill 被拉宽**（细节轮）— 音量胶囊 Preferred 策略被 HBox 拉到 181px（sizeHint 仅
+  113px），内部喇叭 QLabel 跟着涨到 83px。vol_pill 与喇叭标签改 Fixed 策略。
+- **队列曲名溢出**（细节轮）— 超长曲名把行撑到 348px 溢出队列卡（QLabel 不自动省略号）。
+  现在 `QFontMetrics.elidedText` 截断 + tooltip 保留全名；迷你态曲名同样处理。
+- **字幕头挤压切字**（细节轮）— 窄卡（队列展开后字幕卡仅 ~340px）里「-0.5s」前缀被压掉、
+  文件名被切。右侧控制簇改 4px 组内间距 + Fixed 策略，窄卡自动藏文件名标签（tooltip 保留）。
+  另按设计稿补齐 sub-head：18px 圆形 leaf 标（`#F4EFE7` 底 + 10px 赤陶图标）+「字幕同步」。
+- **播放键圆面贴设计稿**（细节轮）— `GlowPlayButton` 增加 `face_ratio` 参数：完整态 48px
+  按钮出 42px 圆面、迷你态 42px 按钮出 36px 圆面；柔光止点随圆面自适应，保证圆面外有可见柔光。
+- **胶囊全是方角（倒圆角失效）**（细节轮）— Qt 的 QSS **不会把超过半高的 `border-radius`
+  钳成胶囊，而是直接退化成直角**（CSS 写 `100px` 成胶囊，Qt 画成方角矩形；实测 76px 高
+  38px✓ / 39px✗，超 1px 就退化）。传输栏 / 音量 / 倍速 / tag / 胶囊按钮此前全写
+  `border-radius: 100px`，完整态传输栏渲染成直角矩形。现改为按控件实际高度取半高：
+  传输 60px→30、迷你 50px→25、音量 27px→13、倍速 24px→12、胶囊按钮→12、tag→8；
+  迷你胶囊补纵向 Fixed 策略（曾被布局拉到 64px，圆角比例失效）。
+
+## [v1.8.3] - 2026-10-21
+
+本次为曲目列表加入自绘的音频格式图标，并修掉一个让选中行变刺眼纯蓝的 QSS 陷阱。
+
+### 新增
+- **音频格式图标** — 新增 `ui/file_format_icons.py`，用 QPainter 绘制圆角方块图标：垂直渐变（上亮下暗）、顶部柔光、细白内描边、白色格式名（带下沉投影）。覆盖 `AUDIO_EXTENSIONS` 全部 **22 种**音频格式，按「有损 / 无损」两档配色：
+  - 有损（mp3 / mp2 / aac / m4a / m4b / m4r / ogg / oga / opus / spx / wma / ac3 / amr）→ 主题强调色 `#42B4C2`
+  - 无损（flac / wav / ape / wv / aiff / aif / dsf / dff / mka）→ 加深一档 `#2F8CA3`
+- **字号自适应** — 2/3/4/5 字符分别是边长的 0.40 / 0.335 / 0.29 / 0.245，超过可用宽度 78% 时再按 `QFontMetricsF` 二次收缩，`AIFF`/`OPUS` 不会溢出；小于 20px 只画色块（字高不足 6px 会糊成白线）。字体度量异常时（离屏渲染未配置字体目录会退回"每字符 1em"的假值）跳过收缩，避免把字号压到 5px。
+- **曲目表格式列改为图标** — 类型列（列宽 70 → 56）不放文字，直接显示 28px 格式图标；行高 34 → 36 以容纳图标，tooltip 保留纯文本格式名。20px 时三个字母只有 6.7px 高、实测糊成一团，28px 是可读下限。
+- **图标样张** — 22 张 256px PNG 导出到 `assets/format_icons/audio/`，可直接用于文档或外部引用。
+
+### 修复
+- **选中行变成刺眼纯蓝** — `ACCENT_TINT` 原本写作 `rgba(66, 180, 194, 0.15)`，而 Qt 的 QSS 会**静默丢弃**带 alpha 的 `background-color`，整条声明失效后回落到系统高亮蓝（`#389EC9`）。结果选中行是纯蓝底白字，青蓝色图标在选中行里直接融进背景。现改为预混好的不透明等价色 `#DDEEF1`（15% accent over `BG_MAIN`），`ACCENT_TINT_LIGHT` 同步改为 `#EAF5F7`。
+- **标签组件的配色副本** — `ui/tag_widgets.py` 曾自行复制 `ACCENT`/`ACCENT_TINT`/`TEXT_*`，现改为从 `ui.theme_base` 导入，避免改一处漏一处。
+
+### 工程
+- 新增测试 22 项（合计 **239 项通过**）：格式归一、有损/无损分档、字号收缩、圆角外透明、dpr、多尺寸 QIcon、22 种格式全部可渲染，以及两条 QSS 守卫 —— `ACCENT_TINT` 必须不透明、`ui/` 下 `background-color` 不得出现 `rgba()` / `#AARRGGBB`。
+- 守卫做了注入验证：把 `ACCENT_TINT` 改回 `rgba(...)` 后对应测试精准失败，恢复后全绿。
+
+## [v1.8.2] - 2026-10-21
+
+本次修正三处听感与窗口模型问题：拖动进度条重复音效、文件关联拉起整个应用、以及托盘常驻。
+
+### 修复
+- **拖动进度条不再重复出声** — 旧实现拖动时按 100ms 节流连续发 `seek`，每次 `QMediaPlayer.setPosition` 都会让解码器重开音频管线，听觉上就是同一小段被反复播放。现在 `SeekSlider` 拆成两个信号：`seekPreview`（拖动中的位置预览，只更新时间文本与字幕高亮，**绝不 seek**）与 `clickedSeek`（松手瞬间提交的唯一一次跳转）。点轨道、拖滑块两条路径都只提交一次；底部播放条与独立播放器窗口均已改用该语义。
+- **拖动时滑块不再被播放位置拽回去** — 新增 `SeekSlider.is_seeking`（覆盖"点轨道拖动"与"拖滑块"两种状态），`positionChanged` 只在非拖动时回写滑块值。
+
+### 变更
+- **文件关联只开小窗** — `--play` 不再构造启动器与主界面，只创建一个 560×140 的迷你播放窗（封面信息 + 控制条），启动更快、内存更省；`--player` 仍是完整尺寸播放器窗口。关闭该窗口即退出程序。
+- **去掉托盘常驻** — 删除 `ui/tray_controller.py`，播放时就是一个普通任务栏窗口，最小化后从任务栏点回来，不再占据右下角小图标区；关掉最后一个窗口程序就退出（`setQuitOnLastWindowClosed(True)`）。嵌在主界面里的播放器窗口仍是"关掉只隐藏"。
+- **小窗定位与退出语义** — 独立播放窗口首次显示时居中（迷你窗落在屏幕下方三分之一），`Esc` 在独立模式下直接关闭窗口；窗口内提示文字随模式变化。
+
+### 工程
+- `main.py` 重构为三条明确路径（默认主界面 / `--play` 小窗 / `--player` 完整窗口），`_apply_args` 对 `launcher=None` 容错。
+- 新增守卫：`test_main_module_has_no_tray_resident`（启动流程不得出现托盘）、`test_standalone_window_closes_for_real`（独立窗关闭即退出）、`test_embedded_window_close_only_hides`（嵌入窗只隐藏）、`test_standalone_compact_layout`、`test_seek_preview_never_touches_media`、`test_player_window_commits_seek_only_on_release`。注入式验证过：把 `sliderMoved` 接回 seek、把关闭改回 hide，对应守卫均精准失败。
+- 完整测试集 186 项通过，Ruff 检查通过；版本统一显示 v1.8.2。
+
+### 已知
+- 离屏 pytest 里反复创建/销毁 `QWidget` 会让 Qt 在 `FlowLayout` 上撞到悬空指针（原生访问违例），因此进度条跳转行为改用离屏脚本验证，测试集只保留静态守卫。
+
+## [v1.8.1] - 2026-10-18
+
+本次为播放器控制图标的视觉修正。
+
+### 优化
+- **播放/暂停与切歌图标** — 不再使用 `▶` / `❚❚` / `◀◀` 字体字符，改为 `ui/media_icons.py` 中用 QPainter 矢量绘制：播放三角 20px、暂停双条 20px、上下首 18px，按 42px 圆与 36×30 按钮的实际比例绘制。修复字体字形偏小、被 emoji 字体接管成彩色方块、以及不同缩放级别下大小漂移的问题；悬停时图标颜色过渡，高分屏 2× 绘制保持锐利。
+
+### 工程
+- `test_player_window.py` 新增矢量图标断言（非空、尺寸、播放/暂停切换）；完整测试集 180 项通过，Ruff 检查通过；版本统一显示 v1.8.1。
+
+## [v1.8.0] - 2026-10-18
+
+本次新增 Windows 系统集成：把本程序正式注册为可选音乐播放器。
+
+### 新增
+- **默认播放器注册** — 新增 `system_integration.py`，在 HKCU 下写入 ProgID、22 种音频扩展名的 `OpenWithProgids`、`Capabilities`、`RegisteredApplications`，打包版额外写入 `Applications\<exe>` + `SupportedTypes`。注册后本程序会出现在右键「打开方式」和「设置 → 默认应用」，无需管理员权限。
+- **系统集成对话框** — 启动器标题栏「系统集成」、托盘菜单「系统集成（默认播放器）…」均可打开；显示注册状态，提供「注册为可选播放器」「打开默认应用设置」「取消注册」。
+- **命令行** — `--register` 注册后直接打开默认应用设置；`--unregister` 完整撤销本程序写入的注册项（不触碰系统已有的默认关联）。
+
+### 说明（Windows 限制）
+- Win10/11 的默认应用由 `UserChoice` 哈希保护，**程序无法静默把自己设为默认**；强写会被系统重置。本版只做正规注册并把用户带到设置页，最后一步「设为默认」需要用户点一次。
+- 系统媒体键（播放/暂停键）依赖 SMTC，本版仍未接入；`Ctrl+Alt+Space` / `Ctrl+Alt+←/→` 与托盘仍可用。
+
+### 工程
+- 新增 `test_system_integration.py`（4 项），其中注册表往返测试使用临时 ProgID 真实写入并完整清理。
+- 完整测试集 179 项通过，Ruff 检查通过；版本统一显示 v1.8.0。
+
+## [v1.7.1] - 2026-10-18
+
+本次为 DLsite 信息拉取「全部网络请求失败」的修复。
+
+### 修复
+- **抓取全部失败（高危）** — 桌面环境里 libcurl 默认套用 `HTTP(S)_PROXY` 环境变量，而实际能出网的是 Windows 系统代理（注册表 `Internet Settings`），导致每个请求都走失效转发（502）或直连超时。现按「用户指定 → 系统代理 → 直连 → 环境变量」顺序探测，成功后缓存复用；直连时显式传空代理串，禁止 libcurl 再套用环境代理。
+- **失败日志不可读** — 新增 `last_error()`，日志从笼统的「网络请求失败」变为「代理隧道失败 / 无法连接代理 / 连接超时 / HTTP 状态码」；网络通道探测结果（使用了哪个代理）也写入抓取日志。
+- **失败冷却挡住修复后重试** — 24 小时冷却改为仅进程内有效：每次启动首次抓取清除上轮失败记录；设置里代理变更会自动清除并重新入队；新增「清除失败记录并重试」按钮。
+- **封面下载** — 复用同一代理通道，不再单独直连导致封面缺失。
+
+### 配置
+- 新增 `DL_PROXY`（音频设置 →「DLsite 网络代理」）：留空自动探测，可填 `http://127.0.0.1:7897` 这类地址。
+
+### 工程
+- 新增 `test_dlsite_proxy.py`（8 项）：代理规范化、自动排序、去重、失败回退、缓存复用、失败原因可读性。
+- 完整测试集 175 项通过，Ruff 检查通过；版本统一显示 v1.7.1。
+- 注意：仓库内 `dist/` 仍是旧构建且未包含 `beautifulsoup4`，需重新打包后修复才会进入 exe。
+
+## [v1.7.0] - 2026-10-18
+
+本次把音频模块从「库内播放条」升级为可日常使用的播放器：独立窗口、滚动字幕、队列、托盘、全局热键与命令行入口。
+
+### 新增
+- **独立播放器窗口** — 封面 + 曲目信息 + 滚动字幕 + 可折叠队列；支持迷你模式（560×140）、窗口置顶、拖放文件/文件夹即播、`打开文件…` 多选。关闭窗口只隐藏，播放继续。
+- **字幕滚动** — 新增纯 Python `audio_manager/subtitles.py`：SRT / WebVTT / LRC / ASS-SSA 解析，UTF-8/UTF-16/GB18030/Shift-JIS 编码嗅探，cue 二分定位（句间空隙不残留上一句）。新增 `ui/subtitle_view.py`：当前句高亮居中、其余淡化，手动滚动暂停跟随 3.5 秒，`A-`/`A+` 调字号，`±0.5s` 校准并可归零。字幕按「同名 → 同名语言变体（中文优先）→ 目录内唯一字幕」配对。
+- **字幕偏移持久化** — `tracks` 表新增 `subtitle_offset` 列（旧库自动迁移），按曲目记住校准值。
+- **播放队列与循环/倍速** — 队列面板双击切歌；列表 / 单曲 / 随机三种循环模式；0.75x–2x 倍速；曲目元数据（标题/艺术家/专辑）来自媒体标签，取不到时回退文件名。
+- **系统托盘** — 托盘菜单可打开播放器、播放/暂停、上一首/下一首、退出；左键单击恢复窗口；无托盘环境自动降级。
+- **全局热键** — `Ctrl+Alt+Space` 播放/暂停、`Ctrl+Alt+←/→` 切歌（Windows `RegisterHotKey`，被占用时静默降级）。
+- **单实例与命令行** — 新增 `app_instance.py`：二次启动通过本地 socket 把参数转发给已运行实例；支持 `--play 文件/文件夹`、`--player`、`--module audio|photo`，启动器与音频模块新增「♪ 播放器」入口。
+
+### 变更
+- **库窗口关闭不再停止播放** — 播放器归 app 级控制器，返回启动器或关闭音频库窗口后音乐继续，用托盘/播放器窗口控制。
+- **播放错误提示** — 文件缺失/解码失败显示在播放条或播放器状态栏，不再弹模态框。
+
+### 工程
+- 新增 `test_subtitles.py`（12 项）与 `test_player_window.py`（8 项，含单实例转发、字幕偏移持久化、`QMediaPlayer` 不得出现在窗口层的静态守卫）。
+- 完整测试集 167 项通过，Ruff 检查通过；启动器、写真窗口和音频窗口标题统一显示 v1.7.0。
+
+## [v1.6.5] - 2026-10-18
+
+本次为音频播放能力的底层重构与多格式扩展，是独立播放器窗口/字幕滚动的第一步。
+
+### 变更
+- **播放控制器抽取** — 新增 `ui/playback_controller.py`，把 `QMediaPlayer`、`QAudioOutput`、播放队列、当前索引、音量、循环模式与播放设备重绑统一收进 app 级单例 `PlaybackController`。`AudioMainWindow` 不再自己持有播放器，只订阅控制器信号；底部播放条通过 `bind_controller()` 直接绑定控制器，不再关心 Qt 多媒体对象。关窗时主动断开订阅，避免单例信号命中已销毁窗口。
+- **循环模式** — 新增列表循环 / 单曲循环 / 随机播放（手动切歌在单曲循环下仍前进，播放结束才重播当前曲）。
+- **多格式支持** — 扫描白名单扩至 MP2/APE/WV/M4B/M4R/OGA/OPUS/SPX/AIFF/AIF/MKA/AC3/AMR/DSF/DFF；时长解析新增 Opus（Ogg granule，按 48kHz）与 AIFF/AIFF-C（COMM + 80 位扩展精度采样率），其余新格式解析不到时返回 0，由播放时 `durationChanged` 回填。
+- **播放器延迟初始化保持不变** — 仅打开音频库窗口不会创建 `QMediaPlayer`，不占用音频设备。
+
+### 工程
+- 新增 `test_playback_controller.py`（11 项）：队列延迟初始化、上下首环绕、单曲循环自动/手动行为、随机不重复当前曲、文件缺失只发错误信号、音量夹紧与去重发信号、单例重建、格式白名单、AIFF 时长解析、静态守卫（`audio_view.py` 禁止出现 `QMediaPlayer`）。
+- 完整测试集 147 项通过，Ruff 检查通过；启动器、写真窗口和音频窗口标题统一显示 v1.6.5。
+
 ## [v1.6.4] - 2026-10-12
 
 本次为音频模块筛选选择器的崩溃修复。

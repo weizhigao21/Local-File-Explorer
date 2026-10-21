@@ -4,7 +4,7 @@
 """
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QImageReader, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -35,8 +35,15 @@ from ui.audio_theme import (
 )
 from ui.audio_threads import DurationProbeThread
 from ui.audio_widgets import SubPlaylistCard
+from ui.file_format_icons import format_icon
 from ui.flow_layout import FlowLayout
 from ui.tag_widgets import TagButton, parse_tags
+
+# 曲目表里格式图标的目标边长。
+# 20px 时三个字母只剩 6.7px 高，会糊成一团白点，28px 是实测能读出 MP3/FLAC 的下限；
+# 行高必须同步放大，否则图标会被行高裁切。
+TRACK_ICON_SIZE = 28
+TRACK_ROW_HEIGHT = 36
 
 
 class PlaylistDetailPage(QWidget):
@@ -50,14 +57,17 @@ class PlaylistDetailPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background-color: {BG_MAIN};")
+        # 整页底色必须带选择器：裸 background-color 会被 Qt 级联给纯 QWidget 子容器（坑 #11）
+        self.setStyleSheet(f"PlaylistDetailPage {{ background-color: {BG_MAIN}; }}")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         detail_toolbar = QFrame()
+        detail_toolbar.setObjectName("detailToolbar")  # #detailToolbar 选择器防级联到内部 QLabel
         detail_toolbar.setFixedHeight(40)
-        detail_toolbar.setStyleSheet(f"background-color: {BG_SIDEBAR}; border: none;")
+        detail_toolbar.setStyleSheet(
+            f"QFrame#detailToolbar {{ background-color: {BG_SIDEBAR}; border: none; }}")
         dt_layout = QHBoxLayout(detail_toolbar)
         dt_layout.setContentsMargins(8, 4, 8, 4)
         self.detail_back_btn = QPushButton("← 返回歌单列表")
@@ -83,7 +93,7 @@ class PlaylistDetailPage(QWidget):
         self.cover_label = QLabel()
         self.cover_label.setFixedSize(160, 160)
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cover_label.setStyleSheet("background-color: #FFFFFF; border-radius: 6px;")
+        self.cover_label.setStyleSheet("background-color: #FFFFFF; border-radius: 10px;")
         self.cover_label.setText("无封面")
         info_row.addWidget(self.cover_label)
 
@@ -141,7 +151,7 @@ class PlaylistDetailPage(QWidget):
 
         # 子歌单区域
         self.sub_header = QLabel("子歌单")
-        self.sub_header.setStyleSheet("color: #BBB; font-size: 13px; font-weight: bold; padding-top: 8px;")
+        self.sub_header.setStyleSheet("color: #C4B394; font-size: 13px; font-weight: bold; padding-top: 8px;")
         self.sub_header.setVisible(False)
         self.info_layout.addWidget(self.sub_header)
 
@@ -163,25 +173,28 @@ class PlaylistDetailPage(QWidget):
         self.track_list = QTableWidget(0, 4)
         self.track_list.setHorizontalHeaderLabels(["#", "标题", "类型", "时长"])
         self.track_list.verticalHeader().setVisible(False)
+        # 类型列只放格式图标（图标里已经写了格式名，再写一遍就是重复）
+        self.track_list.setIconSize(QSize(TRACK_ICON_SIZE, TRACK_ICON_SIZE))
+        self.track_list.verticalHeader().setDefaultSectionSize(TRACK_ROW_HEIGHT)
         header = self.track_list.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.track_list.setColumnWidth(0, 44)
-        self.track_list.setColumnWidth(2, 70)
+        self.track_list.setColumnWidth(2, 56)
         self.track_list.setColumnWidth(3, 70)
         header.setHighlightSections(False)
-        header.setStyleSheet("QHeaderView::section { background: #F5F0E8; color: #999; border: none; "
-                             "border-bottom: 1px solid #E8E0D5; padding: 4px 8px; font-size: 11px; }")
+        header.setStyleSheet("QHeaderView::section { background: #F4EFE7; color: #A89880; border: none; "
+                             "border-bottom: 1px solid #E8DECB; padding: 4px 8px; font-size: 11px; }")
         self.track_list.setStyleSheet(f"""
             QTableWidget {{
-                background-color: {BG_MAIN}; color: #777;
-                border: 1px solid #EDE6DA; border-radius: 4px; outline: none;
+                background-color: {BG_MAIN}; color: #7A6E5C;
+                border: 1px solid #EDE2CE; border-radius: 10px; outline: none;
                 gridline-color: #EFE9DE;
             }}
-            QTableWidget::item {{ padding: 4px 8px; border-bottom: 1px solid #E8E0D5; }}
-            QTableWidget::item:hover {{ background-color: #EDE6DA; color: {TEXT_PRIMARY}; }}
+            QTableWidget::item {{ padding: 4px 8px; border-bottom: 1px solid #E8DECB; }}
+            QTableWidget::item:hover {{ background-color: #EDE2CE; color: {TEXT_PRIMARY}; }}
             QTableWidget::item:selected {{
                 background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};
             }}
@@ -227,18 +240,18 @@ class PlaylistDetailPage(QWidget):
         row.setContentsMargins(0, 8, 0, 0)
         row.setSpacing(8)
         title = QLabel("曲目列表")
-        title.setStyleSheet("color: #BBB; font-size: 13px; font-weight: bold; padding-top: 0;")
+        title.setStyleSheet("color: #C4B394; font-size: 13px; font-weight: bold; padding-top: 0;")
         self.track_header = title
         row.addWidget(title)
         row.addStretch()
         label = QLabel("类型:")
-        label.setStyleSheet("color: #BBB; font-size: 12px;")
+        label.setStyleSheet("color: #C4B394; font-size: 12px;")
         self.type_filter = QComboBox()
         self.type_filter.addItem("全部类型", "")
         self.type_filter.setFixedWidth(110)
         self.type_filter.setStyleSheet(f"""
             QComboBox {{ background: #FFFFFF; color: {TEXT_PRIMARY}; border: 1px solid #E0D8CC;
-                          border-radius: 4px; padding: 2px 6px; font-size: 12px; }}
+                          border-radius: 8px; padding: 2px 6px; font-size: 12px; }}
             QComboBox::drop-down {{ border: none; width: 18px; }}
             QComboBox QAbstractItemView {{ background: #FFFFFF; color: {TEXT_PRIMARY};
                                            selection-background-color: {ACCENT_TINT};
@@ -368,12 +381,19 @@ class PlaylistDetailPage(QWidget):
 
 
     def _set_row(self, row, number, title, ftype, secs):
-        """写入表格的一行数据（# / 标题 / 类型 / 时长）"""
-        cells = [str(number), title, ftype, self._fmt_time(secs)]
+        """写入表格的一行数据（# / 标题 / 格式图标 / 时长）"""
+        cells = [str(number), title, "", self._fmt_time(secs)]
         for col, text in enumerate(cells):
             item = QTableWidgetItem(text)
             if col != 1:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if col == 2 and ftype:
+                # 图标里已经写了格式名，这一列不再重复放文字；
+                # tooltip 留一份纯文本，便于悬停确认与无障碍读取。
+                item.setIcon(
+                    format_icon(ftype, sizes=(TRACK_ICON_SIZE, TRACK_ICON_SIZE * 2))
+                )
+                item.setToolTip(ftype)
             self.track_list.setItem(row, col, item)
 
 
@@ -445,9 +465,9 @@ class PlaylistDetailPage(QWidget):
         btn.setCheckable(True)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setStyleSheet(
-            "QToolButton { color: #BBB; font-size: 13px; font-weight: bold; border: none;"
+            "QToolButton { color: #C4B394; font-size: 13px; font-weight: bold; border: none;"
             " background: transparent; text-align: left; padding: 0; }"
-            "QToolButton:hover { color: #888; }"
+            "QToolButton:hover { color: #A89880; }"
         )
         body.setVisible(False)
         btn.toggled.connect(

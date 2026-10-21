@@ -15,8 +15,9 @@ __all__ = [
 ]
 
 # ---- 写真模块特有的强调色档位 ----
-ACCENT_PRESSED = "#3DA0AE"         # 强调色按下
-ACCENT_TINT_LIGHT = "rgba(66, 180, 194, 0.08)"
+ACCENT_PRESSED = "#9E4B30"         # 强调色按下
+# 同 ACCENT_TINT：QSS 不吃带 alpha 的 background-color，这里给预混好的不透明等价色
+ACCENT_TINT_LIGHT = "#EFE3D9"      # ≈ 8% accent over BG_MAIN
 
 # 全局滚动条样式（窄条 + 圆角 + 悬停变亮）
 GLOBAL_SCROLLBAR_QSS = """
@@ -51,16 +52,16 @@ QScrollBar:horizontal {
 # 通用按钮样式（hover 时变 accent 色）
 BTN_QSS = f"""
 QPushButton {{
-    background-color: #EDE6DA;
-    color: #555555;
+    background-color: #EDE2CE;
+    color: #3D3830;
     padding: 6px 14px;
-    border: 1px solid #D5CDC0;
+    border: 1px solid #E0D5C2;
     border-radius: 4px;
 }}
 QPushButton:hover {{
     background-color: #F3EFE8;
     border: 1px solid {ACCENT};
-    color: #444;
+    color: #3D3830;
 }}
 QPushButton:pressed {{
     background-color: {ACCENT_PRESSED};

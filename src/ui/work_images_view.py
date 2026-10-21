@@ -31,8 +31,8 @@ DECODE_W = ITEM_W - 12
 DECODE_H = ITEM_IMG_H - 6
 
 # 强调色（与 main_window 保持一致）
-ACCENT = "#42B4C2"
-ACCENT_TINT = QColor(66, 180, 194, 40)        # 选中态背景
+ACCENT = "#B85C3E"
+ACCENT_TINT = QColor(184, 92, 62, 40)        # 选中态背景
 ACCENT_BORDER = QColor(ACCENT)
 
 
@@ -54,11 +54,11 @@ class _ImageDelegate(QStyledItemDelegate):
             painter.fillRect(rect, ACCENT_TINT)
             painter.setPen(ACCENT_BORDER)
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(rect, QColor("#FFFDF8"))
-            painter.setPen(QColor("#D5CDC0"))
+            painter.fillRect(rect, QColor("#FFFCF7"))
+            painter.setPen(QColor("#E0D5C2"))
         else:
             painter.fillRect(rect, QColor("#FFFFFF"))
-            painter.setPen(QColor("#E8E0D5"))
+            painter.setPen(QColor("#E8DECB"))
         painter.drawRect(rect.adjusted(0, 0, -1, -1))
 
         # 绘制 pixmap
@@ -79,14 +79,14 @@ class _ImageDelegate(QStyledItemDelegate):
             painter.drawPixmap(x, y, scaled)
         else:
             # 占位
-            painter.setPen(QColor("#999999"))
+            painter.setPen(QColor("#A89880"))
             painter.drawText(
                 QRect(rect.x(), rect.y() + ITEM_IMG_H // 2 - 10, rect.width(), 20),
                 Qt.AlignmentFlag.AlignCenter, "..."
             )
 
         # 索引
-        painter.setPen(QColor("#999999"))
+        painter.setPen(QColor("#A89880"))
         font = painter.font()
         font.setPointSize(9)
         painter.setFont(font)
@@ -138,7 +138,7 @@ class WorkImagesView(QWidget):
         self.list_widget.setGridSize(QSize(ITEM_W + 12, ITEM_H + 12))
         self.list_widget.setItemDelegate(_ImageDelegate(self.list_widget))
         self.list_widget.setStyleSheet(
-            "QListWidget { background-color: #F5F0E8; border: none; }"
+            "QListWidget { background-color: #F4EFE7; border: none; }"
             "QListWidget::item { background: transparent; border: none; padding: 0; }"
         )
         self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -164,15 +164,15 @@ class WorkImagesView(QWidget):
 
         # 底部信息栏（独立于滚动区域）
         bottom_widget = QWidget()
-        bottom_widget.setStyleSheet("background-color: #FDF9F2; border-top: 1px solid #E8E0D5;")
+        bottom_widget.setStyleSheet("background-color: #FBF7F0; border-top: 1px solid #E8DECB;")
         bottom = QHBoxLayout(bottom_widget)
         bottom.setContentsMargins(16, 6, 16, 6)
         info = QLabel(f"{work['author']} / {work['name']} · 共 {len(images)} 张")
-        info.setStyleSheet("color: #555555; font-size: 13px;")
+        info.setStyleSheet("color: #3D3830; font-size: 13px;")
         bottom.addWidget(info)
         bottom.addStretch()
         hint = QLabel("点击图片查看 · 返回请按 Esc 或顶栏 ← 返回")
-        hint.setStyleSheet("color: #999999; font-size: 11px;")
+        hint.setStyleSheet("color: #A89880; font-size: 11px;")
         bottom.addWidget(hint)
         bottom_widget.setFixedHeight(40)
         layout.addWidget(bottom_widget)

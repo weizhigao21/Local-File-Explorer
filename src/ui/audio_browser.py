@@ -36,6 +36,7 @@ from ui.audio_theme import (
     BG_MAIN,
     BG_SIDEBAR,
     BTN_QSS,
+    CARD_BORDER,
     MENU_QSS,
     TEXT_MUTED,
     TEXT_PRIMARY,
@@ -52,7 +53,8 @@ class PlaylistBrowser(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background-color: {BG_MAIN};")
+        # 整页底色必须带选择器：裸 background-color 会被 Qt 级联给纯 QWidget 子容器（坑 #11）
+        self.setStyleSheet(f"PlaylistBrowser {{ background-color: {BG_MAIN}; }}")
         # 浏览器只呈现根级歌单列表，子歌单由「歌单详情页」以子歌单卡片呈现。
         # 历史上这里还有一套"路径栈 + 面包屑"下钻机制，但从未接线（无任何
         # navigate_to 调用方），实为误导性死代码，已整体移除。
@@ -79,7 +81,9 @@ class PlaylistBrowser(QWidget):
 
         # ---- 导航栏 ----
         nav_bar = QFrame()
-        nav_bar.setStyleSheet(f"background-color: {BG_SIDEBAR}; border: none;")
+        nav_bar.setObjectName("audioNavBar")  # #audioNavBar 选择器防级联到内部 QLabel
+        nav_bar.setStyleSheet(
+            f"QFrame#audioNavBar {{ background-color: {BG_SIDEBAR}; border: none; }}")
         nav_layout = QHBoxLayout(nav_bar)
         nav_layout.setContentsMargins(8, 4, 8, 4)
         nav_layout.setSpacing(6)
@@ -108,8 +112,8 @@ class PlaylistBrowser(QWidget):
         self.search_box.setFixedWidth(180)
         self.search_box.setStyleSheet(f"""
             QLineEdit {{
-                background-color: #EDE6DA; color: {TEXT_PRIMARY};
-                border: 1px solid #D5CDC0; border-radius: 4px;
+                background-color: #EDE2CE; color: {TEXT_PRIMARY};
+                border: 1px solid #E0D5C2; border-radius: 8px;
                 padding: 4px 8px; font-size: 12px;
             }}
             QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
@@ -127,7 +131,7 @@ class PlaylistBrowser(QWidget):
                 border: none; border-radius: 13px;
                 font-size: 16px; font-weight: bold;
             }}
-            QPushButton:hover {{ background-color: #48B8BC; }}
+            QPushButton:hover {{ background-color: #D4886A; }}
         """)
         self.tag_selector_btn.setToolTip("添加筛选条件（标签 / CV / 社团）")
         self.tag_selector_btn.clicked.connect(self._open_filter_selector)
@@ -142,8 +146,8 @@ class PlaylistBrowser(QWidget):
         self.sort_selector.setFixedWidth(140)
         self.sort_selector.setStyleSheet(f"""
             QComboBox {{
-                background-color: #EDE6DA; color: {TEXT_PRIMARY};
-                border: 1px solid #D5CDC0; border-radius: 4px;
+                background-color: #EDE2CE; color: {TEXT_PRIMARY};
+                border: 1px solid #E0D5C2; border-radius: 8px;
                 padding: 4px 8px; font-size: 12px;
             }}
             QComboBox::drop-down {{ border: none; width: 20px; }}
@@ -169,8 +173,8 @@ class PlaylistBrowser(QWidget):
         self.view_selector.setFixedWidth(110)
         self.view_selector.setStyleSheet(f"""
             QComboBox {{
-                background-color: #EDE6DA; color: {TEXT_PRIMARY};
-                border: 1px solid #D5CDC0; border-radius: 4px;
+                background-color: #EDE2CE; color: {TEXT_PRIMARY};
+                border: 1px solid #E0D5C2; border-radius: 8px;
                 padding: 4px 8px;
             }}
             QComboBox::drop-down {{ border: none; width: 20px; }}
@@ -215,9 +219,9 @@ class PlaylistBrowser(QWidget):
                 border: none; outline: none;
             }}
             QListWidget::item {{
-                padding: 10px 16px; border-bottom: 1px solid #E8E0D5;
+                padding: 10px 16px; border-bottom: 1px solid #E8DECB;
             }}
-            QListWidget::item:hover {{ background-color: #E8E0D5; }}
+            QListWidget::item:hover {{ background-color: #E8DECB; }}
             QListWidget::item:selected {{
                 background-color: {ACCENT_TINT}; color: {TEXT_PRIMARY};
             }}
@@ -230,8 +234,11 @@ class PlaylistBrowser(QWidget):
 
         # ---- 分页栏 ----
         self.page_bar = page_bar = QFrame()
+        page_bar.setObjectName("audioPageBar")  # #audioPageBar 选择器防级联到内部 QLabel
         page_bar.setFixedHeight(40)
-        page_bar.setStyleSheet(f"background-color: {BG_SIDEBAR}; border: none;")
+        page_bar.setStyleSheet(
+            f"QFrame#audioPageBar {{ background-color: {BG_SIDEBAR};"
+            f" border-top: 1px solid {CARD_BORDER}; }}")
         page_layout = QGridLayout(page_bar)
         page_layout.setContentsMargins(8, 4, 8, 4)
         page_layout.setSpacing(6)

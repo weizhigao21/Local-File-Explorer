@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -88,7 +89,7 @@ class ModuleCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         base_border_style = (
-            "border: 1px solid #BBB;"
+            "border: 1px solid #C4B394;"
             if module["status"] == "coming_soon"
             else f"border: 1px solid {CARD_BORDER};"
         )
@@ -175,6 +176,9 @@ class ModuleCard(QFrame):
 class LauncherWindow(QMainWindow):
     """主入口启动器窗口"""
 
+    playerRequested = pyqtSignal()
+    systemRequested = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"本地资源管理器 v{config.APP_VERSION}")
@@ -236,6 +240,28 @@ class LauncherWindow(QMainWindow):
         )
         sub_row.addWidget(subtitle, 1)
 
+        player_btn = QPushButton("♪ 播放器")
+        player_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        player_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {CARD_BG}; color: {TEXT_PRIMARY};
+                border: 1px solid {CARD_BORDER}; border-radius: 4px;
+                padding: 4px 12px; font-size: 12px;
+            }}
+            QPushButton:hover {{ border: 1px solid {ACCENT}; background-color: {CARD_HOVER}; }}
+        """)
+        player_btn.clicked.connect(self.playerRequested.emit)
+        sub_row.addWidget(player_btn)
+        sub_row.addSpacing(8)
+
+        system_btn = QPushButton("系统集成")
+        system_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        system_btn.setToolTip("注册为 Windows 可选音乐播放器 / 打开默认应用设置")
+        system_btn.setStyleSheet(player_btn.styleSheet())
+        system_btn.clicked.connect(self.systemRequested.emit)
+        sub_row.addWidget(system_btn)
+        sub_row.addSpacing(12)
+
         scale_label = QLabel("UI缩放:")
         scale_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px; background: transparent; border: none;")
         sub_row.addWidget(scale_label)
@@ -245,8 +271,8 @@ class LauncherWindow(QMainWindow):
         self.scale_selector.setFixedWidth(80)
         self.scale_selector.setStyleSheet(f"""
             QComboBox {{
-                background-color: #EDE6DA; color: {TEXT_PRIMARY};
-                border: 1px solid #D5CDC0; border-radius: 4px;
+                background-color: #EDE2CE; color: {TEXT_PRIMARY};
+                border: 1px solid #E0D5C2; border-radius: 4px;
                 padding: 2px 6px; font-size: 11px;
             }}
             QComboBox::drop-down {{ border: none; width: 16px; }}
@@ -308,6 +334,10 @@ class LauncherWindow(QMainWindow):
                 self._open_module(m)
                 return
 
+    def open_module(self, module_id):
+        """外部入口（命令行 --module）按 id 打开模块"""
+        self._on_card_clicked(module_id)
+
     def _open_module(self, module):
         """打开指定模块"""
         mid = module["id"]
@@ -342,6 +372,7 @@ class LauncherWindow(QMainWindow):
                 self.show()
 
             win = AudioMainWindow(on_back_to_launcher=_on_audio_closed)
+            win.playerRequested.connect(self.playerRequested.emit)
             self._module_windows[mid] = win
             self.hide()
             win.show()

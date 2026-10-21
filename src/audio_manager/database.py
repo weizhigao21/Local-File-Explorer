@@ -85,6 +85,7 @@ def init_db():
                 path TEXT UNIQUE NOT NULL,
                 duration REAL DEFAULT 0,
                 track_number INTEGER DEFAULT 0,
+                subtitle_offset INTEGER DEFAULT 0,
                 FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_tracks_playlist ON tracks(playlist_id);
@@ -98,6 +99,8 @@ def init_db():
             "ALTER TABLE playlists ADD COLUMN parent_path TEXT DEFAULT ''",
             "CREATE INDEX IF NOT EXISTS idx_playlists_parent ON playlists(parent_path)",
             "ALTER TABLE playlists ADD COLUMN mtime REAL DEFAULT 0",
+            # 字幕相对音频的时间偏移（毫秒），按曲目保存
+            "ALTER TABLE tracks ADD COLUMN subtitle_offset INTEGER DEFAULT 0",
         ]:
             with suppress(sqlite3.OperationalError):
                 conn.execute(stmt)
@@ -469,3 +472,26 @@ def get_all_tags():
                     if t:
                         tag_set.add(t)
         return sorted(tag_set, key=lambda x: x.lower())
+
+
+def get_subtitle_offset(path):
+    """读取某曲目的字幕偏移（毫秒）；未设置返回 0"""
+    with _active_conn() as conn:
+        row = conn.execute(
+            "SELECT subtitle_offset FROM tracks WHERE path = ?", (path,)
+        ).fetchone()
+    if not row:
+        return 0
+    try:
+        return int(row["subtitle_offset"] or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_subtitle_offset(path, offset_ms):
+    """保存某曲目的字幕偏移（毫秒）；路径不在库中时静默忽略"""
+    with _active_conn() as conn:
+        conn.execute(
+            "UPDATE tracks SET subtitle_offset = ? WHERE path = ?",
+            (int(offset_ms), path),
+        )

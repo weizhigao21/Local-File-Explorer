@@ -112,6 +112,19 @@ class DurationProbeThread(QThread):
             traceback.print_exc()
 
 
+_dlsite_errors_cleared = False
+
+
+def _clear_dlsite_errors_once():
+    """每个进程只清一次历史失败记录（见 DlsiteWorker.run 的说明）"""
+    global _dlsite_errors_cleared
+    if _dlsite_errors_cleared:
+        return
+    _dlsite_errors_cleared = True
+    with suppress(Exception):
+        dlsite_db.clear_errors()
+
+
 class DlsiteWorker(QThread):
     """DLsite 作品信息后台抓取线程（多线程并行）
 
@@ -126,7 +139,7 @@ class DlsiteWorker(QThread):
     progress = pyqtSignal(int, int, str)  # (已处理数, 总数, 当前动作)
     log = pyqtSignal(str)                 # 一行日志
 
-    ERROR_RETRY_SECONDS = 24 * 3600  # 失败记录的最低重试间隔
+    ERROR_RETRY_SECONDS = 24 * 3600  # 同一进程内失败记录的最低重试间隔
     REQUEST_DELAY = 2.0              # 每个工作线程对 DLsite 的请求间隔（秒）
     WORKER_COUNT = 4                 # 并行抓取线程数（4线程×2s间隔 ≈ 2个/秒）
 
@@ -185,6 +198,11 @@ class DlsiteWorker(QThread):
             return
         try:
             dlsite_db.init_db()
+            # 网络通道探测结果也写进界面的抓取日志，方便判断是代理还是站点问题
+            dlsite.set_log_callback(self.log.emit)
+            # 每个进程首次抓取时清掉上次会话的失败记录：网络/代理通常已经恢复，
+            # 不能让 24h 冷却把重试永久挡住；同一进程内失败仍按 ERROR_RETRY_SECONDS 冷却。
+            _clear_dlsite_errors_once()
         except Exception as e:
             print(f"[DLsite] 数据库初始化失败: {e}")
             return
@@ -196,6 +214,7 @@ class DlsiteWorker(QThread):
             t.start()
         for t in threads:
             t.join()  # stop() 后各线程很快退出
+        dlsite.set_log_callback(None)
 
     def _fetch_loop(self):
         """工作线程主循环：共享队列取任务，逐个处理"""
@@ -232,8 +251,9 @@ class DlsiteWorker(QThread):
             html = dlsite.fetch(rj)
             did_network = True
             if not html:
-                dlsite_db.set_error(rj, "网络请求失败")
-                self.log.emit(f"{rj} 抓取失败：网络请求失败")
+                reason = dlsite.last_error() or "网络请求失败"
+                dlsite_db.set_error(rj, f"网络请求失败：{reason}")
+                self.log.emit(f"{rj} 抓取失败：{reason}")
             else:
                 d = dlsite.parse(html, rj)
                 if d.get("cover"):
