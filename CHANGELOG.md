@@ -4,6 +4,31 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.8.11] - 2026-10-22
+
+作品详情页背景不再惨白（用户反馈「背景太亮了，非常不舒服」）。
+
+### 修复
+- **三层底色漏画**，屏幕上大面积露出系统窗口灰 `#F0F0F0`（离屏是 `#EFEFEF`），
+  夹在米色顶栏和播放条之间：
+  1. `PlaylistDetailPage` / `PlaylistBrowser` 是 QWidget 子类，写 `background-color`
+     前必须先 `setAttribute(WA_StyledBackground, True)`，否则 QSS 底色根本不绘制；
+  2. 而且选择器只能用 objectName —— Python 子类的 `metaObject` 类名仍是 `QWidget`，
+     `PlaylistDetailPage { … }` 这种类名选择器匹配不上，改成 `#playlistDetail`；
+  3. `QScrollArea` 的 QSS 只画滚动区自身，**viewport 会用系统灰盖在上面** ——
+     详情页与歌单列表页的视口都要单独上色；
+  4. `QMainWindow` 的 QSS 管不到 `centralWidget`，central 自己也要上色（`#audioCentral`）。
+- **详情页底色压深一档**：新增令牌 `theme_base.BG_PAGE = #EFE8DA`（比窗底 `BG_MAIN`
+  深 4%）。标题 + 子歌单 + 曲目表这种长页面整片 `#F4EFE7` 在大屏上偏亮发飘，
+  压深后亮面卡片/表头浮起来，层次更清楚。
+
+### 测试
+- 新增 `tests/test_audio_page_background.py`（4 项）：详情页四角/中部抓图采样不得出现
+  系统灰、滚动区视口必须带底色、歌单列表页同判据、主窗口 centralWidget 属性 + 抓图。
+- 3 次注入式验证全部精准失败：视口不上色 → 抓图 + 视口断言同时失败；去掉页面
+  `WA_StyledBackground` → 属性断言失败；去掉 central 上色 → 主窗口守卫失败。
+  312 passed，ruff 干净。
+
 ## [v1.8.10] - 2026-10-22
 
 作品卡片名不再撑破卡片框架（用户截图反馈：DLsite 长标题换 6 行，把「N 首」

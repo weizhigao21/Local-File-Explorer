@@ -6,7 +6,7 @@ import os
 from contextlib import suppress
 from datetime import datetime
 
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
@@ -102,6 +102,12 @@ class AudioMainWindow(QMainWindow):
     # ==================== UI 构建 ====================
     def _setup_ui(self):
         central = QWidget()
+        # QMainWindow 的 QSS 底色管不到 centralWidget：central 是独立 QWidget，
+        # 不给它上色就会露出系统窗口灰（#F0F0F0），和米色顶栏/播放条拼成花板
+        # （用户反馈「作品里的背景太亮」，2026-10-22）。
+        central.setObjectName("audioCentral")
+        central.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        central.setStyleSheet(f"#audioCentral {{ background-color: {BG_MAIN}; }}")
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)

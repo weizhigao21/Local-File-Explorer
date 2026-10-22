@@ -12,6 +12,7 @@ from ui.theme_base import (
     ACCENT_HOVER,
     ACCENT_TINT,
     BG_MAIN,
+    BG_PAGE,
     BG_SIDEBAR,
     BORDER_COLOR,
     CARD_BG,
@@ -28,7 +29,7 @@ from ui.theme_base import (
 __all__ = [
     # 从 theme_base 转出的设计令牌
     "ACCENT", "ACCENT_HOVER", "ACCENT_TINT",
-    "BG_MAIN", "BG_SIDEBAR", "CARD_BG", "CARD_BORDER", "CARD_HOVER",
+    "BG_MAIN", "BG_PAGE", "BG_SIDEBAR", "CARD_BG", "CARD_BORDER", "CARD_HOVER",
     "INPUT_BG", "PLAYER_BG",
     "TEXT_PRIMARY", "TEXT_SECONDARY", "TEXT_MUTED", "TEXT_DIM", "BORDER_COLOR",
     # 本模块自有的样式与工具

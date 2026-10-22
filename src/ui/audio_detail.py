@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
 from audio_manager.dlsite_db import split_cv_names
 from ui.audio_theme import (
     ACCENT_TINT,
-    BG_MAIN,
+    BG_PAGE,
     BG_SIDEBAR,
     BTN_QSS,
     TEXT_DIM,
@@ -57,8 +57,14 @@ class PlaylistDetailPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 整页底色必须带选择器：裸 background-color 会被 Qt 级联给纯 QWidget 子容器（坑 #11）
-        self.setStyleSheet(f"PlaylistDetailPage {{ background-color: {BG_MAIN}; }}")
+        # 整页底色必须带选择器：裸 background-color 会被 Qt 级联给纯 QWidget 子容器（坑 #11）。
+        # 而且选择器只能用 objectName —— Python 子类的 metaObject 类名仍是 QWidget，
+        # 写类名选择器根本匹配不上（坑 #15）。
+        # 另外 QWidget 子类不开 WA_StyledBackground 时 QSS 底色不会绘制，
+        # 整页会露出系统窗口灰 #F0F0F0，与米色顶栏拼成一片惨白（用户反馈 2026-10-22）。
+        self.setObjectName("playlistDetail")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"#playlistDetail {{ background-color: {BG_PAGE}; }}")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -80,7 +86,11 @@ class PlaylistDetailPage(QWidget):
         info_scroll = QScrollArea()
         info_scroll.setWidgetResizable(True)
         info_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        info_scroll.setStyleSheet(f"QScrollArea {{ background-color: {BG_MAIN}; border: none; }}")
+        info_scroll.setStyleSheet(f"QScrollArea {{ background-color: {BG_PAGE}; border: none; }}")
+        # QScrollArea 的 QSS 只画滚动区自身，视口（viewport）会盖在上面用系统窗口灰
+        # #F0F0F0，整片内容看起来惨白（用户反馈「作品里的背景太亮」2026-10-22）。
+        # 视口必须单独上色，滚到没有子控件的地方才不会露灰。
+        info_scroll.viewport().setStyleSheet(f"background-color: {BG_PAGE};")
 
         info_content = QWidget()
         info_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
@@ -189,7 +199,7 @@ class PlaylistDetailPage(QWidget):
                              "border-bottom: 1px solid #E8DECB; padding: 4px 8px; font-size: 11px; }")
         self.track_list.setStyleSheet(f"""
             QTableWidget {{
-                background-color: {BG_MAIN}; color: #7A6E5C;
+                background-color: {BG_PAGE}; color: #7A6E5C;
                 border: 1px solid #EDE2CE; border-radius: 10px; outline: none;
                 gridline-color: #EFE9DE;
             }}

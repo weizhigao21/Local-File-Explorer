@@ -53,8 +53,13 @@ class PlaylistBrowser(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 整页底色必须带选择器：裸 background-color 会被 Qt 级联给纯 QWidget 子容器（坑 #11）
-        self.setStyleSheet(f"PlaylistBrowser {{ background-color: {BG_MAIN}; }}")
+        # 整页底色必须带选择器：裸 background-color 会被 Qt 级联给纯 QWidget 子容器（坑 #11）；
+        # 且只能是 objectName 选择器 —— Python 子类的 metaObject 类名是 QWidget，
+        # 类名选择器匹配不上。QWidget 子类还要开 WA_StyledBackground 才会绘制底色，
+        # 否则页面边缘露出系统窗口灰（坑 #15）。
+        self.setObjectName("playlistBrowser")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"#playlistBrowser {{ background-color: {BG_MAIN}; }}")
         # 浏览器只呈现根级歌单列表，子歌单由「歌单详情页」以子歌单卡片呈现。
         # 历史上这里还有一套"路径栈 + 面包屑"下钻机制，但从未接线（无任何
         # navigate_to 调用方），实为误导性死代码，已整体移除。
@@ -197,6 +202,9 @@ class PlaylistBrowser(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet(f"QScrollArea {{ background-color: {BG_MAIN}; border: none; }}")
+        # 视口要单独上色：QScrollArea 的 QSS 只画滚动区自身，viewport 会盖在上面
+        # 用系统窗口灰 #F0F0F0，翻页到空白处就露出一片惨白（坑 #15）。
+        scroll.viewport().setStyleSheet(f"background-color: {BG_MAIN};")
         container = QWidget()
         container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.flow = FlowLayout(container, margin=16, h_spacing=16, v_spacing=16)

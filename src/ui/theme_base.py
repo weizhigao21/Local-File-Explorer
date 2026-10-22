@@ -25,6 +25,9 @@ ACCENT_TINT = "#EBD9CE"                   # ≈ 15% accent over BG_MAIN
 
 # ---- 背景 ----
 BG_MAIN = "#F4EFE7"                       # 暖奶油窗底（= player P_BG）
+# 内容页底：比窗底再深一档。歌单详情这种「标题 + 子歌单 + 曲目表」的长页，
+# 整片 #F4EFE7 在大屏上偏亮发飘，压深 4% 后与亮面卡片/表头形成层次（v1.8.11）。
+BG_PAGE = "#EFE8DA"
 BG_SIDEBAR = "#FBF7F0"                    # 侧栏：米白（= player P_CARD）
 CARD_BG = "#FBF7F0"                       # 卡片面
 CARD_HOVER = "#FFFCF7"

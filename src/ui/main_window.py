@@ -155,6 +155,9 @@ class MainWindow(QMainWindow):
         self.works_scroll.setWidgetResizable(True)
         self.works_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.works_scroll.setStyleSheet("QScrollArea { border: none; background-color: #F4EFE7; }")
+        # 视口要单独上色：QScrollArea 的 QSS 画不到 viewport，作品少时下方整片
+        # 会露出系统窗口灰 #F0F0F0（音频模块详情页同源问题，v1.8.11）。
+        self.works_scroll.viewport().setStyleSheet("background-color: #F4EFE7;")
         self.works_scroll.verticalScrollBar().valueChanged.connect(self._on_works_scroll)
         self.works_scroll.viewport().installEventFilter(self)
 
