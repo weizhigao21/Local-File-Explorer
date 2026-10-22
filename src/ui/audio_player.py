@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QSlider,
     QStyle,
@@ -196,12 +197,14 @@ class AudioPlayerBar(QFrame):
     seekRequested = pyqtSignal(int)  # 秒
     volumeChanged = pyqtSignal(int)  # 0-100
     nowPlayingClicked = pyqtSignal()  # 点击当前曲目名（跳转所属歌单）
+    expandClicked = pyqtSignal()      # 「展开 ↗」：在大播放器里继续（字幕/队列/迷你）
 
     # ── 尺寸常量 ──
     # 胶囊圆角必须取半高：Qt 对超半高的 border-radius 退化成直角（见模块头注释）。
     _BAR_H = 64
     _TRANSPORT_H = 50   # 播放键 42 + 边距 3×2 + 描边 2 → 半高 25
     _VOL_H = 30         # 滑杆 20 + 边距 4×2 + 描边 2 → 半高 15
+    _EXPAND_H = 26      # 「展开 ↗」胶囊（半高 13）
     _TITLE_WIDTH = 200  # 曲名列定宽（超宽走省略号，防挤掉进度条）
 
     def __init__(self, parent=None):
@@ -330,6 +333,34 @@ class AudioPlayerBar(QFrame):
         self.volume_slider.valueChanged.connect(self.volumeChanged.emit)
         vol_layout.addWidget(self.volume_slider)
         player_layout.addWidget(self.vol_pill)
+
+        # ── 「展开 ↗」：把当前播放交给独立播放器窗口（字幕 / 队列 / 迷你）──
+        # 模块内这条播放条只负责"随手试听"；要沉浸看字幕、排队列时才进大播放器。
+        # 两条界面绑的是同一个 PlaybackController，切过去是接着播、不是重放。
+        # 高度 26 → 圆角必须取半高 13，否则整条退化成直角（坑见模块头）。
+        self.expand_btn = QPushButton("展开 ↗")
+        self.expand_btn.setObjectName("expandPlayerBtn")
+        self.expand_btn.setFixedHeight(self._EXPAND_H)
+        self.expand_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.expand_btn.setToolTip("在大播放器里打开（字幕 / 队列 / 迷你模式）")
+        self.expand_btn.setStyleSheet(f"""
+            QPushButton#expandPlayerBtn {{
+                background-color: {CARD_BG};
+                border: 1px solid {CARD_BORDER};
+                border-radius: {self._EXPAND_H // 2}px;
+                color: {TEXT_SECONDARY};
+                font-size: 11px;
+                padding: 0 10px;
+            }}
+            QPushButton#expandPlayerBtn:hover {{
+                background-color: {ACCENT_TINT};
+                border-color: {ACCENT};
+                color: {ACCENT};
+            }}
+        """)
+        self.expand_btn.clicked.connect(self.expandClicked.emit)
+        player_layout.addWidget(self.expand_btn)
 
     # ── 内部信号桥 ──
 

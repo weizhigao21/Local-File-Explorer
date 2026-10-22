@@ -176,6 +176,9 @@ class AudioMainWindow(QMainWindow):
         self.player_bar = AudioPlayerBar()
         self.player_bar.bind_controller(self.playback)
         self.player_bar.nowPlayingClicked.connect(self._on_now_playing_clicked)
+        # 「展开 ↗」= 进独立播放器窗口（字幕 / 队列 / 迷你）。播放条留在模块里做
+        # 随手试听，不抢焦点；想看沉浸界面时用户自己点，避免双击曲目就弹窗打断浏览。
+        self.player_bar.expandClicked.connect(self.playerRequested.emit)
         layout.addWidget(self.player_bar)
         self.player_bar.setVisible(False)
 
