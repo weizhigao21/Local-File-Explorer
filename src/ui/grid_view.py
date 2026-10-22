@@ -3,6 +3,7 @@ from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QFrame, QLabel, QVBoxLayout
 
 from ui.image_loader import get_cached, loader
+from ui.text_utils import truncate_title
 
 # 强调色（与 main_window 保持一致）
 ACCENT = "#B85C3E"
@@ -46,7 +47,11 @@ class WorkCard(QFrame):
         self.img_label.setText("...")
         layout.addWidget(self.img_label)
 
-        title = QLabel(work["name"])
+        # 长标题不截断会换 6 行（75px），把「作者 · N 张」挤出卡片、还压住封面。
+        # 与音频模块同一套规则：20 字 + 省略号，全名留在 tooltip。
+        title = QLabel(truncate_title(work["name"]))
+        title.setObjectName("workTitle")
+        title.setToolTip(work["name"])
         title.setWordWrap(True)
         title.setStyleSheet("color: #3D3830; font-size: 13px;")
         layout.addWidget(title)

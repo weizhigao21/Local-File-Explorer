@@ -37,6 +37,12 @@ from ui.audio_theme import (
     TEXT_MUTED,
     TEXT_PRIMARY,
 )
+from ui.text_utils import truncate_title
+
+# 卡片名区只有 160px 宽（PlaylistCard 固定 180x240），DLsite 那种
+# 「双语-RJ01588371-【W乳首責め×…】【CV秋山はるる】」动辄 80–90 字的名字会换成
+# 六七行，把子标题整行顶出卡片框架（用户截图反馈 2026-10-22）。
+# 截断规则在 ui/text_utils.py（写真模块共用同一份），完整名称留在 tooltip 里。
 
 
 class CircularProgress(QWidget):
@@ -199,9 +205,10 @@ class PlaylistCard(QFrame):
         self.cover_label.setText("...")
         layout.addWidget(self.cover_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # 歌单名（自动换行）
+        # 歌单名（截到 20 字后换行，最多两行，不会溢出卡片）
         name = pl["name"]
-        name_label = QLabel(name)
+        name_label = QLabel(truncate_title(name))
+        name_label.setObjectName("cardName")   # 守卫按名字取标签，别和封面抢
         name_label.setToolTip(name)
         name_label.setWordWrap(True)
         name_label.setFixedWidth(160)
