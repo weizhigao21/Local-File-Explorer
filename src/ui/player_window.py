@@ -10,7 +10,14 @@
 import os
 from contextlib import suppress
 
-from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QPropertyAnimation,
+    QRect,
+    QSize,
+    Qt,
+    QTimer,
+)
 from PyQt6.QtGui import (
     QColor,
     QFont,
@@ -21,6 +28,7 @@ from PyQt6.QtGui import (
     QShortcut,
 )
 from PyQt6.QtWidgets import (
+    QWIDGETSIZE_MAX,
     QAbstractItemView,
     QApplication,
     QFileDialog,
@@ -85,6 +93,17 @@ from ui.subtitle_view import SubtitleView
 _SPEEDS = (0.75, 1.0, 1.25, 1.5, 2.0)
 _COVER_SIZE = 208
 _MINI_COVER = 44
+_WIN_MIN_W = 540        # 常规态窗口最小宽
+_WIN_MIN_H = 140        # 常规态窗口最小高（迷你态退出时恢复）
+_HEADER_H = 52          # 常规态顶栏高
+_HEADER_MARGINS = (18, 0, 18, 0)
+_HEADER_SPACING = 12
+# 迷你态顶栏收薄：52px 里只放 25px 胶囊太空旷（用户反馈 2026-10-22）
+_MINI_HEADER_H = 42
+_MINI_HEADER_MARGINS = (14, 0, 14, 0)
+_MINI_HEADER_SPACING = 8
+_MINI_W = 560           # 迷你态窗口默认宽（横向仍可拉）
+_MINI_TRANSITION_MS = 180   # 迷你↔完整态的窗口几何过渡时长
 _QUEUE_NAME_MAX = 128   # 队列曲名省略宽（240 卡内刨去序号/尾标/边距）
 _MINI_TITLE_MAX = 124   # 迷你态曲名省略宽（130px 信息列）
 
@@ -132,6 +151,8 @@ class PlayerWindow(QMainWindow):
         self._mini = False
         self._positioned = False
         self._normal_size = QSize(900, 620)
+        self._geo_anim = None           # 迷你↔完整态的几何过渡动画
+        self._animate = True            # 测试可关掉，直接切尺寸
         self._track = None
         self._subtitle_path = None
         self._current_sec = 0
@@ -139,7 +160,7 @@ class PlayerWindow(QMainWindow):
         self._queue = []
 
         self.setWindowTitle("播放器")
-        self.setMinimumSize(540, 140)
+        self.setMinimumSize(_WIN_MIN_W, _WIN_MIN_H)
         self.setAcceptDrops(True)
         self.resize(self._normal_size)
         # 独立模式是普通顶层窗口（无 parent、非 Qt.Tool）：Windows 会给它一个任务栏按钮，
@@ -178,11 +199,11 @@ class PlayerWindow(QMainWindow):
 
         # ---- 顶栏：品牌标 + 产品名 + 面包屑 + 图标胶囊 ----
         self.header = QFrame()
-        self.header.setFixedHeight(52)
+        self.header.setFixedHeight(_HEADER_H)
         self.header.setStyleSheet(header_qss())
         header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(18, 0, 18, 0)
-        header_layout.setSpacing(12)
+        header_layout.setContentsMargins(*_HEADER_MARGINS)
+        header_layout.setSpacing(_HEADER_SPACING)
 
         brand_mark = QLabel("▶")
         brand_mark.setFixedSize(22, 22)
@@ -205,6 +226,10 @@ class PlayerWindow(QMainWindow):
         self.header_title.setTextFormat(Qt.TextFormat.RichText)
         self.header_title.setStyleSheet("font-size: 12px;"
                                         " background: transparent; border: none;")
+        # 空闲态占位：否则顶栏中段一大片空白（用户反馈「空旷」）。
+        # 开始播放后由 _on_track_changed 换成「艺术家 / 曲名」。
+        self.header_title.setText(
+            f'<span style="color:{P_TEXT_FAINT}">拖入音频或从资源库选择播放</span>')
         header_layout.addWidget(self.header_title)
         header_layout.addStretch()
 
@@ -509,30 +534,38 @@ class PlayerWindow(QMainWindow):
         # ---- 迷你态：44px 封面缩略 + 曲名时间 + 传输胶囊 + 圆角细进度 ----
         self.mini_body = QWidget()
         self.mini_body.setVisible(False)
+        # 纵向 Fixed：过渡动画期间窗口还很高，默认 Preferred 会把迷你行拉到整窗
+        # 居中（内容看起来先往下滑一下）。Fixed 让迷你行紧贴顶栏、窗口自己往下收。
+        self.mini_body.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                     QSizePolicy.Policy.Fixed)
         mini_layout = QHBoxLayout(self.mini_body)
-        mini_layout.setContentsMargins(16, 12, 16, 12)
-        mini_layout.setSpacing(14)
+        # 紧凑排版：组间 8px、四周 12/10（反馈 2026-10-22，原 14/16 太空）
+        mini_layout.setContentsMargins(12, 10, 12, 10)
+        mini_layout.setSpacing(8)
 
         self.mini_cover = QLabel()
         self.mini_cover.setFixedSize(_MINI_COVER, _MINI_COVER)
         self.mini_cover.setStyleSheet(mini_cover_qss())
-        mini_layout.addWidget(self.mini_cover)
+        mini_layout.addWidget(self.mini_cover, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        # 曲名列：只有曲名（时间已移到进度条两端），整列与进度块同中线
         mini_info = QWidget()
         mini_info.setFixedWidth(130)
         info_layout = QVBoxLayout(mini_info)
         info_layout.setContentsMargins(0, 0, 0, 0)
-        info_layout.setSpacing(2)
+        info_layout.setSpacing(0)
         self.mini_title = QLabel("未播放")
+        # 单行曲名没有竖排拉伸余量：sizeHint 13px < 12px 字体墨盒 14px，
+        # 必须用显式度量顶住，否则字形头脚被裁（守卫 test_no_visible_label_clips_glyphs）
+        mini_title_font = QFont()
+        mini_title_font.setPixelSize(12)
+        mini_title_font.setWeight(QFont.Weight.Medium)
+        self.mini_title.setFont(mini_title_font)
+        self.mini_title.setMinimumHeight(QFontMetrics(mini_title_font).height())
         self.mini_title.setStyleSheet(f"color: {P_TEXT}; font-size: 12px; font-weight: 500;"
                                       " background: transparent; border: none;")
-        self.mini_time = QLabel("00:00 / 00:00")
-        self.mini_time.setStyleSheet(
-            f"color: {P_TEXT_DIM}; font-size: 10px;"
-            " font-family: Consolas, 'Segoe UI'; background: transparent; border: none;")
         info_layout.addWidget(self.mini_title)
-        info_layout.addWidget(self.mini_time)
-        mini_layout.addWidget(mini_info)
+        mini_layout.addWidget(mini_info, 0, Qt.AlignmentFlag.AlignVCenter)
 
         mini_transport = QFrame()
         # 迷你胶囊 50px 高 → 半高 25（超半高的圆角 Qt 会退化成直角）。
@@ -567,7 +600,13 @@ class PlayerWindow(QMainWindow):
         self.mini_next.setToolTip("下一首（→）")
         self.mini_next.clicked.connect(self.playback.next)
         mini_transport_layout.addWidget(self.mini_next)
-        mini_layout.addWidget(mini_transport)
+        mini_layout.addWidget(mini_transport, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # 进度块：进度条在上，时间在下（当前进度贴头、总时长贴尾）
+        seek_block = QWidget()
+        seek_block_layout = QVBoxLayout(seek_block)
+        seek_block_layout.setContentsMargins(0, 0, 0, 0)
+        seek_block_layout.setSpacing(1)
 
         self.mini_seek = SeekSlider(Qt.Orientation.Horizontal)
         self.mini_seek.setFixedHeight(16)
@@ -575,9 +614,32 @@ class PlayerWindow(QMainWindow):
         self.mini_seek.setStyleSheet(mini_slider_qss())
         self.mini_seek.clickedSeek.connect(self._seek_to_second)
         self.mini_seek.seekPreview.connect(self._on_seek_preview)
-        mini_layout.addWidget(self.mini_seek, 1)
+        seek_block_layout.addWidget(self.mini_seek)
+
+        time_row = QHBoxLayout()
+        time_row.setContentsMargins(0, 0, 0, 0)
+        time_row.setSpacing(0)
+        time_qss = (f"color: {P_TEXT_DIM}; font-size: 10px;"
+                    " font-family: Consolas, 'Segoe UI';"
+                    " background: transparent; border: none;")
+        self.mini_time_cur = QLabel("00:00")
+        self.mini_time_cur.setStyleSheet(time_qss)
+        self.mini_time_total = QLabel("00:00")
+        self.mini_time_total.setStyleSheet(time_qss)
+        time_row.addWidget(self.mini_time_cur)
+        time_row.addStretch()
+        time_row.addWidget(self.mini_time_total)
+        seek_block_layout.addLayout(time_row)
+
+        mini_layout.addWidget(seek_block, 1, Qt.AlignmentFlag.AlignVCenter)
 
         root.addWidget(self.mini_body)
+
+        # 尾部弹性占位：过渡动画期间窗口还很高，而迷你态各子项都是不扩张的，
+        # QBoxLayout 会把多出来的高度平摊到每一项（顶栏被推到半空、内容漂在中间）。
+        # 占位项吃掉全部多余空间，顶栏钉在顶上、窗口自己往下收。常规态 body 的
+        # stretch=1 会优先拿走全部空间，这里拿 0，不影响完整布局。
+        root.addStretch(0)
 
     def _soft_shadow(self, widget, blur=12, dy=2, alpha=18):
         """卡片的柔阴影（设计稿 box-shadow: 0 2px 12px rgba(120,90,60,0.05~0.06)）"""
@@ -594,8 +656,9 @@ class PlayerWindow(QMainWindow):
         button.setIconSize(QSize(13, 13))
 
     def _refresh_mini_time(self):
-        self.mini_time.setText(
-            f"{format_time(self._current_sec)} / {format_time(self._total_sec)}")
+        # 时间贴在进度条两端：当前进度在头、总时长在尾
+        self.mini_time_cur.setText(format_time(self._current_sec))
+        self.mini_time_total.setText(format_time(self._total_sec))
 
     def _set_crumb(self, artist, title):
         """顶栏面包屑：艺术家（深咖加粗）/ 曲名（灰）"""
@@ -914,23 +977,94 @@ class PlayerWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, checked)
         self.show()
 
+    def _clamp_to_screen(self, rect):
+        """把窗口矩形夹回屏幕可用区：缩小再放大不会把窗口挤出屏幕外"""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return rect
+        area = screen.availableGeometry()
+        out = QRect(rect)
+        if out.right() > area.right():
+            out.moveRight(area.right())
+        if out.bottom() > area.bottom():
+            out.moveBottom(area.bottom())
+        if out.left() < area.left():
+            out.moveLeft(area.left())
+        if out.top() < area.top():
+            out.moveTop(area.top())
+        return out
+
+    def _animate_geometry(self, target, on_finished=None):
+        """把窗口几何平滑过渡到 target（迷你↔完整态切换用）
+
+        直接 resize 是一次硬跳变，看起来生硬（用户反馈 2026-10-22）；改成一边
+        移动一边缩放，缓出曲线开头快、落点稳，视觉上像窗口「收」进顶栏。
+        `_animate=False`（测试）时退化为立刻 setGeometry，保证断言同步生效。
+        """
+        if self._geo_anim is not None:
+            with suppress(RuntimeError):
+                self._geo_anim.stop()
+            self._geo_anim = None
+        if not self._animate or not self.isVisible() or self.geometry() == target:
+            self.setGeometry(target)
+            if on_finished is not None:
+                on_finished()
+            return
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(_MINI_TRANSITION_MS)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        if on_finished is not None:
+            anim.finished.connect(on_finished)
+        # 必须留引用：动画对象被 GC 掉，窗口就停在起点不动了
+        self._geo_anim = anim
+        anim.start()
+
     def _toggle_mini(self, checked):
         self._mini = checked
-        if checked:
-            self._normal_size = self.size()
         # 迷你态只留：顶栏 + 封面缩略/曲名时间/传输/进度（网页版 C 的迷你态）
         # controls 容器要整体隐藏（含上下边距 32px），否则 mini_body 被压扁，
         # 42px 播放键溢出 32px 高的传输胶囊，光晕被齐底截成「方形光斑」。
         # 子控件仍单独显隐：isHidden() 不跟随父容器，测试与恢复都依赖显式状态。
+        cur = self.geometry()
+        if checked:
+            self._normal_size = self.size()
         self.body.setVisible(not checked)
         self.controls.setVisible(not checked)
         self.seek_card.setVisible(not checked)
         self.secondary_row.setVisible(not checked)
         self.mini_body.setVisible(checked)
         if checked:
-            self.resize(560, 140)
+            # 迷你态顶栏收薄：52px 高只放 25px 胶囊，中间大片留白显得空旷。
+            # 压到 42px + 边距 14 / 间距 8，整条顶栏变紧凑的工具条。
+            self.header.setFixedHeight(_MINI_HEADER_H)
+            self.header.layout().setContentsMargins(*_MINI_HEADER_MARGINS)
+            self.header.layout().setSpacing(_MINI_HEADER_SPACING)
+            # 迷你态锁定纵向尺寸：窗高 = 顶栏 + 迷你行自然高度。不锁的话窗口能
+            # 被上下拖成一大条空白（内容散落一整屏，用户反馈 2026-10-22）。
+            # 横向仍可自由拉伸；高度固定后胶囊半高圆角比例也不会被破坏。
+            mini_h = self.header.minimumHeight() + self.mini_body.sizeHint().height()
+            # 尺寸约束分两段下：过渡期间只抬下限（下限是下界，620→mini_h 一路都
+            # 合法），落点后再锁上限。若一开始就锁 max，窗口会瞬间压扁、动画失效。
+            self.setMinimumHeight(mini_h)
+            self.setMaximumHeight(QWIDGETSIZE_MAX)
+            # 左上角为锚点：进出两趟的 x/y 不变，来回切不会横向漂移
+            target = self._clamp_to_screen(
+                QRect(cur.x(), cur.y(), min(cur.width(), _MINI_W), mini_h))
+            self._animate_geometry(target, lambda: self.setMaximumHeight(mini_h))
         else:
-            self.resize(self._normal_size)
+            # 退出迷你态：顶栏恢复常规尺寸 + 撤销固定高度
+            self.header.setFixedHeight(_HEADER_H)
+            self.header.layout().setContentsMargins(*_HEADER_MARGINS)
+            self.header.layout().setSpacing(_HEADER_SPACING)
+            # 下限暂时留在迷你高度（112px）：立即还原 _WIN_MIN_H 会把动画起点
+            # 当场顶到 140px，开头一顿；等过渡结束再还回常规最小高度。
+            self.setMaximumHeight(QWIDGETSIZE_MAX)
+            target = self._clamp_to_screen(
+                QRect(cur.x(), cur.y(), self._normal_size.width(),
+                      self._normal_size.height()))
+            self._animate_geometry(target, lambda: self.setMinimumHeight(_WIN_MIN_H))
 
     # ==================== 窗口生命周期 ====================
     def set_compact(self, compact=True):
@@ -941,15 +1075,13 @@ class PlayerWindow(QMainWindow):
             self._toggle_mini(bool(compact))
 
     def _center_on_screen(self):
+        """打开时把窗口摆在主屏可用区域正中（迷你态也居中，用户反馈 2026-10-22）"""
         screen = QApplication.primaryScreen()
         if screen is None:
             return
         area = screen.availableGeometry()
         frame = self.frameGeometry()
         frame.moveCenter(area.center())
-        # 迷你窗落在屏幕下方三分之一处，像常规播放器的浮动小窗
-        if self._mini:
-            frame.moveBottom(area.bottom() - 60)
         self.move(frame.topLeft())
 
     def show_player(self):

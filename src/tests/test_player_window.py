@@ -7,7 +7,7 @@ import uuid
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QWIDGETSIZE_MAX, QApplication  # noqa: E402
 
 from app_instance import SingleInstance  # noqa: E402
 from audio_manager import database as adb  # noqa: E402
@@ -34,6 +34,9 @@ def temp_audio_db(tmp_path, monkeypatch):
 def window(qapp, temp_audio_db):
     playback = PlaybackController()
     win = PlayerWindow(playback=playback)
+    # 几何过渡默认关掉：动画要跑满 180ms 才落点，断言会读到中间帧。
+    # 动画本身由 test_mini_toggle_animates_geometry 单独打开验证。
+    win._animate = False
     yield win, playback
     win.shutdown()
 
@@ -215,6 +218,135 @@ def test_pills_render_as_true_capsules(window, qapp):
         f"迷你胶囊被布局拉伸: {mini.height()} != {mini.sizeHint().height()}"
         "（拉高后半高圆角不再是胶囊）"
     )
+
+
+def test_window_opens_centered_even_in_mini(window, qapp):
+    """打开位置必须在主屏正中：迷你态也不能被压到屏幕下方
+
+    此前迷你窗有 moveBottom(area.bottom() - 60) 的特殊处理，每次都落在屏幕
+    下半边（用户反馈 2026-10-22）。现在两种形态统一居中。
+    """
+    win, _playback = window
+    win.show()
+    qapp.processEvents()
+    win.mini_btn.setChecked(True)
+    qapp.processEvents()
+
+    win.hide()
+    win._positioned = False  # 模拟首次打开
+    win.show_player()
+    qapp.processEvents()
+
+    area = QApplication.primaryScreen().availableGeometry()
+    frame = win.frameGeometry()
+    assert abs(frame.center().x() - area.center().x()) <= 2, (
+        f"窗口未水平居中: {frame.center().x()} vs {area.center().x()}")
+    assert abs(frame.center().y() - area.center().y()) <= 2, (
+        f"窗口未垂直居中: {frame.center().y()} vs {area.center().y()}"
+        "（迷你态曾被压到屏幕下方）")
+    win.close()
+    qapp.processEvents()
+
+
+def test_mini_window_locks_vertical_size(window, qapp):
+    """迷你态必须锁死纵向尺寸：不能被上下拉成一条大空白
+
+    只 resize 不锁最大高度时，用户能把迷你窗拖到任意高度，迷你行内容被 vbox
+    撑开、散落一整屏（用户截图反馈 2026-10-22）。横向仍应保持可拉伸。
+    """
+    win, _playback = window
+    win.show()
+    qapp.processEvents()
+    win.mini_btn.setChecked(True)
+    qapp.processEvents()
+
+    from ui import player_window as pwm
+
+    # 顶栏收薄：52px 里只放 25px 胶囊太空旷（用户反馈）
+    assert win.header.height() == pwm._MINI_HEADER_H, (
+        f"迷你态顶栏应收薄到 {pwm._MINI_HEADER_H}px，实际 {win.header.height()}")
+
+    assert win.minimumHeight() == win.maximumHeight() == win.height(), (
+        f"迷你态纵向未锁定: min={win.minimumHeight()} max={win.maximumHeight()}"
+        f" 实际={win.height()}"
+    )
+    h = win.height()
+    win.resize(560, h + 240)
+    qapp.processEvents()
+    assert win.height() == h, "迷你态仍可纵向拉伸（应被锁定）"
+
+    win.resize(720, h)
+    qapp.processEvents()
+    assert win.width() == 720, "迷你态横向应保持可拉伸"
+
+    # 锁定高度必须容得下迷你行自然高度，否则内容被压扁
+    assert win.mini_body.height() >= win.mini_body.sizeHint().height(), "迷你行被压扁"
+
+    win.mini_btn.setChecked(False)
+    qapp.processEvents()
+    assert win.maximumHeight() == QWIDGETSIZE_MAX, "退出迷你态应恢复可拉伸窗口"
+    assert win.header.height() == pwm._HEADER_H, "退出迷你态顶栏应恢复常规高度"
+    win.close()
+    qapp.processEvents()
+
+
+def test_mini_toggle_animates_geometry(window, qapp):
+    """迷你↔完整态切换要走几何过渡动画，不能硬跳变（用户反馈「有点生硬」）
+
+    点击迷你按钮时窗口应一边移动一边缩放：QPropertyAnimation(geometry)、
+    时长 _MINI_TRANSITION_MS、缓出曲线，落点尺寸与锁定高度一致；
+    过渡结束后才落 min/max 约束（否则窗口会被瞬间压扁/顶高，动画白做）。
+    """
+    from PyQt6.QtCore import QEasingCurve
+    from PyQt6.QtTest import QTest
+
+    from ui import player_window as pwm
+
+    win, _playback = window
+    win.resize(900, 620)
+    win.show()
+    qapp.processEvents()
+    win._animate = True
+
+    win.mini_btn.setChecked(True)
+    anim = win._geo_anim
+    assert anim is not None, "切换迷你态应启动几何过渡动画"
+    assert anim.duration() == pwm._MINI_TRANSITION_MS, (
+        f"过渡时长应为 {pwm._MINI_TRANSITION_MS}ms，实际 {anim.duration()}ms")
+    assert anim.easingCurve().type() == QEasingCurve.Type.OutCubic, "过渡应为缓出曲线"
+    assert anim.endValue().width() == pwm._MINI_W, "动画落点宽度与迷你态默认宽不一致"
+    assert anim.endValue().height() == win.minimumHeight(), (
+        "动画落点高度必须等于即将锁定的迷你高度，否则落点会被夹变形")
+    # 约束（尤其 max）必须等过渡结束再落：toggle 返回的这一刻高度得还停在起点，
+    # 否则 setMaximumHeight 当场把窗口压成迷你高度 —— 纵向瞬跳，只剩横向在动。
+    assert win.height() == 620, (
+        f"切换瞬间高度应仍为 620（纵向不得瞬跳），实际 {win.height()}")
+
+    # 抓一张中间帧：必须已经缩小，但还没到落点（证明是过渡不是瞬跳）
+    QTest.qWait(60)
+    assert pwm._MINI_W < win.width() < 900, (
+        f"过渡中间帧宽度应介于 {pwm._MINI_W} 与 900 之间，实际 {win.width()}")
+
+    QTest.qWait(pwm._MINI_TRANSITION_MS)
+    qapp.processEvents()
+    assert win.width() == pwm._MINI_W, "过渡结束宽度应落在迷你态默认宽"
+    assert win.minimumHeight() == win.maximumHeight() == win.height(), (
+        f"过渡结束后应锁死高度: min={win.minimumHeight()} max={win.maximumHeight()}"
+        f" 实际={win.height()}")
+
+    win.mini_btn.setChecked(False)
+    # 同理：退出时最小高度不能立刻还回 _WIN_MIN_H，否则动画起点被顶到 140，开头一顿
+    assert win.minimumHeight() < pwm._WIN_MIN_H, (
+        f"退出瞬间最小高度应仍是迷你高度，实际 {win.minimumHeight()}")
+    QTest.qWait(pwm._MINI_TRANSITION_MS + 120)
+    qapp.processEvents()
+    assert (win.width(), win.height()) == (900, 620), (
+        f"退出迷你态应还原进迷你前的尺寸，实际 {win.width()}x{win.height()}")
+    assert win.maximumHeight() == QWIDGETSIZE_MAX, "退出后应恢复可拉伸"
+    assert win.minimumHeight() == pwm._WIN_MIN_H, (
+        f"退出后最小高度应还回 {pwm._WIN_MIN_H}，实际 {win.minimumHeight()}")
+    win.close()
+    qapp.processEvents()
 
 
 def test_queue_row_elides_long_titles(window, tmp_path):

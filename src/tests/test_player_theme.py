@@ -184,10 +184,11 @@ def test_glow_button_actually_paints(qapp):
 
 
 def test_mini_layout_has_cover_thumbnail():
-    """迷你态带 44px 封面缩略 + 曲名时间（网页版共同修正清单）"""
+    """迷你态带 44px 封面缩略 + 曲名 + 进度条两端时间（网页版共同修正清单）"""
     source = _source("ui/player_window.py")
     for needle in ("self.mini_body", "self.mini_cover", "self.mini_title",
-                   "self.mini_time", "self.mini_seek", "_MINI_COVER = 44"):
+                   "self.mini_time_cur", "self.mini_time_total",
+                   "self.mini_seek", "_MINI_COVER = 44"):
         assert needle in source, f"迷你态缺少 {needle}"
 
 
