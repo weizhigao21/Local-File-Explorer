@@ -4,6 +4,29 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.8.12] - 2026-10-22
+
+作品网格相邻两行不再压在一起（用户截图反馈「两个作品太压在一起了吧」）。
+
+### 修复
+- **`FlowLayout` 用错排布尺寸导致行重叠**：它当年直接用 `widget.sizeHint()` 算行距，
+  而 `PlaylistCard` 是 `setFixedSize(180, 240)` —— 卡片内容布局的 sizeHint 只有
+  **196**（名字两行时 202）。布局按 196 累加行距、控件却被 min/max 顶回 240，
+  结果**第二行整体上移 21~28px，封面压住上一行的「N 首」**。
+  卡片越靠下叠得越明显，视觉上就是「两排糊在一起」。
+- 新增 `_item_box()`：排布尺寸 = `sizeHint().expandedTo(minimumSize())`，
+  再用 `maximumSize()` 夹住 —— 这样 `setFixedSize` 的控件一定按固定尺寸占位，
+  没设固定尺寸的控件（详情页标签胶囊等）行为完全不变。
+- 写真模块作品卡（`WorkCard` 220×280，sizeHint 257）同病同治；横向间隙也一并
+  从 14/18px 的错位回到准确的 16px。
+
+### 测试
+- 新增 `tests/test_flow_layout.py`（4 项）：音频卡两行不重叠且卡片高度仍为 240、
+  写真卡同理、`_item_box` 必须返回固定尺寸、无固定尺寸的控件仍按 sizeHint 排。
+- 2 次注入式验证：回退成裸 `sizeHint` → 两个重叠守卫精准失败；把
+  `minimumSize()` 换成 `minimumSizeHint()` → 3 项失败并打印出 `196 != 240`。
+  316 passed，ruff 干净。
+
 ## [v1.8.11] - 2026-10-22
 
 作品详情页背景不再惨白（用户反馈「背景太亮了，非常不舒服」）。

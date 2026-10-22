@@ -2,6 +2,27 @@ from PyQt6.QtCore import QPoint, QRect, QSize, Qt
 from PyQt6.QtWidgets import QLayout
 
 
+def _item_box(item) -> QSize:
+    """控件在布局里真正占用的尺寸（不是裸 sizeHint）。
+
+    只信 `sizeHint()` 会漏掉 `setFixedSize()`：PlaylistCard 固定 180x240，
+    但它内容布局的 sizeHint 只有 196 高（名字两行时 202）。布局按 196 累加
+    行距，控件却被 min/max 顶回 240 —— **相邻两行重叠 20~28px**，看起来像
+    「两个作品压在一起」（用户截图反馈 2026-10-22）。
+
+    ⇒ 先用 minimumSize 兜底（setFixedSize 会把 min 也设成固定值），再用
+    maximumSize 夹住，保证排布尺寸 == 控件最终尺寸。
+    """
+    widget = item.widget()
+    if widget is None:
+        return item.sizeHint()
+    box = widget.sizeHint().expandedTo(widget.minimumSize())
+    maximum = widget.maximumSize()
+    if maximum.isValid():
+        box = box.boundedTo(maximum)
+    return box
+
+
 class FlowLayout(QLayout):
     """自动换行布局：根据容器宽度自动计算每行可容纳的控件数"""
 
@@ -92,7 +113,9 @@ class FlowLayout(QLayout):
             widget = item.widget()
             if widget is not None and widget.isHidden():
                 continue  # 搜索过滤隐藏的卡片不占位
-            hint = widget.sizeHint() if widget else item.sizeHint()
+            # 必须按真实占位尺寸排（见 _item_box 注释）：裸 sizeHint 会让
+            # setFixedSize 的卡片行距算小、两行叠在一起
+            hint = _item_box(item)
             space_x = self._h_space
             space_y = self._v_space
             next_x = x + hint.width() + space_x
