@@ -28,8 +28,16 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 }
-# locale=zh-cn 是关键：切换 DLsite 为简体中文（分类等字段返回中文）
+# locale=zh-cn 是唯一可靠的简体中文开关（实测：URL 上的 ?locale=zh_CN 无效，
+# 不带这个 cookie 一律返回日文页）。每个请求都必须带上，包括网络探测那一次。
 COOKIES = {"locale": "zh-cn", "adultchecked": "1"}
+
+# ── 页面语言判定 ──
+# DLsite 在 <html lang> 上直接标明语言：中文 zh-CN、日文 ja-JP。
+# 表头词只作兜底（个别页面没有 lang 属性），中/日两套表头互斥，不会同时出现。
+_HTML_LANG_RE = re.compile(r"<html[^>]*\blang\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_ZH_HEADERS = ("发售日", "声优", "分类", "插画", "文件形式", "文件容量", "年龄指定")
+_JA_HEADERS = ("販売日", "声優", "ジャンル", "イラスト", "ファイル形式", "ファイル容量", "年齢指定")
 
 DEFAULT_TIMEOUT = 30
 PROBE_TIMEOUT = 8
@@ -58,6 +66,30 @@ def _log(message):
     if _log_callback is not None:
         with suppress(Exception):
             _log_callback(message)
+
+def page_locale(html: str) -> str:
+    """判断详情页语言：返回 "zh"（简体中文）/ "ja"（日文）/ ""（无法判断）
+
+    优先看 <html lang>，缺失时用信息表表头词兜底。"" 表示页面既没有 lang
+    也没有可识别的表头——调用方按"放行"处理，避免把正常页面误判成日文。
+    """
+    if not html:
+        return ""
+    m = _HTML_LANG_RE.search(html)
+    if m:
+        lang = m.group(1).strip().lower()
+        if lang.startswith("zh"):
+            return "zh"
+        if lang.startswith("ja"):
+            return "ja"
+    zh = sum(html.count(word) for word in _ZH_HEADERS)
+    ja = sum(html.count(word) for word in _JA_HEADERS)
+    if zh > ja:
+        return "zh"
+    if ja > zh:
+        return "ja"
+    return ""
+
 
 # RJ 码（兼容新旧位数，如 RJ01196889 / RJ283610）
 # 注意：不能用 \b 词边界——Python 的 \w 把 CJK 汉字当单词字符，
@@ -188,20 +220,28 @@ def _probe(url):
 
     调用方必须已持有 _proxy_lock：4 个抓取线程只允许一个去探测，
     其余线程等待结果，避免同时打 4 轮请求。
+
+    注意 cookies=True：探测拿到的 HTML 会被 fetch() 直接当结果返回，
+    早年这里传 False，导致每次重新探测后的第一条作品都落成日文页。
     """
     global _proxy_resolved, _proxy_probed_at, _proxy_error
     candidates, _mode = proxy_candidates()
     errors = []
     for proxy, label in candidates:
         try:
-            response = _request(url, proxy, PROBE_TIMEOUT, cookies=False)
+            response = _request(url, proxy, PROBE_TIMEOUT)
             if response.status_code == 200 and len(response.content) > 1000:
                 _proxy_resolved = proxy
                 _proxy_probed_at = time.time()
                 _proxy_error = ""
                 where = proxy or "直连"
                 _log(f"网络通道就绪（{label}: {where}）")
-                return proxy, response.text
+                html = response.text
+                if page_locale(html) == "ja":
+                    # 探测这一页没切成中文就丢掉，交给 fetch 正常重试
+                    _log("探测响应为日文页，交由抓取流程重试")
+                    return proxy, None
+                return proxy, html
             errors.append(f"{label}: HTTP {response.status_code}")
         except Exception as e:
             errors.append(f"{label}: {_short_error(e)}")
@@ -236,6 +276,11 @@ def reset_network_state():
 def fetch(rj: str, delay: float = RETRY_DELAY, retries: int = MAX_RETRIES) -> str | None:
     """抓取详情页 HTML；失败返回 None，原因见 last_error()
 
+    只接受简体中文页：locale=zh-cn cookie 偶尔会失效（拿到日文页），
+    这种页面照样是 HTTP 200，若直接入库就会留下日文标题/日文分类。
+    因此每个响应都过一遍 page_locale()，判定为日文就当作失败重试，
+    重试用尽仍为日文则返回 None，由调用方写入错误、24h 后自动重试。
+
     代理只探测一次并缓存；探测成功后直接复用。若请求过程中失败，清空缓存，
     下一次抓取重新探测（例如用户刚刚打开/切换了代理）。
     """
@@ -254,9 +299,13 @@ def fetch(rj: str, delay: float = RETRY_DELAY, retries: int = MAX_RETRIES) -> st
         try:
             response = _request(url, proxy, DEFAULT_TIMEOUT)
             if response.status_code == 200:
-                _last_error = ""
-                return response.text
-            failure = f"HTTP {response.status_code}"
+                if page_locale(response.text) == "ja":
+                    failure = "DLsite 返回日文页面（简体中文语言设置未生效）"
+                else:
+                    _last_error = ""
+                    return response.text
+            else:
+                failure = f"HTTP {response.status_code}"
         except Exception as e:
             failure = _short_error(e)
         if attempt + 1 < retries:

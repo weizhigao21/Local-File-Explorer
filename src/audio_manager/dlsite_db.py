@@ -123,6 +123,18 @@ def clear_errors():
     return cur.rowcount
 
 
+def delete_work(rj: str) -> bool:
+    """删除单条作品信息（返回是否真的删掉了记录）
+
+    用于"这条抓错了要重抓"的场景：删掉后该 RJ 不再出现在
+    get_cached_rjs() 里，下次扫描会重新抓取。封面文件保留
+    （同一作品的封面与语言无关，复用即可，省一次下载）。
+    """
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM works WHERE rj_code = ?", (rj,))
+    return cur.rowcount > 0
+
+
 def get_work(rj: str) -> dict | None:
     """查询单条作品记录（无则 None）；genres/description 反序列化为列表"""
     with get_conn() as conn:
