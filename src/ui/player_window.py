@@ -800,6 +800,9 @@ class PlayerWindow(QMainWindow):
             self.progress.setValue(seconds)
         if not self.mini_seek.is_seeking:
             self.mini_seek.setValue(seconds)
+        # 字幕也跟着播放位置信号走：100ms 轮询只是补充，后端回调更可靠。
+        # set_position 内部对「同一句」直接返回，两条路同时推进不会重复渲染。
+        self.subtitle_view.set_position(position_ms)
 
     def _on_duration_changed(self, duration_ms):
         seconds = int(duration_ms) // 1000
@@ -815,6 +818,9 @@ class PlayerWindow(QMainWindow):
         for button in (self.play_btn, self.mini_play):
             button.set_kind(kind)
             button.setToolTip(tip)
+        # 自愈：开始播放时确认字幕时钟在跑（窗口若曾隐藏过，hideEvent 停过它）
+        if playing and self.isVisible() and not self._subtitle_timer.isActive():
+            self._subtitle_timer.start()
 
     def _on_volume_changed(self, volume):
         if self.volume_slider.value() == volume:
@@ -891,8 +897,15 @@ class PlayerWindow(QMainWindow):
         self.status_label.setText(f"播放错误：{message}"[:80])
 
     def _tick_subtitle(self):
-        if self.isVisible() and self.playback.current_track:
-            self.subtitle_view.set_position(self.playback.position())
+        """100ms 轮询推进字幕高亮
+
+        不判断 `isVisible()`：窗口隐藏时 hideEvent 已经把定时器停掉了，
+        多这层判断反而会在「刚 show、尚未映射」的间隙漏更新，
+        表现为字幕永远停在第一句（用户反馈 2026-10-24）。
+        """
+        if not self.playback.current_track:
+            return
+        self.subtitle_view.set_position(self.playback.position())
 
     # ==================== 字幕 / 封面 ====================
     def _load_subtitle(self, track):

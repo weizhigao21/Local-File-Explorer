@@ -45,7 +45,13 @@ class SubtitleTrack:
 
     def __init__(self, path="", cues=None, encoding="utf-8", fmt=""):
         self.path = path
-        self.cues = list(cues or [])
+        cues = list(cues or [])
+        # 二分定位要求 start_ms 有序。各解析器都会自己排序，但 SubtitleTrack 也
+        # 可能被直接构造（测试、外部数据），乱序会让 index_at 返回错误下标，
+        # 表现为高亮卡在某一句不动。这里兜一层，正常已序的列表不会触发拷贝。
+        if any(cues[i].start_ms > cues[i + 1].start_ms for i in range(len(cues) - 1)):
+            cues.sort(key=lambda cue: cue.start_ms)
+        self.cues = cues
         self.encoding = encoding
         self.format = fmt
         self._starts = [cue.start_ms for cue in self.cues]

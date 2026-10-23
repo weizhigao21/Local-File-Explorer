@@ -81,7 +81,9 @@ def test_track_change_loads_subtitle_and_title(window, tmp_path):
     win._on_track_changed(track)
 
     assert win.title_label.text() == "第 03 轨"
-    assert "03.srt" in win.subtitle_view.file_label.text()
+    # 卡片标题现在只放「格式 · 句数」（短到不会被省略），文件名在 tooltip
+    assert "2 句" in win.subtitle_view.file_label.text()
+    assert "03.srt" in win.subtitle_view.file_label.toolTip()
     assert win.subtitle_view.list.count() == 2
     assert win.meta_label.text().startswith("MP3")
 

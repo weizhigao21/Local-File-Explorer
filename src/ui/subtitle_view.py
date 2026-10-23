@@ -230,17 +230,19 @@ class SubtitleView(QFrame):
         self.list.clear()
 
         if not self._track:
-            self._set_file_text("未找到字幕（支持 SRT / LRC / VTT / ASS）")
-            self.file_label.setToolTip("")
+            self._set_file_text("未找到字幕")
+            self.file_label.setToolTip("支持 SRT / LRC / VTT / ASS，与音频同目录同名前缀")
             self.offset_label.setVisible(False)
             self._show_placeholder("未找到字幕文件")
             return
 
         self.offset_label.setVisible(True)
-        self._set_file_text(
-            f"{self._track.name} · {self._track.format} · {self._track.encoding}"
+        # 只放「格式 · 句数」：一行够短不会被省略，而句数正是判断"字幕没滚"
+        # 到底是没加载（0/1 句）、还是加载了没跟进的关键信息；文件名进 tooltip。
+        self._set_file_text(f"{self._track.format} · {len(self._track.cues)} 句")
+        self.file_label.setToolTip(
+            f"{self._track.path}\n编码：{self._track.encoding}\n共 {len(self._track.cues)} 句"
         )
-        self.file_label.setToolTip(self._track.path)
         for cue in self._track.cues:
             item = QListWidgetItem(cue.text)
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
