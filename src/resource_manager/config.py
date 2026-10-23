@@ -39,7 +39,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.8.13"
+APP_VERSION = "1.8.14"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -58,6 +58,10 @@ _DEFAULT_USER_CONFIG = {
     "AUDIO_VIEW_MODE": 0,        # 音频视图: 0=网格, 1=列表
     # DLsite 抓取代理：空 = 自动（系统代理 → 直连 → 环境变量）
     "DL_PROXY": "",
+    # 播放器行为
+    "PLAYER_AUTO_QUEUE": False,      # 打开播放器时自动展开播放队列
+    "PLAYER_ON_TOP": False,          # 播放器窗口始终置顶
+    "PLAYER_EMBEDDED_COVER": True,   # 文件夹没封面时，用音频文件自带的内嵌封面
 }
 
 # 当前生效的用户配置（运行时可改，通过 save_user_config() 写盘）
@@ -136,3 +140,6 @@ UI_SCALE = _user_config["UI_SCALE"]
 AUDIO_SORT_INDEX = _user_config["AUDIO_SORT_INDEX"]
 AUDIO_VIEW_MODE = _user_config["AUDIO_VIEW_MODE"]
 DL_PROXY = _user_config["DL_PROXY"]
+PLAYER_AUTO_QUEUE = _user_config["PLAYER_AUTO_QUEUE"]
+PLAYER_ON_TOP = _user_config["PLAYER_ON_TOP"]
+PLAYER_EMBEDDED_COVER = _user_config["PLAYER_EMBEDDED_COVER"]

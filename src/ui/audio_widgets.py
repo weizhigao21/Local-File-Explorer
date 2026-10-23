@@ -9,6 +9,7 @@ from PyQt6.QtCore import QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImageReader, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -368,7 +369,8 @@ class AudioSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("音频设置")
-        self.setFixedSize(540, 560)
+        # 高度要放得下「音频目录 + DLsite 代理 + 播放器」三组，目录列表占剩余空间
+        self.setFixedSize(540, 748)
         self.setStyleSheet(f"AudioSettingsDialog {{ background-color: #FBF7F0; color: {TEXT_PRIMARY}; }}")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -443,6 +445,34 @@ class AudioSettingsDialog(QDialog):
         retry_row.addWidget(retry_btn)
         retry_row.addStretch()
         layout.addLayout(retry_row)
+
+        # ---- 播放器 ----
+        player_label = QLabel("播放器")
+        player_label.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 13px; font-weight: bold;"
+        )
+        layout.addWidget(player_label)
+
+        self.auto_queue_check = QCheckBox("打开播放器时自动展开播放队列")
+        self.on_top_check = QCheckBox("播放器窗口始终置顶")
+        self.embedded_cover_check = QCheckBox("文件夹没有封面时，用音频文件自带的封面")
+        for box in (self.auto_queue_check, self.on_top_check, self.embedded_cover_check):
+            box.setStyleSheet(f"QCheckBox {{ color: {TEXT_PRIMARY}; font-size: 12px; }}")
+            layout.addWidget(box)
+        self.auto_queue_check.setChecked(bool(getattr(config, "PLAYER_AUTO_QUEUE", False)))
+        self.on_top_check.setChecked(bool(getattr(config, "PLAYER_ON_TOP", False)))
+        self.embedded_cover_check.setChecked(
+            bool(getattr(config, "PLAYER_EMBEDDED_COVER", True))
+        )
+
+        player_hint = QLabel(
+            "队列展开状态、置顶状态在下次打开播放器时按这里的设置生效。"
+            "封面优先用作品封面（歌单里的封面，或文件夹里的 封面/cover/folder/front 等），"
+            "都没有时才用音频内部嵌的图——能否读出来取决于文件格式与解码后端，读不出会留空。"
+        )
+        player_hint.setWordWrap(True)
+        player_hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        layout.addWidget(player_hint)
 
         btn_layout = QHBoxLayout()
         delete_btn = QPushButton("删除当前数据库")
@@ -522,6 +552,9 @@ class AudioSettingsDialog(QDialog):
         old_proxy = getattr(config, "DL_PROXY", "")
         config.set_user_config("AUDIO_ROOTS", paths)
         config.set_user_config("DL_PROXY", proxy)
+        config.set_user_config("PLAYER_AUTO_QUEUE", self.auto_queue_check.isChecked())
+        config.set_user_config("PLAYER_ON_TOP", self.on_top_check.isChecked())
+        config.set_user_config("PLAYER_EMBEDDED_COVER", self.embedded_cover_check.isChecked())
         config.save_user_config()
 
         message = "设置已保存。音频目录修改在重启程序后生效。"

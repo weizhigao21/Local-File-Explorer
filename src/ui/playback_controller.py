@@ -16,6 +16,7 @@ import random
 from contextlib import suppress
 
 from PyQt6.QtCore import QObject, QUrl, pyqtSignal
+from PyQt6.QtGui import QImage
 from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaMetaData, QMediaPlayer
 
 # 循环模式（字符串便于直接存配置，不依赖枚举序列化）
@@ -252,7 +253,7 @@ class PlaybackController(QObject):
         return rate
 
     def meta_data(self):
-        """当前媒体标签（标题/艺术家/专辑）；后端未解析出时返回空串字段"""
+        """当前媒体标签（标题/艺术家/专辑/内嵌封面）；未解析出时返回空值"""
         if self._player is None:
             return {}
         data = self._player.metaData()
@@ -263,11 +264,27 @@ class PlaybackController(QObject):
             except (TypeError, RuntimeError):
                 return ""
 
+        def read_image(key):
+            """内嵌封面（ID3 APIC / FLAC PICTURE / MP4 covr）→ QImage
+
+            Qt 后端解码出来的就是 QImage；取不到时返回 None，不能让它抛出去
+            （某些后端在无封面时返回无效 QVariant）。
+            """
+            try:
+                value = data.value(key)
+            except (TypeError, RuntimeError):
+                return None
+            if isinstance(value, QImage):
+                return None if value.isNull() else value
+            return None
+
         return {
             "title": read(QMediaMetaData.Key.Title),
             "artist": read(QMediaMetaData.Key.ContributingArtist)
             or read(QMediaMetaData.Key.Author),
             "album": read(QMediaMetaData.Key.AlbumTitle),
+            # 播放器窗口拿它兜底：文件夹里没有封面图时用音频自带的封面
+            "cover": read_image(QMediaMetaData.Key.CoverArtImage),
         }
 
     def stop(self):

@@ -48,8 +48,10 @@ from PyQt6.QtWidgets import (
 )
 
 from audio_manager import database as db
+from audio_manager import dlsite
 from audio_manager import subtitles as subs
 from audio_manager.scanner import AUDIO_EXTENSIONS
+from resource_manager import config
 from resource_manager.utils import natural_key
 from ui.audio_player import SeekSlider
 from ui.audio_theme import format_time
@@ -93,6 +95,12 @@ from ui.subtitle_view import SubtitleView
 _SPEEDS = (0.75, 1.0, 1.25, 1.5, 2.0)
 _COVER_SIZE = 208
 _MINI_COVER = 44
+
+# 文件夹里常见的封面文件名（与扩展名组合，小写比对）与图片扩展名。
+# 下载站/自抓的封面命名五花八门：封面、cover、folder、front、albumart……
+# 只认这些"明确就是封面"的名字，不扫任意图片——作品文件夹里常混着详情页截图。
+_COVER_STEMS = ("封面", "cover", "folder", "front", "albumart", "album", "poster")
+_COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 _WIN_MIN_W = 540        # 常规态窗口最小宽
 _WIN_MIN_H = 140        # 常规态窗口最小高（迷你态退出时恢复）
 _HEADER_H = 52          # 常规态顶栏高
@@ -113,6 +121,45 @@ def _elide(text, width, pixel_size=12):
     font = QFont()
     font.setPixelSize(pixel_size)
     return QFontMetrics(font).elidedText(text or "", Qt.TextElideMode.ElideRight, width)
+
+
+def folder_cover(folder):
+    """在文件夹里按常见命名找封面：封面.jpg / cover.png / folder.jpg …
+
+    返回找到的绝对路径，没有返回 None。只认固定几个"明确是封面"的名字，
+    不取同目录的任意图片——作品文件夹里往往混着详情页截图和特典图，
+    随便挑一张当封面比"无封面"更糟。
+    """
+    if not folder or not os.path.isdir(folder):
+        return None
+    try:
+        names = {name.lower(): name for name in os.listdir(folder)}
+    except OSError:
+        return None
+    for stem in _COVER_STEMS:
+        for ext in _COVER_EXTS:
+            hit = names.get(stem + ext)
+            if hit:
+                path = os.path.join(folder, hit)
+                if os.path.isfile(path):
+                    return path
+    return None
+
+
+def dlsite_cover(track):
+    """按 RJ 码找已下载的 DLsite 封面（data/dlsite_covers/<RJ>.jpg）
+
+    查找顺序：曲目标题 → 所在文件夹名 → 完整路径。
+    单文件播放（无 playlist_id）时歌单层封面拿不到，这是唯一的兜底。
+    """
+    path = track.get("path") or ""
+    folder = os.path.dirname(path)
+    for text in (track.get("title") or "", os.path.basename(folder), path):
+        rj = dlsite.extract_rj_code(text)
+        if rj:
+            cover = os.path.join(config.DLSITE_COVER_DIR, f"{rj}.jpg")
+            return cover if os.path.isfile(cover) else None
+    return None
 
 _BTN_QSS = pill_btn_qss()
 _SKIP_BTN_QSS = skip_btn_qss()
@@ -154,6 +201,7 @@ class PlayerWindow(QMainWindow):
         self._geo_anim = None           # 迷你↔完整态的几何过渡动画
         self._animate = True            # 测试可关掉，直接切尺寸
         self._track = None
+        self._cover_from_file = False   # 当前封面是否来自磁盘文件（否则等内嵌封面）
         self._subtitle_path = None
         self._current_sec = 0
         self._total_sec = 0
@@ -180,6 +228,9 @@ class PlayerWindow(QMainWindow):
         self._build_ui()
         self._bind_controller()
         self._setup_shortcuts()
+        # 构造期就把置顶标志定下来（独立播放模式不经过 show_player）。
+        # 只改窗口标志，不主动 show —— 何时显示由调用方决定。
+        self._sync_on_top_flag()
 
         # 字幕跟随用独立时钟：媒体后端的 positionChanged 间隔不稳定，
         # 100ms 轮询能让高亮滚动更顺滑，也避免依赖信号频率。
@@ -734,6 +785,11 @@ class PlayerWindow(QMainWindow):
             self.mini_title.setToolTip(data["title"])
             self.setWindowTitle(f"{data['title']} · 播放器")
         self._set_crumb(artist, self.title_label.text())
+        # 文件夹里没找到封面时，用音频文件自带的封面（ID3 APIC / FLAC PICTURE）
+        if not self._cover_from_file and getattr(config, "PLAYER_EMBEDDED_COVER", True):
+            image = (data or {}).get("cover")
+            if image is not None and not image.isNull():
+                self._apply_cover_image(image)
 
     def _on_position_changed(self, position_ms):
         seconds = int(position_ms) // 1000
@@ -863,6 +919,12 @@ class PlayerWindow(QMainWindow):
             print(f"[字幕] 保存偏移失败: {e}")
 
     def _load_cover(self, track):
+        """按优先级装载封面：歌单封面 → 文件夹常见命名 → DLsite 缓存
+
+        三条都没有时先清空；**内嵌封面要等媒体元数据解析完才到**，由
+        `_on_metadata` 补上（`self._cover_from_file` 标记当前是否已是文件封面，
+        避免内嵌封面反过来盖掉更清晰的作品封面）。
+        """
         path = track.get("path") or ""
         cover = None
         playlist_id = track.get("playlist_id")
@@ -873,18 +935,16 @@ class PlayerWindow(QMainWindow):
             except Exception:
                 cover = None
         if not (cover and os.path.isfile(cover)):
-            folder = os.path.dirname(path)
-            for name in ("封面.jpg", "封面.png", "cover.jpg", "cover.png"):
-                candidate = os.path.join(folder, name)
-                if os.path.isfile(candidate):
-                    cover = candidate
-                    break
-        if not (cover and os.path.isfile(cover)):
-            self.cover_label.setPixmap(QPixmap())
-            self.cover_label.setText("无封面")
-            self.mini_cover.setPixmap(QPixmap())
-            return
+            cover = folder_cover(os.path.dirname(path))
+        if not cover:
+            cover = dlsite_cover(track)
 
+        self._cover_from_file = bool(cover) and self._apply_cover_file(cover)
+        if not self._cover_from_file:
+            self._clear_cover()
+
+    def _apply_cover_file(self, cover):
+        """从图片文件读封面；读不出来返回 False（调用方继续向下兜底）"""
         reader = QImageReader(cover)
         reader.setAutoTransform(True)
         size = reader.size()
@@ -893,10 +953,12 @@ class PlayerWindow(QMainWindow):
                                              Qt.AspectRatioMode.KeepAspectRatio))
         image = reader.read()
         if image.isNull():
-            self.cover_label.setPixmap(QPixmap())
-            self.cover_label.setText("无封面")
-            self.mini_cover.setPixmap(QPixmap())
-            return
+            return False
+        self._apply_cover_image(image)
+        return True
+
+    def _apply_cover_image(self, image):
+        """把 QImage 填进主封面与迷你封面（两处同源，保证切换迷你态不闪）"""
         pixmap = QPixmap.fromImage(image).scaled(
             _COVER_SIZE, _COVER_SIZE,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -910,6 +972,11 @@ class PlayerWindow(QMainWindow):
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         ))
+
+    def _clear_cover(self):
+        self.cover_label.setPixmap(QPixmap())
+        self.cover_label.setText("无封面")
+        self.mini_cover.setPixmap(QPixmap())
 
     def _update_meta_label(self):
         path = (self._track or {}).get("path") or ""
@@ -1085,6 +1152,7 @@ class PlayerWindow(QMainWindow):
         self.move(frame.topLeft())
 
     def show_player(self):
+        self._apply_player_prefs()
         if self.isMinimized():
             self.showNormal()
         self.show()
@@ -1093,6 +1161,27 @@ class PlayerWindow(QMainWindow):
             self._center_on_screen()
         self.raise_()
         self.activateWindow()
+
+    def _sync_on_top_flag(self):
+        """按设置同步置顶状态（不主动显示窗口，构造期也能安全调用）"""
+        want = bool(getattr(config, "PLAYER_ON_TOP", False))
+        if want != bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint):
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, want)
+        # 按钮状态跟着走，但别触发 _toggle_on_top（那里面会 show 窗口）
+        self.on_top_btn.blockSignals(True)
+        self.on_top_btn.setChecked(want)
+        self.on_top_btn.blockSignals(False)
+        self._set_pill_icon(self.on_top_btn, "pin")
+
+    def _apply_player_prefs(self):
+        """打开播放器前套用「音频设置 → 播放器」里的选项
+
+        允许用户手动收起队列/取消置顶：这里只在设置要求开启时展开，
+        不会因为设置为关就强行把用户已展开的队列收回去。
+        """
+        self._sync_on_top_flag()
+        if getattr(config, "PLAYER_AUTO_QUEUE", False) and not self.queue_btn.isChecked():
+            self.queue_btn.setChecked(True)
 
     def showEvent(self, event):
         super().showEvent(event)
