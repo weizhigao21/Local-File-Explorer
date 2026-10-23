@@ -4,6 +4,42 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.8.15] - 2026-10-24
+
+修「改代码时桌面图标疯狂闪烁」——**跑测试时在向真实 Windows 外壳广播关联变更**。
+
+### 修复
+- **根因**：`notify_shell()` 用 ctypes 调
+  `SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH)`，这是一次**全局广播** ——
+  shell 收到后重新解析所有文件类型的图标、重建图标缓存，桌面上每个图标重绘一遍。
+  而 `tests/test_system_integration.py` 的 `_no_shell_touch` 安全网只拦了
+  `subprocess`（ie4uinit / taskkill），**ctypes 这一路完全没拦**。该文件有 6 个
+  用例会走 `register / unregister / apply_format_icons / remove_format_icons`，
+  每个末尾都调 `notify_shell()` —— 一轮 pytest 广播 6~8 次，用户看到的就是桌面
+  连续闪断。
+- 三道防线：
+  1. `notify_shell()` 在 pytest 下（`PYTEST_CURRENT_TEST`）直接空转；
+  2. `tests/conftest.py` 新增全局 autouse fixture，任何测试里 `notify_shell`
+     都是 stub；
+  3. `_no_shell_touch` 补上 ctypes 这一路。
+- `test_register_and_unregister_round_trip` 不再用真实 `.mp3/.flac`：
+  `register()` 会给每种扩展名写 `OpenWithProgids`，等于替用户改「打开方式」候选，
+  现在改用临时扩展名并在结束时清掉空键。
+
+### 取证方法（下次复现照此办理）
+- explorer 进程启动时间未变、Application 日志无 1002 事件 → **不是 explorer 重启**
+- `%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db` 的 mtime 在跑测试的
+  时间点被刷新（本机 `iconcache_32.db` 停在 00:59:34，正是那次 pytest）→ 确实收到
+  了关联变更广播
+- 修复后跑同一批测试（357 passed），`iconcache_32/48.db` 时间戳一分未动
+
+### 测试
+- 新增 `tests/test_shell_notifications.py`（7 项）：pytest 下空转、非测试环境确实
+  广播 `0x08000000`、conftest stub 生效、stub 返回 True 不影响调用方、
+  `_no_shell_touch` 必须含 notify_shell、生产代码保护不得被删。
+- 2 次注入式验证：拆 conftest 拦截 → 5 项失败；拆生产保护 → 4 项失败。
+- **357 passed**，ruff 干净。
+
 ## [v1.8.14] - 2026-10-24
 
 播放器窗口自动找封面；「音频设置」新增播放器选项。

@@ -584,8 +584,18 @@ RESTART_COOLDOWN_SEC = 120
 
 
 def notify_shell():
-    """通知资源管理器：关联变了（等价于改了默认应用后系统自动做的刷新）"""
+    """通知资源管理器：关联变了（等价于改了默认应用后系统自动做的刷新）
+
+    SHCNE_ASSOCCHANGED 是**全局广播**：shell 会重新读取所有文件类型的图标并
+    重建图标缓存，桌面上每个图标都跟着重绘一遍。手动点一次没问题，
+    但一秒内来几次，用户看到的就是"桌面图标疯狂闪烁"。
+
+    所以测试环境（pytest 会设 PYTEST_CURRENT_TEST）直接空转：测试要验证的是
+    注册表结构，没有任何理由去打扰真实外壳。测试侧另有一层 stub 兜着。
+    """
     if not is_supported():
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST"):
         return False
     try:
         import ctypes

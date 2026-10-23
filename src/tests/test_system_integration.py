@@ -1,6 +1,7 @@
 """Windows 注册表集成：ProgID 结构、图标挂载与还原（临时项，测完清理）"""
 import os
 import sys
+from contextlib import suppress
 
 import pytest
 
@@ -9,7 +10,13 @@ import system_integration as si
 
 @pytest.fixture(autouse=True)
 def _no_shell_touch(monkeypatch):
-    """测试绝不碰真实外壳：所有子进程调用（ie4uinit / taskkill / explorer）一律拦掉"""
+    """测试绝不碰真实外壳：subprocess（ie4uinit / taskkill / explorer）与
+    ctypes 广播（notify_shell → SHCNE_ASSOCCHANGED）一律拦掉。
+
+    早年只拦了 subprocess，漏掉 ctypes 这一路：`notify_shell()` 会向 shell
+    广播"所有关联都变了"，资源管理器随即重建全部图标缓存，桌面上每个图标
+    重绘一遍。一轮测试下来要广播 6~8 次，用户看到的就是桌面疯狂闪烁（2026-10-24）。
+    """
     started = []
 
     def _fake_run(cmd, *args, **kwargs):
@@ -20,8 +27,17 @@ def _no_shell_touch(monkeypatch):
         started.append(["Popen", *cmd] if isinstance(cmd, (list, tuple)) else ["Popen", cmd])
         return
 
+    def _fake_notify():
+        started.append(["notify_shell"])
+        return True
+
+    # 保留原始实现引用（conftest 的全局 stub 已挂了一份，这里透传），
+    # 守卫测试才能验证"生产路径确实会广播 / pytest 下自动空转"。
+    _fake_notify._original = getattr(si.notify_shell, "_original", si.notify_shell)  # noqa: SLF001
+
     monkeypatch.setattr(si.subprocess, "run", _fake_run)
     monkeypatch.setattr(si.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(si, "notify_shell", _fake_notify)
     return started
 
 
@@ -61,9 +77,17 @@ def test_icon_paths_are_per_extension():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows 注册表专有")
-def test_register_and_unregister_round_trip():
-    """真实写入 HKCU 的临时项：验证结构正确，最后完整清理"""
+def test_register_and_unregister_round_trip(monkeypatch):
+    """真实写入 HKCU 的临时项：验证结构正确，最后完整清理
+
+    扩展名用临时值：`register()` 会为**每种**扩展名写 `OpenWithProgids`，
+    用真实的 .mp3/.flac 等于替用户改「打开方式」候选列表，测完虽然会删，
+    但期间资源管理器已经感知到关联变化、重载了一次图标。
+    """
     import winreg
+
+    fake_exts = [".lrmprobe1", ".lrmprobe2"]
+    monkeypatch.setattr(si, "supported_extensions", lambda: list(fake_exts))
 
     app_name = "本地资源管理器-测试"
     prog_id = "LocalResourceManager.Audio.Pytest"
@@ -79,25 +103,30 @@ def test_register_and_unregister_round_trip():
         with winreg.OpenKey(root, si.REGISTERED_APPS_PATH) as key:
             cap_path, _ = winreg.QueryValueEx(key, app_name)
         with winreg.OpenKey(root, cap_path + r"\FileAssociations") as key:
-            assert winreg.QueryValueEx(key, ".mp3")[0] == f"{prog_id}.mp3"
-            assert winreg.QueryValueEx(key, ".flac")[0] == f"{prog_id}.flac"
+            assert winreg.QueryValueEx(key, ".lrmprobe1")[0] == f"{prog_id}.lrmprobe1"
+            assert winreg.QueryValueEx(key, ".lrmprobe2")[0] == f"{prog_id}.lrmprobe2"
 
         # ProgID 打开命令
         with winreg.OpenKey(
-            root, si.CLASSES_PATH + "\\" + f"{prog_id}.mp3" + r"\shell\open\command"
+            root, si.CLASSES_PATH + "\\" + f"{prog_id}.lrmprobe1" + r"\shell\open\command"
         ) as key:
             command = winreg.QueryValue(key, "")
         assert "--play" in command and "%1" in command
 
         # 扩展名的「打开方式」候选
         with winreg.OpenKey(
-            root, si.CLASSES_PATH + r"\.mp3\OpenWithProgids"
+            root, si.CLASSES_PATH + r"\.lrmprobe1\OpenWithProgids"
         ) as key:
-            winreg.QueryValueEx(key, f"{prog_id}.mp3")
+            winreg.QueryValueEx(key, f"{prog_id}.lrmprobe1")
     finally:
         ok, _message = si.unregister(app_name, prog_id)
         assert ok
         assert not si.is_registered(app_name, prog_id)
+        # unregister 只删值不删空键，临时扩展名的空壳顺手清掉
+        for ext in fake_exts:
+            for sub in (rf"\.{ext}\OpenWithProgids", rf"\.{ext}"):
+                with suppress(OSError):
+                    winreg.DeleteKey(root, si.CLASSES_PATH + sub)
 
     with pytest.raises(FileNotFoundError):
         winreg.OpenKey(root, si.CLASSES_PATH + "\\" + prog_id)
