@@ -17,6 +17,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
+from PyQt6.QtCore import QPropertyAnimation  # noqa: E402
+from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from audio_manager import database as adb  # noqa: E402
@@ -126,7 +128,8 @@ def test_position_advances_row_and_scroll(window):
         seen = []
         for ms in (0, 12000, 30000, 60000, 90000):
             sv.set_position(ms)
-            QApplication.processEvents()
+            # 滚动是 220ms 的滑行动画，要等它落点再读值（否则读到起点）
+            QTest.qWait(320)
             seen.append((sv._current_row, bar.value()))
 
         rows = [row for row, _ in seen]
@@ -164,6 +167,108 @@ def test_file_label_says_not_found(window):
     win, _pc = window
     win.subtitle_view.set_track(None, 0)
     assert "未找到字幕" in win.subtitle_view.file_label.text()
+
+
+# ==================== 滚动条：滑行 + 完整 QSS ====================
+#
+# 用户反馈（2026-10-31）：「播放器窗口的字幕滚动时，旁边的滚动条上下抖动」。
+# 复现结论：滚动值本身单调稳定（换句才动一次，每次前进），抖的是**绘制**——
+# QListWidget 挂在 QSS 下时滚动条改由 QStyleSheetStyle 画，缺 add-page /
+# sub-page 规则的话滑块移动后旧位置的槽不重绘，残影留在原地被看成「抖」；
+# 再加上换句是 scrollToItem 瞬跳，一格格硬跳更强化了这个观感。
+# 现在：① 滚动条每个子控件都给了不透明色；② 自动跟随改成 220ms 滑行。
+
+
+def test_scrollbar_qss_covers_every_sub_control():
+    """滚动条 QSS 必须把每个子控件写全，且不能用透明/rgba 背景"""
+    import pathlib
+
+    source = pathlib.Path(__file__).with_name("..").resolve()
+    body = (source / "ui" / "subtitle_view.py").read_text(encoding="utf-8")
+    qss = body.split("def _scrollbar_qss", 1)[1].split("\ndef ", 1)[0]
+    for selector in (
+        "QScrollBar:vertical",
+        "QScrollBar::handle:vertical",
+        "QScrollBar::add-line:vertical",
+        "QScrollBar::sub-line:vertical",
+        "QScrollBar::add-page:vertical",
+        "QScrollBar::sub-page:vertical",
+    ):
+        assert selector in qss, f"滚动条缺少 {selector} 规则，滑块移动会留下残影"
+    assert "rgba(" not in qss, "QSS 的 background-color 不支持 rgba（会被整条丢弃）"
+    assert "transparent" not in qss, "槽/页必须是不透明色，否则旧滑块擦不掉"
+
+
+def test_auto_scroll_glides_instead_of_jumping(window):
+    """换句时滚动条不许瞬跳：先保持原位，再由动画滑到目标"""
+    win, _pc = window
+    win.show()
+    try:
+        sv = win.subtitle_view
+        sv.resize(320, 200)
+        sv.set_track(_track(40), 0)
+        bar = sv.list.verticalScrollBar()
+
+        sv.set_position(60000)          # 第 21 句
+        assert bar.value() == 0, "换句当下就瞬移 = 硬跳，观感就是抖"
+        assert sv._scroll_anim.state() == QPropertyAnimation.State.Running
+
+        QTest.qWait(320)
+        assert bar.value() > 0, "滑行结束后应停在新的居中位置"
+    finally:
+        win.hide()
+
+
+def test_scrollbar_value_never_moves_backwards(window):
+    """连续换句：滚动值只许前进，回退就是「上下抖动」"""
+    win, _pc = window
+    win.show()
+    try:
+        sv = win.subtitle_view
+        sv.resize(320, 200)
+        sv.set_track(_track(40), 0)
+        sv._scroll_anim.setDuration(30)  # 本用例只验证方向，不必真滑 220ms
+        bar = sv.list.verticalScrollBar()
+
+        values = []
+        for row in range(2, 26):
+            sv.set_position(row * 3000 + 100)
+            QTest.qWait(50)
+            values.append(bar.value())
+
+        backwards = [(a, b) for a, b in zip(values, values[1:], strict=False) if b < a]
+        assert not backwards, f"滚动条出现回退（会看成抖动）：{backwards}"
+    finally:
+        win.hide()
+
+
+def test_user_drag_cancels_glide(window):
+    """用户拖滚动条时立刻停掉自动滑行，别和他抢"""
+    win, _pc = window
+    win.show()
+    try:
+        sv = win.subtitle_view
+        sv.resize(320, 200)
+        sv.set_track(_track(40), 0)
+        sv.set_position(60000)
+        assert sv._scroll_anim.state() == QPropertyAnimation.State.Running
+
+        sv.list.verticalScrollBar().sliderPressed.emit()
+        assert sv._scroll_anim.state() == QPropertyAnimation.State.Stopped
+        assert sv._follow is False
+    finally:
+        win.hide()
+
+
+def test_set_position_restyles_only_two_rows():
+    """换句只许动「旧的当前句 + 新的当前句」，不许整表重绘"""
+    import pathlib
+
+    source = pathlib.Path(__file__).with_name("..").resolve()
+    body = (source / "ui" / "subtitle_view.py").read_text(encoding="utf-8")
+    block = body.split("def set_position", 1)[1].split("\n    def ", 1)[0]
+    assert "_apply_font()" not in block, "set_position 里整表重绘会让滚动条跟着抖"
+    assert block.count("_style_row(") == 2, "只该重绘上一句与当前句两行"
 
 
 # ==================== 时间轴兜底 ====================

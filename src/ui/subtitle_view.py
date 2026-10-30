@@ -8,7 +8,7 @@
     - 支持字号调整与 ±0.5 秒偏移（偏移量由外部持久化）。
 解析与定位全部交给 audio_manager.subtitles，本控件不碰文件。
 """
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -62,6 +62,41 @@ _FOLLOW_RESUME_MS = 3500
 _OFFSET_STEP_MS = 500
 _MAX_OFFSET_MS = 60000
 _FILE_LABEL_MAX = 104  # 文件名标签的省略宽（窄卡里防挤掉右侧按钮前缀）
+_SCROLL_MS = 220       # 自动跟随时滚动条的滑行时长
+_SCROLL_MIN_STEP = 2   # 目标位移小于该像素数就不动（避免无意义重绘）
+
+
+def _scrollbar_qss(theme):
+    """字幕列表的竖向滚动条：细条 + 把每个子控件都写全
+
+    两个原因，缺一不可：
+    1. 视觉：系统默认滚动条 17px 宽、带上下箭头，贴在暖奶油卡片上很突兀；
+    2. **抖动**（用户反馈 2026-10-31）：QListWidget 上挂了 QSS 之后，它的
+       滚动条改由 QStyleSheetStyle 绘制。只要 `add-page / sub-page` 没写，
+       滑块移动时**旧位置那一段槽不会被重绘**，残影留在原地 —— 肉眼看就是
+       滚动条在上下抖。因此 groove（`QScrollBar:vertical` 的 background）、
+       handle、add-line、sub-line、add-page、sub-page 必须全部给出不透明色，
+       不能写 `background: none`。
+    """
+    base = theme["card_bg"]
+    handle = theme["btn_edge"]
+    hover = theme["muted"]   # 只加深一档：hover 用 accent 会在指针停留时闪
+    return f"""
+QScrollBar:vertical {{
+    background: {base}; width: 10px; margin: 0; border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {handle}; min-height: 28px; border-radius: 3px; margin: 2px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {hover}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0; width: 0; border: none; background: {base};
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: {base};
+}}
+"""
+
 
 
 def _elide(text, width, pixel_size=11):
@@ -174,10 +209,17 @@ class SubtitleView(QFrame):
         self.list.setStyleSheet(
             "QListWidget { background: transparent; border: none; outline: none; }"
             "QListWidget::item { padding: 5px 8px; border-radius: 6px; }"
+            + _scrollbar_qss(t)
         )
         self.list.userScrolled.connect(self._pause_follow)
         self.list.verticalScrollBar().sliderPressed.connect(self._pause_follow)
         layout.addWidget(self.list, 1)
+
+        # 自动跟随用滑行代替瞬跳：一换句滚动条就整体瞬移，看久了像在「抖」。
+        # 必须存到 self 上，否则被 GC 掉、滚动条不动（坑：动画对象要留引用）。
+        self._scroll_anim = QPropertyAnimation(self.list.verticalScrollBar(), b"value", self)
+        self._scroll_anim.setDuration(_SCROLL_MS)
+        self._scroll_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
 
         self._follow_timer = QTimer(self)
         self._follow_timer.setSingleShot(True)
@@ -227,6 +269,7 @@ class SubtitleView(QFrame):
         self._current_row = -1
         self._follow = True
         self._follow_timer.stop()
+        self._scroll_anim.stop()   # 换轨时残留的滑行动画会把新列表甩到中间
         self.list.clear()
 
         if not self._track:
@@ -261,8 +304,11 @@ class SubtitleView(QFrame):
             return
         if index == self._current_row and not force:
             return
+        previous = self._current_row
         self._current_row = index
-        self._apply_font()
+        if previous >= 0 and previous != index:
+            self._style_row(previous)
+        self._style_row(index)
         if self._follow:
             self._scroll_to(index)
 
@@ -299,28 +345,59 @@ class SubtitleView(QFrame):
 
     def _apply_font(self):
         for row in range(self.list.count()):
-            item = self.list.item(row)
-            if not item.flags():
-                continue  # 占位项
-            font = QFont(self.font())
-            font.setPointSize(self._font_size)
-            font.setBold(row == self._current_row)
-            item.setFont(font)
-            if row == self._current_row:
-                item.setForeground(QColor(self._theme["accent"]))
-                item.setBackground(QColor(*self._theme["accent_soft"]))
-            else:
-                item.setForeground(QColor(self._theme["muted"]))
-                item.setBackground(QColor(0, 0, 0, 0))
+            self._style_row(row)
+
+    def _style_row(self, row):
+        """只重绘一行：换句时只动「旧的当前句」和「新的当前句」
+
+        原来每次换句都遍历全部行 setFont/setBackground，几百行的列表整块
+        失效重绘，滚动条也跟着一起抖 —— 现在只碰两行。
+        """
+        item = self.list.item(row)
+        if item is None or not item.flags():
+            return  # 越界或占位项
+        current = row == self._current_row
+        font = QFont(self.font())
+        font.setPointSize(self._font_size)
+        font.setBold(current)
+        item.setFont(font)
+        if current:
+            item.setForeground(QColor(self._theme["accent"]))
+            item.setBackground(QColor(*self._theme["accent_soft"]))
+        else:
+            item.setForeground(QColor(self._theme["muted"]))
+            item.setBackground(QColor(0, 0, 0, 0))
+
+    def _target_value(self, row):
+        """把某一句滚到视口中间所需的目标滚动值（超范围时夹到两端）"""
+        item = self.list.item(row)
+        if item is None:
+            return None
+        rect = self.list.visualItemRect(item)
+        if rect.height() <= 0:      # 尚未布局，交给调用方兜底
+            return None
+        bar = self.list.verticalScrollBar()
+        center = rect.top() + rect.height() // 2 - self.list.viewport().height() // 2
+        return max(bar.minimum(), min(bar.maximum(), center))
 
     def _scroll_to(self, row):
-        item = self.list.item(row)
-        if item is not None:
-            self.list.scrollToItem(
-                item, QAbstractItemView.ScrollHint.PositionAtCenter
-            )
+        """滑行到当前句：不再用 scrollToItem 瞬跳（那一跳看着就是抖）"""
+        target = self._target_value(row)
+        bar = self.list.verticalScrollBar()
+        if target is None:
+            item = self.list.item(row)
+            if item is not None:
+                self.list.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+            return
+        if abs(target - bar.value()) < _SCROLL_MIN_STEP:
+            return
+        self._scroll_anim.stop()
+        self._scroll_anim.setStartValue(bar.value())
+        self._scroll_anim.setEndValue(target)
+        self._scroll_anim.start()
 
     def _pause_follow(self):
+        self._scroll_anim.stop()   # 用户接管时别和他抢滚动条
         self._follow = False
         self._follow_timer.start()
 

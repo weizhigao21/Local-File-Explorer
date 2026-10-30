@@ -4,6 +4,44 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.8.17] - 2026-10-31
+
+修「字幕滚动时旁边的滚动条上下抖动」。
+
+### 排查
+先按「滚动值在抖」查了一遍，结论是**没有**：用真实字幕（167 句 SRT）在 125% 缩放
+下逐句推进，`scrollBar.value()` 严格单调（每句 +35~46px）、`maximum()` 全程恒定，
+连「跳到中段再往下走」也不抖。也就是说滚动**状态**是干净的，抖的是**绘制与位移方式**：
+
+1. `QListWidget` 上挂了 QSS，它的滚动条就改由 `QStyleSheetStyle` 绘制。原来一条
+   `QScrollBar` 规则都没写，`add-page / sub-page` 这两块（滑块上下两侧的槽）没有
+   显式绘制，滑块移动后**旧位置那段槽不会被重绘**，残影留在原地 —— 看上去就是
+   滑块在两个位置之间来回闪。
+2. 换句用的是 `scrollToItem(PositionAtCenter)`，`ScrollPerPixel` 模式下是**瞬时**
+   赋值，每句硬跳一格（长列表里一格 30~50px），节奏一快就像是抽。
+3. 每次换句都 `_apply_font()` 遍历**全部**行 `setFont / setBackground`，几百行的
+   列表整块失效重绘，滚动条跟着一起重画。
+
+### 修复
+- 新增 `_scrollbar_qss()`，把 `QScrollBar:vertical`、`handle`、`add-line`、
+  `sub-line`、`add-page`、`sub-page` **全部**给出不透明色（槽用卡片底色、滑块用
+  `btn_edge`），彻底消掉残影；顺手把 17px 带上下箭头的系统滚动条换成 10px 细条，
+  贴在暖奶油卡片上不再突兀。**不能用 `background: none`** —— 那正是残影的来源。
+- 自动跟随改成 **220ms 滑行**（`QPropertyAnimation` + `InOutCubic`）：换句时滚动条
+  从当前位置滑到「新句居中」的位置，不再瞬移。目标值自己算
+  （`item 中心 − 视口一半`，夹到 `[min, max]`），不依赖 `scrollToItem` 的估算。
+- 换句只重绘**两行**（旧的当前句 + 新的当前句），不再整表 `setFont`。
+- 用户滚轮 / 拖滑块接管时立刻 `stop()` 动画（`_pause_follow`），不和他抢滚动条；
+  换轨时也先停动画，免得残留滑行把新列表甩到中间。
+
+### 测试
+- `tests/test_subtitle_follow.py` 新增 5 项（共 15 项）：滚动条六个子控件规则齐全
+  且不含 `rgba(` / `transparent`、换句当下不许瞬跳且动画在跑、连续换句滚动值只能
+  前进不许回退、拖滑块要停动画并暂停跟随、`set_position` 里不许出现 `_apply_font()`。
+- 4 次注入式验证全部精准失败：删 `add-page/sub-page` 规则、滚动改回 `scrollToItem`、
+  换句改回整表 `_apply_font()`、`_pause_follow` 不带动画 stop。
+- **372 passed**，ruff 干净；离屏+真机双路截图确认任意时刻只有**一个**滑块、无残影。
+
 ## [v1.8.16] - 2026-10-24
 
 修「播放时字幕不跟着走」——字幕高亮停在第一句。
