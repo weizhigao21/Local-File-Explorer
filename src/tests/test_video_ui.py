@@ -193,6 +193,7 @@ def test_main_window_builds(app, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "VIDEO_DB_PATH", str(tmp_path / "video.db"))
     monkeypatch.setattr(config, "VIDEO_THUMB_DIR", str(tmp_path / "thumbs"))
     monkeypatch.setattr(config, "VIDEO_ROOT", str(tmp_path / "视频"))
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(tmp_path / "视频")])
     (tmp_path / "视频").mkdir()
     monkeypatch.setattr(config, "USER_CONFIG_PATH", str(tmp_path / "config.json"))
 

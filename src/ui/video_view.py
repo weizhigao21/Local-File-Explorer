@@ -320,19 +320,25 @@ class VideoMainWindow(QMainWindow):
         QTimer.singleShot(0, self._load_visible_cards)
 
     def _update_hint(self, work_count):
-        root = config.VIDEO_ROOT
-        if not os.path.isdir(root):
+        roots = scanner.video_roots()
+        missing = [r for r in roots if not os.path.isdir(r)]
+        if not roots or len(missing) == len(roots):
+            detail = "、".join(roots) or "（未配置）"
             self.hint_label.setText(
-                f"视频目录不存在：{root}　—　点左下角「设置」选择你的视频根目录"
+                f"视频目录不存在：{detail}　—　点左下角「设置」选择你的视频根目录"
             )
             self.hint_label.setVisible(True)
         elif work_count == 0:
             self.hint_label.setText(
-                "这个目录下还没有作品。结构应为：根目录 / 作者 / 作品 / 视频文件。"
+                "这些目录下还没有作品。结构应为：根目录 / 作者 / 作品 / 视频文件。"
             )
             self.hint_label.setVisible(True)
         else:
-            self.hint_label.setVisible(False)
+            hint = ""
+            if missing:
+                hint = "暂时读不到的目录：" + "、".join(missing)
+            self.hint_label.setText(hint)
+            self.hint_label.setVisible(bool(missing))
 
     def _on_search_changed(self, _text):
         self._search_timer.start()
@@ -435,11 +441,12 @@ class VideoMainWindow(QMainWindow):
     def start_scan(self, manual=False):
         if self.scan_thread is not None and self.scan_thread.isRunning():
             return
-        if not os.path.isdir(config.VIDEO_ROOT):
+        if not any(os.path.isdir(r) for r in scanner.video_roots()):
             if manual:
                 QMessageBox.warning(
                     self, "目录不存在",
-                    f"视频目录不存在：{config.VIDEO_ROOT}\n请先在「设置」里选择根目录。",
+                    "视频目录不存在：" + "、".join(scanner.video_roots() or ["（未配置）"])
+                    + "\n请先在「设置」里选择根目录。",
                 )
             self._update_hint(len(self._cards))
             return

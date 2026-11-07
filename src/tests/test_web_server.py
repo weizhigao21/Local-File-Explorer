@@ -38,10 +38,12 @@ def env(tmp_path, monkeypatch):
     video_root.mkdir()
 
     monkeypatch.setattr(config, "PHOTO_ROOT", str(photo_root))
+    monkeypatch.setattr(config, "PHOTO_ROOTS", [str(photo_root)])
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "photo.db"))
     monkeypatch.setattr(config, "THUMBNAIL_DIR", str(tmp_path / "thumbs"))
     monkeypatch.setattr(config, "WEB_CACHE_DIR", str(tmp_path / "web_cache"))
     monkeypatch.setattr(config, "VIDEO_ROOT", str(video_root))
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(video_root)])
     monkeypatch.setattr(config, "VIDEO_DB_PATH", str(tmp_path / "video.db"))
     monkeypatch.setattr(config, "VIDEO_THUMB_DIR", str(tmp_path / "video_thumbs"))
     monkeypatch.setattr(config, "USER_CONFIG_PATH", str(tmp_path / "config.json"))
@@ -828,3 +830,62 @@ def test_compat_ignores_injected_third_party_errors():
     js = _static_text("compat.js")
     assert "function isOurScript(" in js
     assert "/static/" in js, "要靠 /static/ 判断报错是不是自家脚本发的"
+
+
+# ==================== 多根目录配置（v1.10.0） ====================
+
+def test_normalize_roots_accepts_single_string_and_dedupes():
+    """旧版单字符串、尾斜杠重复、空白项都要收敛成一个干净列表"""
+    assert config._normalize_roots(r"E:\写真", "PHOTO_ROOTS") == [r"E:\写真"]
+    assert config._normalize_roots(
+        [r"E:\写真", r"E:\写真" + "\\", "   "], "PHOTO_ROOTS"
+    ) == [r"E:\写真"]
+    assert config._normalize_roots([], "PHOTO_ROOTS") == config._DEFAULT_USER_CONFIG["PHOTO_ROOTS"]
+
+
+def test_old_single_root_config_is_migrated(tmp_path, monkeypatch):
+    """老 config.json 里只有 PHOTO_ROOT / VIDEO_ROOT，升级后不能把用户路径丢了"""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps({"PHOTO_ROOT": "D:/旧写真", "VIDEO_ROOT": "D:/旧视频"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "USER_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(config, "_user_config", dict(config._user_config))
+    config._load_user_config()
+
+    assert config._user_config["PHOTO_ROOTS"] == ["D:/旧写真"]
+    assert config._user_config["VIDEO_ROOTS"] == ["D:/旧视频"]
+
+
+def test_set_user_config_accepts_legacy_single_root(monkeypatch):
+    """旧的 set_user_config("PHOTO_ROOT", ...) 调用要等价于「只有一个根」"""
+    monkeypatch.setattr(config, "_user_config", dict(config._user_config))
+    monkeypatch.setattr(config, "PHOTO_ROOTS", list(config.PHOTO_ROOTS))
+    monkeypatch.setattr(config, "PHOTO_ROOT", config.PHOTO_ROOT)
+
+    config.set_user_config("PHOTO_ROOT", "D:/新写真")
+
+    assert config.PHOTO_ROOTS == ["D:/新写真"]
+    assert config.PHOTO_ROOT == "D:/新写真"
+
+
+# ==================== 网页大图：先缩图再原图（v1.10.0） ====================
+
+def test_view_widths_stay_inside_thumbnail_whitelist(seeded):
+    """看图用的宽度必须在白名单里：漏了会静默回落原图（几十 MB，正是卡顿根因）"""
+    data = library.photo_work_images(library.photo_works()[0]["id"])
+    image = data["images"][0]
+    for key in ("thumb", "full"):
+        width = int(image[key].split("w=")[1])
+        assert width in config.WEB_THUMB_WIDTHS, f"{key} 用了未经缩图的白名单外宽度 {width}"
+    assert image["orig"] and "?" not in image["orig"], "原图地址不应带缩放参数"
+
+
+def test_lightbox_prefers_scaled_image_and_loads_original_on_demand():
+    """看图默认 1600 宽主图，原图只在点「原图」时拉——直接给原图就是卡顿的来源"""
+    js = _static_text("app.js")
+    assert "lbImg.src = image.full" in js
+    assert "image.orig" in js
+    assert "lb-img" in _static_text("index.html")
+    assert 'id="lb-orig"' in _static_text("index.html"), "看图浮层缺少「原图」按钮"

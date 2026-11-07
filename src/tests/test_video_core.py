@@ -21,6 +21,7 @@ def library(tmp_path, monkeypatch):
     root = tmp_path / "视频"
     root.mkdir()
     monkeypatch.setattr(config, "VIDEO_ROOT", str(root))
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(root)])
     monkeypatch.setattr(config, "VIDEO_DB_PATH", str(tmp_path / "video.db"))
     monkeypatch.setattr(config, "VIDEO_THUMB_DIR", str(tmp_path / "video_thumbs"))
     # 测试不跑 ffprobe：假文件读不出时长，真跑只会拖慢用例
@@ -155,6 +156,7 @@ def test_cancelled_scan_never_deletes(library):
 
 def test_missing_root_raises_friendly_error(library, monkeypatch):
     monkeypatch.setattr(config, "VIDEO_ROOT", str(library / "不存在"))
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(library / "不存在")])
     with pytest.raises(FileNotFoundError):
         scanner.scan()
 
@@ -414,3 +416,65 @@ def test_count_authors_matches_scanned_units(library):
     scanner.scan(progress_callback=lambda kind, name, *_args: seen.append(name)
                  if kind == "author" else None)
     assert len(seen) == 3
+
+
+# ==================== 多根目录（v1.10.0） ====================
+
+def test_scan_covers_every_video_root(library, tmp_path, monkeypatch):
+    """两个根目录各自的作品都要进库"""
+    second = tmp_path / "视频2"
+    second.mkdir()
+    _make_work(library, "社团A", "作品一", ["01.mp4"])
+    _make_work(second, "社团B", "作品二", ["02.mp4"])
+
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(library), str(second)])
+    scanner.scan()
+
+    assert sorted(name for _, name in db.list_all_authors()) == ["社团A", "社团B"]
+    assert len(db.list_works()) == 2
+
+
+def test_two_level_roots_each_get_their_own_bucket(library, tmp_path, monkeypatch):
+    """两个两层库：各自的归集作者按根目录名分开，作品不会挤在一起"""
+    second = tmp_path / "视频2"
+    second.mkdir()
+    _make_flat(library, "剧集一", ["01.mp4"])
+    _make_flat(second, "剧集二", ["02.mp4"])
+
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(library), str(second)])
+    scanner.scan()
+
+    authors = sorted(name for _, name in db.list_all_authors())
+    assert len(authors) == 2, authors
+    assert len(db.list_works()) == 2
+
+
+def test_same_author_name_in_two_roots_is_separated(library, tmp_path, monkeypatch):
+    """两棵库都有「社团/作品」：作者名加后缀，作品各自独立"""
+    second = tmp_path / "视频2"
+    second.mkdir()
+    _make_work(library, "社团", "作品", ["01.mp4"])
+    _make_work(second, "社团", "作品", ["02.mp4"])
+
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(library), str(second)])
+    scanner.scan()
+
+    assert sorted(name for _, name in db.list_all_authors()) == ["社团", "社团（视频2）"]
+    assert len(db.list_works()) == 2
+
+
+def test_missing_video_root_keeps_records(library, tmp_path, monkeypatch):
+    """根目录消失（NAS 掉线）时不许删作者记录"""
+    import shutil
+
+    second = tmp_path / "视频2"
+    second.mkdir()
+    _make_work(library, "社团A", "作品一", ["01.mp4"])
+    _make_work(second, "社团B", "作品二", ["02.mp4"])
+    monkeypatch.setattr(config, "VIDEO_ROOTS", [str(library), str(second)])
+    scanner.scan()
+    assert {name for _, name in db.list_all_authors()} == {"社团A", "社团B"}
+
+    shutil.rmtree(second)
+    scanner.scan()
+    assert {name for _, name in db.list_all_authors()} == {"社团A", "社团B"}

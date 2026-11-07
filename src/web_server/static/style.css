@@ -792,6 +792,26 @@ body.video-open #toast { display: none !important; }
   font-variant-numeric: tabular-nums;
 }
 
+.lb-actions {
+  display: flex;
+  align-items: center;
+}
+
+/* 「原图」按钮：默认看 1600 宽的主图，要抠细节才按需拉原图 */
+.lb-orig {
+  height: 28px;
+  margin-right: 8px;
+  padding: 0 12px;
+  border: 1px solid rgba(232, 220, 205, 0.45);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.35);
+  color: #e8dccd;
+  font-size: 12px;
+  line-height: 26px;
+}
+
+.lb-orig[disabled] { opacity: 0.55; }
+
 .lb-stage {
   flex: 1;
   display: grid;

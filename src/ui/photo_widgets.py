@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -25,7 +25,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setFixedSize(480, 320)
+        self.setFixedSize(520, 470)
         self.setStyleSheet("""
             SettingsDialog {
                 background-color: #F4EFE7;
@@ -35,32 +35,46 @@ class SettingsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(16)
+        layout.setSpacing(12)
 
-        # ---- 资源路径 ----
-        path_section = QLabel("资源目录")
+        # ---- 资源路径（支持多个根目录） ----
+        path_section = QLabel("资源目录（支持多个）")
         path_section.setStyleSheet("color: #3D3830; font-size: 16px; font-weight: bold;")
         layout.addWidget(path_section)
 
-        path_row = QHBoxLayout()
-        path_row.setSpacing(8)
-        self.path_edit = QLineEdit(config.PHOTO_ROOT)
-        self.path_edit.setStyleSheet(
-            "background-color: #EDE2CE; color: #3D3830; padding: 6px; "
-            "border: 1px solid #E0D5C2; border-radius: 4px;"
+        self.path_list = QListWidget()
+        self.path_list.setStyleSheet(
+            "QListWidget { background-color: #EDE2CE; color: #3D3830;"
+            " border: 1px solid #E0D5C2; border-radius: 6px; padding: 4px; }"
         )
-        path_row.addWidget(self.path_edit, 1)
+        for path in getattr(config, "PHOTO_ROOTS", [config.PHOTO_ROOT]):
+            self.path_list.addItem(path)
+        layout.addWidget(self.path_list, 1)
 
-        browse_btn = QPushButton("浏览")
-        browse_btn.setStyleSheet(
-            "background-color: #EDE2CE; color: #3D3830; padding: 6px 12px; "
-            "border: 1px solid #E0D5C2; border-radius: 4px;"
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        add_btn = QPushButton("添加目录")
+        add_btn.setStyleSheet(
+            "background-color: #B85C3E; color: #fff; padding: 6px 14px;"
+            " border: none; border-radius: 13px;"
         )
-        browse_btn.clicked.connect(self._browse)
-        path_row.addWidget(browse_btn)
-        layout.addLayout(path_row)
+        add_btn.clicked.connect(self._add_path)
+        btn_row.addWidget(add_btn)
 
-        path_desc = QLabel("写真资源的根目录路径，程序将从这里扫描作者/作品/图片。")
+        remove_btn = QPushButton("移除选中")
+        remove_btn.setStyleSheet(
+            "background-color: #EDE2CE; color: #3D3830; padding: 6px 14px;"
+            " border: 1px solid #E0D5C2; border-radius: 13px;"
+        )
+        remove_btn.clicked.connect(self._remove_path)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        path_desc = QLabel(
+            "每个根目录下都是「作者 / 作品 / 图片」，可放在不同磁盘或 NAS 上。\n"
+            "两棵库出现同名作者时会自动加目录后缀区分（如「某某（写真@F）」）。"
+        )
         path_desc.setWordWrap(True)
         path_desc.setStyleSheet("color: #A89880; font-size: 11px;")
         layout.addWidget(path_desc)
@@ -124,18 +138,42 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(save_btn)
         layout.addLayout(btn_layout)
 
-    def _browse(self):
-        path = QFileDialog.getExistingDirectory(self, "选择写真根目录", self.path_edit.text())
-        if path:
-            self.path_edit.setText(path)
+    def _add_path(self):
+        start = self.path_list.item(self.path_list.count() - 1)
+        path = QFileDialog.getExistingDirectory(
+            self, "选择写真根目录", start.text() if start else ""
+        )
+        if not path:
+            return
+        existing = {
+            os.path.normcase(os.path.normpath(self.path_list.item(i).text()))
+            for i in range(self.path_list.count())
+        }
+        if os.path.normcase(os.path.normpath(path)) in existing:
+            QMessageBox.information(self, "提示", "这个目录已经在列表里了。")
+            return
+        self.path_list.addItem(path)
+
+    def _remove_path(self):
+        row = self.path_list.currentRow()
+        if row >= 0:
+            self.path_list.takeItem(row)
 
     def on_save(self):
-        new_path = self.path_edit.text().strip()
-        if not os.path.isdir(new_path):
-            QMessageBox.warning(self, "路径无效", f"目录不存在: {new_path}")
+        paths = [
+            self.path_list.item(i).text().strip()
+            for i in range(self.path_list.count())
+        ]
+        paths = [p for p in paths if p]
+        if not paths:
+            QMessageBox.warning(self, "路径无效", "请至少保留一个写真目录。")
             return
+        for path in paths:
+            if not os.path.isdir(path):
+                QMessageBox.warning(self, "路径无效", f"目录不存在: {path}")
+                return
         # 通过 set_user_config 同步模块级变量 + _user_config
-        config.set_user_config("PHOTO_ROOT", new_path)
+        config.set_user_config("PHOTO_ROOTS", paths)
         config.set_user_config("GPU_FRIENDLY_FORMAT", self.gpu_check.isChecked())
         config.save_user_config()
         self.accept()

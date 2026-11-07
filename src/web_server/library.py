@@ -45,6 +45,9 @@ def init_all():
 _lock_guard = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
 
+# 同时进行的缩图解码数（大图解码很吃内存，并发太高会把机器拖慢）
+_DECODE_SLOTS = threading.Semaphore(2)
+
 
 def _lock_for(key):
     """按缓存文件路径取锁：同一个封面并发请求只生成一次，不同封面互不排队"""
@@ -88,13 +91,15 @@ def _exists(path):
 
 def summary():
     """首页统计：三个模块各自的数量 + 版本号（前端用来显示「库里还没东西」）"""
+    photo_roots = list(getattr(config, "PHOTO_ROOTS", None) or [config.PHOTO_ROOT])
+    video_roots = list(getattr(config, "VIDEO_ROOTS", None) or [config.VIDEO_ROOT])
     return {
         "version": config.APP_VERSION,
         "photo": {
             "works": _count(photo_db, "works"),
             "images": _count(photo_db, "images"),
-            "root": config.PHOTO_ROOT,
-            "root_exists": os.path.isdir(config.PHOTO_ROOT),
+            "roots": photo_roots,
+            "root_exists": any(os.path.isdir(p) for p in photo_roots),
         },
         "audio": {
             "playlists": _count(audio_db, "playlists"),
@@ -105,8 +110,8 @@ def summary():
         "video": {
             "works": _count(video_db, "works"),
             "videos": _count(video_db, "videos"),
-            "root": config.VIDEO_ROOT,
-            "root_exists": os.path.isdir(config.VIDEO_ROOT),
+            "roots": video_roots,
+            "root_exists": any(os.path.isdir(p) for p in video_roots),
         },
     }
 
@@ -200,7 +205,11 @@ def photo_work_images(work_id):
                 "id": img["id"],
                 "name": _basename(img["path"]),
                 "thumb": f"/media/photo/{img['id']}?w=640",
-                "full": f"/media/photo/{img['id']}",
+                # 看图用的主图：1600 宽在手机/平板上已经超过屏幕像素密度所需，
+                # 体积却只有原图（常见 10~40MB）的几十分之一
+                "full": f"/media/photo/{img['id']}?w=1600",
+                # 真要 100% 放大看细节时才点「原图」，按需加载
+                "orig": f"/media/photo/{img['id']}",
             }
             for img in images
         ],
@@ -217,6 +226,10 @@ def scaled_photo(path, width):
 
     相册网格一次要几十张原图（每张 3-8MB），手机上根本滚不动，
     所以统一在这里缩：按 md5(路径)_宽.jpg 落盘，第二次直接命中。
+
+    解码走 `im.draft()`：JPEG 可以按 1/2、1/4、1/8 直接解码，
+    6000×4000 的原图缩到 1600 宽只需解 1/4 的像素，比全解再缩快 3~5 倍，
+    否则第一次打开一本写真时 CPU 会被单张图吃满好几秒。
     """
     try:
         width = int(width or 0)
@@ -234,20 +247,26 @@ def scaled_photo(path, width):
         if _exists(target):
             return target
         os.makedirs(config.WEB_CACHE_DIR, exist_ok=True)
-        try:
-            from PIL import Image
+        # 全局限流：同时只解两张。一本写真里连点十几张时，
+        # 无限制并发解码会把内存和 CPU 一起打满，反而全都变慢。
+        with _DECODE_SLOTS:
+            try:
+                from PIL import Image
 
-            with Image.open(path) as im:
-                im.thumbnail((width, width * 4))
-                if im.mode in ("RGBA", "P"):
-                    im = im.convert("RGB")
-                tmp = f"{target}.tmp.jpg"
-                im.save(tmp, "JPEG", quality=82)
-                os.replace(tmp, target)
-            return target
-        except Exception as e:  # noqa: BLE001 - 缩图失败就退回原图，不影响看图
-            print(f"[网页缩图] 失败 {path}: {e}")
-            return path
+                with Image.open(path) as im:
+                    # draft 必须在 load()/thumbnail() 之前调用；非 JPEG 会静默无效
+                    im.draft("RGB", (width, width * 4))
+                    im.thumbnail((width, width * 4))
+                    if im.mode in ("RGBA", "P"):
+                        im = im.convert("RGB")
+                    tmp = f"{target}.tmp.jpg"
+                    # 渐进式：手机先看到模糊轮廓再逐步清晰，比「空白等到齐全」感受快得多
+                    im.save(tmp, "JPEG", quality=84, progressive=True)
+                    os.replace(tmp, target)
+                return target
+            except Exception as e:  # noqa: BLE001 - 缩图失败就退回原图，不影响看图
+                print(f"[网页缩图] 失败 {path}: {e}")
+                return path
 
 
 # ==================== 音频 ====================

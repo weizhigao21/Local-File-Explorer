@@ -27,6 +27,7 @@ def temp_photo_env(tmp_path, monkeypatch):
     photo_root.mkdir()
 
     monkeypatch.setattr(config, "PHOTO_ROOT", str(photo_root))
+    monkeypatch.setattr(config, "PHOTO_ROOTS", [str(photo_root)])
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setattr(config, "THUMBNAIL_DIR", str(tmp_path / "thumbnails"))
     # 指纹缓存路径是模块级变量，需单独 monkeypatch 避免污染真实缓存
@@ -322,3 +323,54 @@ def test_image_moved_between_works_stays_in_db(temp_photo_env):
     assert all_paths[str(dst)] == "作品A", "移动后归属未更新"
     assert str(src) not in all_paths, "旧路径行未清理"
     assert len(all_paths) == 3, "移动后图片丢失或重复"
+
+
+# ==================== 多根目录（v1.10.0） ====================
+
+def test_scan_covers_every_configured_root(temp_photo_env, tmp_path, monkeypatch):
+    """配了两个根目录时，两棵库都要进库——不能只扫第一个"""
+    root2 = tmp_path / "写真2"
+    root2.mkdir()
+    _make_work(temp_photo_env, "作者A", "作品1")
+    _make_work(root2, "作者B", "作品2", img_count=2)
+
+    monkeypatch.setattr(config, "PHOTO_ROOTS", [str(temp_photo_env), str(root2)])
+    scanner.scan(check_fingerprint=False)
+
+    authors = sorted(name for _, name in db.list_all_authors())
+    assert authors == ["作者A", "作者B"]
+    assert len(db.list_works()) == 2
+
+
+def test_same_author_name_in_two_roots_is_separated(temp_photo_env, tmp_path, monkeypatch):
+    """两棵库出现同名作者 + 同名作品：加根目录后缀区分，绝不能互相顶掉"""
+    root2 = tmp_path / "写真2"
+    root2.mkdir()
+    _make_work(temp_photo_env, "画师", "画集")
+    _make_work(root2, "画师", "画集")
+
+    monkeypatch.setattr(config, "PHOTO_ROOTS", [str(temp_photo_env), str(root2)])
+    scanner.scan(check_fingerprint=False)
+
+    authors = sorted(name for _, name in db.list_all_authors())
+    assert authors == ["画师", "画师（写真2）"]
+    # 同名作品各自独立：works 表有 UNIQUE(author_id, name)，合并就只剩一份
+    assert len(db.list_works()) == 2
+
+
+def test_missing_root_keeps_its_records(temp_photo_env, tmp_path, monkeypatch):
+    """某个根目录暂时读不到（移动硬盘没插）时，不能把它名下的作者删掉"""
+    import shutil
+
+    root2 = tmp_path / "写真2"
+    root2.mkdir()
+    _make_work(temp_photo_env, "作者A", "作品1")
+    _make_work(root2, "作者B", "作品2")
+    monkeypatch.setattr(config, "PHOTO_ROOTS", [str(temp_photo_env), str(root2)])
+    scanner.scan(check_fingerprint=False)
+    assert {name for _, name in db.list_all_authors()} == {"作者A", "作者B"}
+
+    shutil.rmtree(root2)
+    scanner.scan(check_fingerprint=False)
+    # 那是「没读到」，不是「已删除」——记录必须留着，硬盘插回来还能用
+    assert {name for _, name in db.list_all_authors()} == {"作者A", "作者B"}

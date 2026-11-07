@@ -447,6 +447,7 @@
   // ---------------- 看图 ----------------
   const lb = $('lightbox');
   const lbImg = $('lb-img');
+  const lbOrig = $('lb-orig');
 
   function openLightbox(images, index) {
     state.lightbox.images = images;
@@ -456,16 +457,34 @@
     showLightboxImage();
   }
 
+  function resetOrigButton() {
+    lbOrig.textContent = '原图';
+    lbOrig.disabled = false;
+    lbOrig.hidden = false;
+  }
+
   function showLightboxImage() {
     const { images, index } = state.lightbox;
     const image = images[index];
     if (!image) return;
+    state.lightbox.orig = '';
+    resetOrigButton();
     lbImg.classList.add('loading');
-    lbImg.src = image.full;
+    // 先用 640 缩图顶上（网格里多半已经缓存，几乎瞬间出图），
+    // 1600 主图解码完再替换。原来直接给原图地址，一张 20MB 要等好几秒。
+    lbImg.src = image.thumb;
+    const big = new Image();
+    big.onload = () => {
+      // 期间可能已经翻页，别把旧图贴回来
+      if (state.lightbox.images[index] !== image) return;
+      lbImg.src = image.full;
+      lbImg.classList.remove('loading');
+    };
+    big.src = image.full;
     $('lb-count').textContent = `${index + 1} / ${images.length}`;
     $('lb-prev').style.opacity = index > 0 ? '1' : '0.2';
     $('lb-next').style.opacity = index < images.length - 1 ? '1' : '0.2';
-    // 预热相邻两张，滑动时不用等
+    // 预热相邻两张的主图，滑动时不用等
     [index - 1, index + 1].forEach((i) => {
       if (images[i]) {
         const preload = new Image();
@@ -473,6 +492,27 @@
       }
     });
   }
+
+  // 原图按需加载：只在用户真的想看 100% 细节时才拉几十 MB
+  lbOrig.addEventListener('click', () => {
+    const { images, index } = state.lightbox;
+    const image = images[index];
+    if (!image || !image.orig || state.lightbox.orig === image.orig) return;
+    lbOrig.disabled = true;
+    lbOrig.textContent = '加载中…';
+    const big = new Image();
+    big.onload = () => {
+      if (state.lightbox.images[index] !== image) return;
+      state.lightbox.orig = image.orig;
+      lbImg.src = image.orig;
+      lbOrig.textContent = '已是原图';
+    };
+    big.onerror = () => {
+      lbOrig.disabled = false;
+      lbOrig.textContent = '原图加载失败';
+    };
+    big.src = image.orig;
+  });
 
   lbImg.addEventListener('load', () => lbImg.classList.remove('loading'));
 

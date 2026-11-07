@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -312,7 +312,7 @@ class VideoSettingsDialog(QDialog):
         super().__init__(parent)
         self.root_changed = False
         self.setWindowTitle("视频设置")
-        self.setFixedSize(520, 340)
+        self.setFixedSize(520, 470)
         # 先挂 objectName 再上样式：#objectName 选择器要求对象名已就位，
         # 否则首帧会按系统灰画一次（v1.8.4 同类问题）。
         self.setObjectName("videoSettings")
@@ -322,31 +322,46 @@ class VideoSettingsDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        section = QLabel("视频目录")
+        section = QLabel("视频目录（支持多个）")
         section.setStyleSheet(
             f"color: {TEXT_PRIMARY}; font-size: 15px; font-weight: bold;"
             " background: transparent; border: none;"
         )
         layout.addWidget(section)
 
+        self.path_list = QListWidget()
+        self.path_list.setStyleSheet(
+            f"QListWidget {{ background-color: {INPUT_BG}; color: {TEXT_PRIMARY};"
+            f" border: 1px solid #E0D5C2; border-radius: 6px; padding: 4px; }}"
+        )
+        for path in getattr(config, "VIDEO_ROOTS", [config.VIDEO_ROOT]):
+            self.path_list.addItem(path)
+        layout.addWidget(self.path_list, 1)
+
         path_row = QHBoxLayout()
         path_row.setSpacing(8)
-        self.path_edit = QLineEdit(config.VIDEO_ROOT)
-        self.path_edit.setStyleSheet(
-            f"QLineEdit {{ background-color: {INPUT_BG}; color: {TEXT_PRIMARY};"
-            f" padding: 6px; border: 1px solid #E0D5C2; border-radius: 4px; }}"
+        add_btn = QPushButton("添加目录")
+        add_btn.setStyleSheet(
+            f"background-color: {ACCENT}; color: #fff; padding: 6px 14px;"
+            " border: none; border-radius: 13px;"
         )
-        path_row.addWidget(self.path_edit, 1)
+        add_btn.clicked.connect(self._add_path)
+        path_row.addWidget(add_btn)
 
-        browse_btn = QPushButton("浏览")
-        browse_btn.setStyleSheet(BTN_QSS)
-        browse_btn.clicked.connect(self._browse)
-        path_row.addWidget(browse_btn)
+        remove_btn = QPushButton("移除选中")
+        remove_btn.setStyleSheet(
+            f"background-color: {INPUT_BG}; color: {TEXT_PRIMARY}; padding: 6px 14px;"
+            " border: 1px solid #E0D5C2; border-radius: 13px;"
+        )
+        remove_btn.clicked.connect(self._remove_path)
+        path_row.addWidget(remove_btn)
+        path_row.addStretch()
         layout.addLayout(path_row)
 
         desc = QLabel(
             "根目录下每个文件夹是一位作者，作者目录下的每个子文件夹是一部作品，\n"
-            "作品目录内的所有视频文件按名称自然排序（第 1 集、第 2 集…）。"
+            "作品目录内的所有视频文件按名称自然排序（第 1 集、第 2 集…）。\n"
+            "两棵库出现同名作者时会自动加目录后缀区分。"
         )
         desc.setWordWrap(True)
         desc.setStyleSheet(
@@ -388,19 +403,46 @@ class VideoSettingsDialog(QDialog):
         btn_row.addWidget(save_btn)
         layout.addLayout(btn_row)
 
-    def _browse(self):
-        path = QFileDialog.getExistingDirectory(self, "选择视频根目录", self.path_edit.text())
-        if path:
-            self.path_edit.setText(path)
+    def _add_path(self):
+        start = self.path_list.item(self.path_list.count() - 1)
+        path = QFileDialog.getExistingDirectory(
+            self, "选择视频根目录", start.text() if start else ""
+        )
+        if not path:
+            return
+        existing = {
+            os.path.normcase(os.path.normpath(self.path_list.item(i).text()))
+            for i in range(self.path_list.count())
+        }
+        if os.path.normcase(os.path.normpath(path)) in existing:
+            QMessageBox.information(self, "提示", "这个目录已经在列表里了。")
+            return
+        self.path_list.addItem(path)
+
+    def _remove_path(self):
+        row = self.path_list.currentRow()
+        if row >= 0:
+            self.path_list.takeItem(row)
 
     def on_save(self):
-        new_root = self.path_edit.text().strip()
-        if not os.path.isdir(new_root):
-            QMessageBox.warning(self, "路径无效", f"目录不存在: {new_root}")
+        roots = [
+            self.path_list.item(i).text().strip()
+            for i in range(self.path_list.count())
+        ]
+        roots = [p for p in roots if p]
+        if not roots:
+            QMessageBox.warning(self, "路径无效", "请至少保留一个视频目录。")
             return
-        self.root_changed = new_root != config.VIDEO_ROOT
+        for path in roots:
+            if not os.path.isdir(path):
+                QMessageBox.warning(self, "路径无效", f"目录不存在: {path}")
+                return
+        old_roots = list(getattr(config, "VIDEO_ROOTS", [config.VIDEO_ROOT]))
+        self.root_changed = [os.path.normcase(p) for p in roots] != [
+            os.path.normcase(p) for p in old_roots
+        ]
         if self.root_changed:
-            config.set_user_config("VIDEO_ROOT", new_root)
+            config.set_user_config("VIDEO_ROOTS", roots)
         config.set_user_config("VIDEO_RESUME", self.resume_check.isChecked())
         config.set_user_config("VIDEO_AUTOPLAY_NEXT", self.autoplay_check.isChecked())
         config.save_user_config()

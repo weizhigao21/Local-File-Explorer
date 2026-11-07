@@ -9,7 +9,7 @@ from PIL import Image
 from resource_manager import config
 from resource_manager import database as db
 from resource_manager import fingerprint_cache as fp
-from resource_manager.utils import natural_key
+from resource_manager.utils import natural_key, root_labels, unique_author_name
 
 # 并行生成缩略图的线程数（IO 密集 + CPU 解码 JPEG）
 _THUMB_WORKERS = 4
@@ -83,14 +83,34 @@ def _ensure_thumbnail(image_path, save_path):
         return None
 
 
+def photo_roots():
+    """当前生效的写真根目录列表（运行时读，便于测试 monkeypatch）
+
+    PHOTO_ROOTS 是 v1.10.0 起的多根配置；PHOTO_ROOT 仍保留为「第一个根目录」的别名，
+    旧配置里只写了单路径的情况在 config 加载阶段已迁移成单元素列表。
+    """
+    roots = [p for p in (getattr(config, "PHOTO_ROOTS", None) or [])
+             if isinstance(p, str) and p.strip()]
+    if roots:
+        return roots
+    first = getattr(config, "PHOTO_ROOT", "")
+    return [first] if first else []
+
+
 def count_authors():
-    """统计写真根目录下的作者文件夹数量"""
-    if not os.path.isdir(config.PHOTO_ROOT):
-        return 0
-    return sum(
-        1 for name in os.listdir(config.PHOTO_ROOT)
-        if os.path.isdir(os.path.join(config.PHOTO_ROOT, name))
-    )
+    """统计所有写真根目录下的作者文件夹数量（跨根同名按去重后的名字计）"""
+    roots = photo_roots()
+    labels = root_labels(roots)
+    total = 0
+    claimed = {}
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if os.path.isdir(os.path.join(root, name)):
+                unique_author_name(name, root, claimed, labels.get(root))
+                total += 1
+    return total
 
 
 def _sync_work_images(work_id, current_images, stats, allow_delete=True):
@@ -251,16 +271,27 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
         check_fingerprint: 为 True 时先对比目录指纹，无变化则直接跳过扫描
     """
     db.init_db()
-    if not os.path.isdir(config.PHOTO_ROOT):
-        raise FileNotFoundError(f"写真目录不存在: {config.PHOTO_ROOT}")
+    configured = photo_roots()
+    roots = [r for r in configured if os.path.isdir(r)]
+    if not roots:
+        raise FileNotFoundError(
+            "写真目录不存在: " + "、".join(configured or ["（未配置）"])
+        )
+    # 配了但当前读不到的根目录（移动硬盘没插、NAS 掉线）：本轮不做作者清理，
+    # 否则一次掉线就会把这棵库的作者连同作品记录整批删掉
+    missing_roots = [r for r in configured if r not in roots]
 
-    # 指纹预检：目录未变化则跳过整个扫描流程
+    # 指纹预检（按根目录分别判定）：全部根目录都没变才跳过整轮
     # 使用目录级指纹（level="dir"）：只 stat 目录 mtime，捕获作品/图片增删，
     # 速度远快于文件级指纹。漏检"图片内容被替换"——用户场景不涉及，可接受。
+    unchanged_roots = set()
     if check_fingerprint:
-        unchanged, _ = fp.is_unchanged(config.PHOTO_ROOT, level="dir")
-        if unchanged:
-            print("[扫描] 目录指纹未变化，跳过扫描")
+        for root in roots:
+            unchanged, _ = fp.is_unchanged(root, level="dir")
+            if unchanged:
+                unchanged_roots.add(root)
+        if len(unchanged_roots) == len(roots):
+            print("[扫描] 所有根目录指纹均未变化，跳过扫描")
             return {"unchanged": True, "skipped_all": True}
 
     stats = {
@@ -275,50 +306,85 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
     # 开启长连接，所有 db 操作复用同一个 connection
     db.begin_persistent()
     cancelled = False
+    skipped_roots = []      # 读不动的根目录：本轮不拿它当删除基准
+    claimed = {}            # 作者名 → 归属根目录，用于跨根同名去重
+    labels = root_labels(roots)
+    author_count = 0
     try:
         # 1. 数据库现有作者 {name: id}
         existing_authors = {name: aid for aid, name in db.list_all_authors()}
         disk_author_names = set()
 
-        author_count = 0
-
-        for author_name in sorted(os.listdir(config.PHOTO_ROOT)):
+        # 根目录按配置顺序处理：顺序决定同名作者谁保留原名（先到先得）
+        for root in roots:
             if cancel_event and cancel_event.is_set():
                 print("扫描已取消")
                 cancelled = True
                 break
 
-            author_path = os.path.join(config.PHOTO_ROOT, author_name)
-            if not os.path.isdir(author_path):
+            try:
+                names = sorted(os.listdir(root))
+            except OSError as e:
+                print(f"[扫描跳过] 无法读取根目录 {root}: {e}")
+                skipped_roots.append(root)
                 continue
 
-            author_count += 1
-            disk_author_names.add(author_name)
+            for author_name in names:
+                if cancel_event and cancel_event.is_set():
+                    print("扫描已取消")
+                    cancelled = True
+                    break
 
-            try:
-                _scan_author(
-                    author_name, author_path, stats,
-                    progress_callback, cancel_event,
-                    author_count, total_authors,
+                author_path = os.path.join(root, author_name)
+                if not os.path.isdir(author_path):
+                    continue
+
+                display_name = unique_author_name(
+                    author_name, root, claimed, labels.get(root)
                 )
-            except Exception as e:
-                print(f"[扫描作者失败] {author_name}: {e}")
-                traceback.print_exc()
+                author_count += 1
+                disk_author_names.add(display_name)
 
-            if author_done_callback:
-                author_done_callback(author_name, 0)
+                if root in unchanged_roots:
+                    # 这棵库没变化：只登记作者名（防止被下面的清理误删），不重扫
+                    if author_done_callback:
+                        author_done_callback(display_name, 0)
+                    if progress_callback:
+                        progress_callback(
+                            "author", display_name, None, 0, author_count, total_authors
+                        )
+                    continue
 
-            if progress_callback:
-                progress_callback(
-                    "author", author_name, None, 0, author_count, total_authors
-                )
+                try:
+                    _scan_author(
+                        display_name, author_path, stats,
+                        progress_callback, cancel_event,
+                        author_count, total_authors,
+                    )
+                except Exception as e:
+                    print(f"[扫描作者失败] {display_name}: {e}")
+                    traceback.print_exc()
 
-            print(f"[作者] {author_name} 已同步")
+                if author_done_callback:
+                    author_done_callback(display_name, 0)
+
+                if progress_callback:
+                    progress_callback(
+                        "author", display_name, None, 0, author_count, total_authors
+                    )
+
+                print(f"[作者] {display_name} 已同步")
 
         # 2. 删除数据库中存在但磁盘不存在的作者
         # 取消时不执行：disk_author_names 只含已遍历到的作者，
-        # 拿它当删除基准会把尚未扫描的作者连同数据整批误删
-        if not cancelled:
+        # 拿它当删除基准会把尚未扫描的作者连同数据整批误删。
+        # 有根目录读不动时同样跳过：那是"没读到"，不是"已删除"。
+        if cancelled or skipped_roots or missing_roots:
+            if skipped_roots:
+                print(f"[扫描] 有 {len(skipped_roots)} 个根目录不可读，跳过作者清理")
+            if missing_roots:
+                print(f"[扫描] 有 {len(missing_roots)} 个根目录不存在，跳过作者清理")
+        else:
             for author_name, author_id in existing_authors.items():
                 if author_name not in disk_author_names:
                     db.delete_author(author_id)
@@ -346,7 +412,11 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None, t
         progress_callback("done", "", None, 0, author_count, total_authors)
 
     # 扫描完成后更新目录指纹缓存（与预检使用相同的 level）
-    fp.update(config.PHOTO_ROOT, level="dir")
+    # 不可读的根目录不写指纹，否则下次会误判"没变化"而永不重试
+    for root in roots:
+        if root in skipped_roots:
+            continue
+        fp.update(root, level="dir")
 
     print(
         f"扫描完成: 新增 {stats['added']} 张, 更新 {stats['updated']} 张, "

@@ -41,7 +41,8 @@ VIDEO_THUMB_DIR = os.path.join(_DATA_DIR, "video_thumbs")
 WEB_CACHE_DIR = os.path.join(_DATA_DIR, "web_cache")
 
 # 网页端允许的缩图宽度（前端只用这几档，防止被随意拉大当图床用）
-WEB_THUMB_WIDTHS = (320, 640, 1280)
+# 1600 供「看图」用（手机/平板屏幕像素密度的合理上限），2048 供大屏平板
+WEB_THUMB_WIDTHS = (320, 640, 960, 1280, 1600, 2048)
 
 # 网页面板默认端口与上限
 WEB_DEFAULT_PORT = 8735
@@ -62,7 +63,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.10.0"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -71,10 +72,11 @@ USER_CONFIG_PATH = os.path.join(_DATA_DIR, "config.json")
 
 # 默认配置（仅在 config.json 不存在时使用）
 _DEFAULT_USER_CONFIG = {
-    "PHOTO_ROOT": r"E:\hhh\写真",
+    # 写真库根目录（可多个）：每个根目录下是 作者/作品/图片
+    "PHOTO_ROOTS": [r"E:\hhh\写真"],
     "AUDIO_ROOTS": [r"E:\音频"],
-    # 视频库根目录：作者/作品/视频文件 三级结构（与写真同构）
-    "VIDEO_ROOT": r"E:\hhh\视频",
+    # 视频库根目录（可多个）：作者/作品/视频文件 三级结构（与写真同构）
+    "VIDEO_ROOTS": [r"E:\hhh\视频"],
     "USE_GPU": True,
     "GPU_FRIENDLY_FORMAT": True,
     "UI_SCALE": 125,
@@ -103,14 +105,35 @@ _DEFAULT_USER_CONFIG = {
 _user_config = dict(_DEFAULT_USER_CONFIG)
 
 
-def _normalize_audio_roots(value):
-    """把 AUDIO_ROOTS 配置归一化为非空字符串列表（兼容旧版单字符串）"""
+def _normalize_roots(value, default_key):
+    """把「多根目录」配置归一化为去重后的非空字符串列表
+
+    兼容三种历史写法：单字符串（旧版 PHOTO_ROOT）、单元素列表、多元素列表。
+    去重时比较 normpath，避免同一个目录被大小写/尾斜杠写出两份。
+    """
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, (list, tuple)):
-        return list(_DEFAULT_USER_CONFIG["AUDIO_ROOTS"])
-    cleaned = [p.strip() for p in value if isinstance(p, str) and p.strip()]
-    return cleaned or list(_DEFAULT_USER_CONFIG["AUDIO_ROOTS"])
+        return list(_DEFAULT_USER_CONFIG[default_key])
+    cleaned = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        key = os.path.normcase(os.path.normpath(text))
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned or list(_DEFAULT_USER_CONFIG[default_key])
+
+
+def _normalize_audio_roots(value):
+    """把 AUDIO_ROOTS 配置归一化为非空字符串列表（兼容旧版单字符串）"""
+    return _normalize_roots(value, "AUDIO_ROOTS")
 
 
 def _normalize_video_volume(value):
@@ -160,10 +183,12 @@ def _load_user_config():
             for k, v in data.items():
                 if k not in _DEFAULT_USER_CONFIG:
                     continue
-                if k == "AUDIO_ROOTS":
+                if k == "PHOTO_ROOTS":
+                    v = _normalize_roots(v, "PHOTO_ROOTS")
+                elif k == "AUDIO_ROOTS":
                     v = _normalize_audio_roots(v)
-                elif k == "VIDEO_ROOT":
-                    v = str(v or "").strip() or _DEFAULT_USER_CONFIG["VIDEO_ROOT"]
+                elif k == "VIDEO_ROOTS":
+                    v = _normalize_roots(v, "VIDEO_ROOTS")
                 elif k == "VIDEO_VOLUME":
                     v = _normalize_video_volume(v)
                 elif k == "VIDEO_SPEED":
@@ -177,7 +202,11 @@ def _load_user_config():
                 elif k == "DL_PROXY":
                     v = str(v or "").strip()
                 merged[k] = v
-            # 兼容旧版单路径配置 AUDIO_ROOT → 迁移为 AUDIO_ROOTS
+            # 兼容旧版单路径配置 → 迁移为多根列表
+            if "PHOTO_ROOTS" not in data and "PHOTO_ROOT" in data:
+                merged["PHOTO_ROOTS"] = _normalize_roots(data["PHOTO_ROOT"], "PHOTO_ROOTS")
+            if "VIDEO_ROOTS" not in data and "VIDEO_ROOT" in data:
+                merged["VIDEO_ROOTS"] = _normalize_roots(data["VIDEO_ROOT"], "VIDEO_ROOTS")
             if "AUDIO_ROOTS" not in data and "AUDIO_ROOT" in data:
                 merged["AUDIO_ROOTS"] = _normalize_audio_roots(data["AUDIO_ROOT"])
             _user_config = merged
@@ -194,14 +223,21 @@ def save_user_config():
         print(f"[config] 保存用户配置失败: {e}")
 
 
+# 旧键 → 多根键：历史代码/旧配置文件里还有按单路径写的调用
+_LEGACY_ROOT_KEYS = {"PHOTO_ROOT": "PHOTO_ROOTS", "VIDEO_ROOT": "VIDEO_ROOTS"}
+_ROOT_KEYS = ("PHOTO_ROOTS", "AUDIO_ROOTS", "VIDEO_ROOTS")
+
+
 def set_user_config(key: str, value):
     """更新用户配置项并立即生效（运行时改，需调用 save_user_config() 持久化）"""
+    if key in _LEGACY_ROOT_KEYS:
+        # 单路径写法按「只有一个根」处理，等价于把列表整个换掉
+        value = _normalize_roots(value, _LEGACY_ROOT_KEYS[key])
+        key = _LEGACY_ROOT_KEYS[key]
     if key not in _DEFAULT_USER_CONFIG:
         raise KeyError(f"未知配置项: {key}")
-    if key == "AUDIO_ROOTS":
-        value = _normalize_audio_roots(value)
-    elif key == "VIDEO_ROOT":
-        value = str(value or "").strip()
+    if key in _ROOT_KEYS:
+        value = _normalize_roots(value, key)
     elif key == "VIDEO_VOLUME":
         value = _normalize_video_volume(value)
     elif key == "VIDEO_SPEED":
@@ -216,17 +252,23 @@ def set_user_config(key: str, value):
         value = str(value or "").strip()
     _user_config[key] = value
     globals()[key] = value  # 同步模块级变量，方便 config.XXX 直接访问
-    if key == "AUDIO_ROOTS":
-        # 保持 AUDIO_ROOT = 第一个根目录（兼容旧代码）
+    # 单路径别名恒等于第一个根目录（旧代码直接读 config.PHOTO_ROOT）
+    if key == "PHOTO_ROOTS":
+        globals()["PHOTO_ROOT"] = value[0]
+    elif key == "AUDIO_ROOTS":
         globals()["AUDIO_ROOT"] = value[0]
+    elif key == "VIDEO_ROOTS":
+        globals()["VIDEO_ROOT"] = value[0]
 
 
 # 启动时加载用户配置
 _load_user_config()
 
-# 暴露为模块级属性（兼容旧的 config.PHOTO_ROOT 访问方式）
-PHOTO_ROOT = _user_config["PHOTO_ROOT"]
-VIDEO_ROOT = _user_config["VIDEO_ROOT"]
+# 暴露为模块级属性（兼容旧的 config.PHOTO_ROOT 访问方式：取第一个根目录）
+PHOTO_ROOTS = list(_user_config["PHOTO_ROOTS"])
+PHOTO_ROOT = PHOTO_ROOTS[0]
+VIDEO_ROOTS = list(_user_config["VIDEO_ROOTS"])
+VIDEO_ROOT = VIDEO_ROOTS[0]
 AUDIO_ROOTS = list(_user_config["AUDIO_ROOTS"])
 AUDIO_ROOT = AUDIO_ROOTS[0]  # 兼容旧代码：第一个音频根目录
 USE_GPU = _user_config["USE_GPU"]
