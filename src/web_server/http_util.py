@@ -52,6 +52,11 @@ _EXTRA_TYPES = {
     ".avif": "image/avif",
     ".srt": "text/plain; charset=utf-8",
     ".vtt": "text/vtt; charset=utf-8",
+    # 显式给脚本/样式定类型：老浏览器对未知 MIME 的 <script> 会直接拒绝执行，
+    # 而 mimetypes 在部分 Windows 上对 .js 会返回 None（落到 octet-stream）。
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
 }
 
 # 浏览器 <video> 直接认的容器（其余靠服务端转封装或让用户在电脑上看）

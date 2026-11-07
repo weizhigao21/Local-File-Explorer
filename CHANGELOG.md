@@ -4,6 +4,27 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.9.2] - 2026-11-07
+
+### 修复
+- **老平板（Android 7，自带 WebView 为 Chrome 51~59）打开网页只显示顶栏文字、里面的按钮全不出来**。
+  根因是 `app.js` 用了 `...(options || {})` 对象展开——那是 ES2018 语法，老内核**解析失败**，
+  整份脚本一句都不执行（不是某一行出错，是全都不执行），`#view` 永远空着。
+  同时还有四处「老内核没有这个函数」：`replaceChildren`（Chrome 86+，26 处渲染全调它）、
+  `Array.prototype.flat`（69+）、`String.padStart`（57+）、`Object.entries`（54+）。
+- 新增 `static/compat.js`（纯 ES5，最先加载）：给 `replaceChildren` / `append` / `prepend` /
+  `flat` / `padStart` / `Object.entries` / `NodeList.forEach` / `closest` 等补垫片；
+  现代浏览器判空跳过，无额外开销。
+- `app.js` 去掉对象展开，改用 `Object.assign`。
+- **封面比例从 `aspect-ratio` 改成 padding-bottom 百分比**：`aspect-ratio` 要 Chrome 88+，
+  老内核上它失效后 `.cover` 高度塌成 0，卡片只剩一行标题（看起来就像「只有名字没有内容」）。
+  顺带把封面图改为绝对定位填满，比例在全系内核上都成立。
+- `inset: 0` 展开成四向属性（87+）；`env(safe-area-inset-*)` 前面补 `0px` 兜底（非刘海屏不再丢 padding）；
+  新增 `@supports not (display: grid)` 兜底，老内核没有 grid 时卡片墙退回 flex 两列。
+- 静态资源显式声明 MIME（`.js` / `.css` / `.svg`）：老浏览器对未知类型的 `<script>` 会拒绝执行。
+- 页面出错时在底部弹一条红条显示错误信息和浏览器 UA（CSP 是 `script-src 'self'`，
+  内联脚本会被拦，所以这段放在 `compat.js` 里），以后再遇到不兼容能一眼看出原因。
+
 ## [v1.9.1] - 2026-11-07
 
 ### 修复

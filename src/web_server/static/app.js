@@ -86,10 +86,12 @@
 
   // ---------------- 请求 ----------------
   async function api(path, options) {
-    const response = await fetch(path, {
-      credentials: 'same-origin',
-      ...(options || {}),
-    });
+    // 这里绝不能写成对象展开 `...(options || {})`：那是 ES2018 语法，
+    // Android 7 自带的老 WebView（Chrome 51~59）会直接**解析失败**，
+    // 整份 app.js 一句都不执行，页面上只剩顶栏文字、按钮全不出来。
+    const init = { credentials: 'same-origin' };
+    if (options) Object.assign(init, options);
+    const response = await fetch(path, init);
     if (response.status === 401) {
       // 令牌失效（电脑上重新生成过）：回根路径让服务端给登录页
       location.replace('/');

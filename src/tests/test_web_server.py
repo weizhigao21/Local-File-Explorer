@@ -564,7 +564,7 @@ def test_index_references_existing_assets():
         html = handle.read()
 
     assert 'name="viewport"' in html, "缺少 viewport，手机会按桌面宽度渲染成一团"
-    for name in ("app.js", "style.css", "icon.svg"):
+    for name in ("app.js", "compat.js", "style.css", "icon.svg"):
         assert name in html, f"index.html 没有引用 {name}"
         assert os.path.isfile(os.path.join(STATIC_DIR, name)), f"{name} 不存在"
 
@@ -632,3 +632,121 @@ def test_server_window_close_keeps_server_running():
         if isinstance(item, ast.Call) and ast.unparse(item.func).endswith(".stop")
     ]
     assert stops == ["self._timer.stop"], f"closeEvent 里多停了东西：{stops}"
+
+
+# ==================== 老浏览器兼容守卫 ====================
+#
+# 背景：用户的老平板是 Android 7，自带 WebView 是 Chrome 51~59 那一代。
+# 当时 app.js 里有两处把它整死的写法：
+#   `...(options || {})` 对象展开是 ES2018，直接语法错误，整份脚本不执行；
+#   `replaceChildren` 是 Chrome 86+，26 处渲染全都调它。
+# 结果就是「只显示名字、按钮全不出来」。下面几条守卫防它再犯。
+
+def _static_text(name):
+    from web_server.app import STATIC_DIR
+
+    with open(os.path.join(STATIC_DIR, name), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _strip_comments_and_strings(js):
+    """把注释和字符串内容抹成空白（换行保留，行号才对得上）
+
+    不剥的话，注释里随手写的示例 `...(options)` 也会被当成对象展开误报。
+    """
+    out = []
+    index = 0
+    length = len(js)
+    while index < length:
+        char = js[index]
+        ahead = js[index + 1] if index + 1 < length else ""
+        if char == "/" and ahead == "/":
+            while index < length and js[index] != "\n":
+                index += 1
+        elif char == "/" and ahead == "*":
+            index += 2
+            while index < length and not (js[index] == "*" and index + 1 < length
+                                          and js[index + 1] == "/"):
+                index += 1
+            index += 2
+        elif char in "'\"`":
+            quote = char
+            index += 1
+            while index < length and js[index] != quote:
+                if js[index] == "\\":
+                    index += 2
+                    continue
+                if js[index] == "\n":
+                    out.append("\n")
+                index += 1
+            index += 1
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def _object_spread_lines(js):
+    """找出位于 `{...}` 里的 `...`（对象展开，ES2018）
+
+    只做括号配对：最近的未闭合括号是 `{` 才算。
+    `[...]` 是数组展开、`(...)` 是形参/实参摊开，都是 ES2015，老内核认。
+    """
+    code = _strip_comments_and_strings(js)
+    lines = []
+    stack = []
+    index = 0
+    while index < len(code):
+        char = code[index]
+        if char in "{[(":
+            stack.append(char)
+        elif char in "}])":
+            if stack:
+                stack.pop()
+        elif code.startswith("...", index):
+            if stack and stack[-1] == "{":
+                lines.append(code.count("\n", 0, index) + 1)
+            index += 2
+        index += 1
+    return lines
+
+
+def test_app_js_has_no_object_spread():
+    """对象展开会让老 WebView 整份脚本解析失败（不是某一行出错，是全都不执行）"""
+    js = _strip_comments_and_strings(_static_text("app.js"))
+    assert _object_spread_lines(js) == [], "app.js 里出现了对象展开 {...x}，改用 Object.assign"
+    for token in ("?.", "??"):
+        assert token not in js, f"app.js 用了 {token}（ES2020 语法），老浏览器解析失败"
+
+
+def test_compat_js_loads_before_app_js():
+    """垫片必须在 app.js 之前执行，顺序反了等于没垫"""
+    html = _static_text("index.html")
+    assert html.index("compat.js") < html.index("app.js"), "compat.js 必须排在 app.js 前面"
+
+
+def test_compat_defines_the_apis_old_webviews_lack():
+    """这几个函数老内核一个都没有，缺一个页面就停在半截"""
+    js = _static_text("compat.js")
+    for name in ("replaceChildren", "flat", "padStart", "entries", "append"):
+        assert name in js, f"compat.js 没有为 {name} 提供垫片"
+    assert "window.onerror" in js, "缺少 onerror 兜底，出问题时用户只能看到白屏"
+
+
+def test_cover_does_not_use_aspect_ratio():
+    """aspect-ratio 要 Chrome 88+；老平板上它失效后封面高度塌成 0，卡片只剩标题"""
+    css = _static_text("style.css")
+    offenders = [
+        line for line in css.splitlines()
+        if line.strip().startswith("aspect-ratio:")
+    ]
+    assert not offenders, "封面的比例请用 padding-bottom 百分比撑，别用 aspect-ratio"
+    assert "padding-bottom: 133.3333%" in css
+
+
+def test_static_js_is_served_with_a_script_mime(tmp_path):
+    """老浏览器对未知 MIME 的 <script> 会拒绝执行"""
+    from web_server import http_util
+
+    assert http_util.guess_content_type("app.js").startswith("application/javascript")
+    assert http_util.guess_content_type("style.css").startswith("text/css")
