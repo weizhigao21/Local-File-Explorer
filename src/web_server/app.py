@@ -39,6 +39,10 @@ MAX_JSON_BODY = 64 * 1024
 # 转发给 ffmpeg 的块大小
 RELAY_CHUNK = 64 * 1024
 
+# 列表接口默认分页：切换模块只拉一页，几万条也不会把手机端拖死
+DEFAULT_PAGE_SIZE = library.PAGE_DEFAULT
+MAX_PAGE_SIZE = library.PAGE_MAX
+
 SECURITY_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
@@ -299,8 +303,20 @@ class RequestHandler(BaseHTTPRequestHandler):
     def api_photo_works(self, match, query):
         # 0 会被当成「作者 id = 0」查空集，必须转成 None 表示不过滤
         author_id = _int_param(query, "author_id") or None
+        data = library.photo_works_page(
+            author_id,
+            _text_param(query, "q"),
+            _int_param(query, "page", 1),
+            _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
+        )
         return self._json(
-            {"works": library.photo_works(author_id, _text_param(query, "q"))}, max_age=30
+            {
+                "works": data["items"],
+                "total": data["total"],
+                "page": data["page"],
+                "pages": data["pages"],
+            },
+            max_age=30,
         )
 
     def api_photo_images(self, match, query):
@@ -311,7 +327,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def api_audio_playlists(self, match, query):
         parent = _text_param(query, "parent")
-        return self._json({"playlists": library.audio_playlists(parent)}, max_age=30)
+        data = library.audio_playlists_page(
+            parent,
+            _int_param(query, "page", 1),
+            _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
+        )
+        return self._json(
+            {
+                "playlists": data["items"],
+                "total": data["total"],
+                "page": data["page"],
+                "pages": data["pages"],
+            },
+            max_age=30,
+        )
 
     def api_audio_playlist(self, match, query):
         data = library.audio_playlist(int(match.group(1)))
@@ -330,8 +359,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def api_video_works(self, match, query):
         author_id = _int_param(query, "author_id") or None
+        data = library.video_works_page(
+            author_id,
+            _text_param(query, "q"),
+            _int_param(query, "page", 1),
+            _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
+        )
         return self._json(
-            {"works": library.video_works(author_id, _text_param(query, "q"))}, max_age=30
+            {
+                "works": data["items"],
+                "total": data["total"],
+                "page": data["page"],
+                "pages": data["pages"],
+            },
+            max_age=30,
         )
 
     def api_video_work_videos(self, match, query):

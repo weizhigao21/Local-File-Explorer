@@ -889,3 +889,74 @@ def test_lightbox_prefers_scaled_image_and_loads_original_on_demand():
     assert "image.orig" in js
     assert "lb-img" in _static_text("index.html")
     assert 'id="lb-orig"' in _static_text("index.html"), "看图浮层缺少「原图」按钮"
+
+
+# ==================== 列表分页（v1.10.1） ====================
+
+def test_paged_slices_and_pages():
+    """切片、翻页、末页不满、越界页空集"""
+    items = list(range(25))
+    data = library._paged(items, 1, 10)
+    assert data["items"] == list(range(10))
+    assert (data["total"], data["pages"], data["page"]) == (25, 3, 1)
+    assert library._paged(items, 3, 10)["items"] == list(range(20, 25))
+    over = library._paged(items, 4, 10)
+    assert over["items"] == [] and over["pages"] == 3
+
+
+def test_paged_clamps_page_size_and_empty():
+    """page_size 超上限钳到 200、缺省回 60，空列表 pages 也要是 1"""
+    data = library._paged(list(range(10)), 1, 99999)
+    assert data["page_size"] == library.PAGE_MAX
+    data = library._paged(list(range(10)), 1, 0)
+    assert data["page_size"] == library.PAGE_DEFAULT
+    data = library._paged([], 1, 10)
+    assert data["items"] == [] and data["total"] == 0 and data["pages"] == 1
+
+
+def test_paged_bad_params_fall_back_to_defaults():
+    """前端传非法 page/page_size 不能 500，按默认值处理"""
+    data = library._paged([1, 2], "abc", "xyz")
+    assert data["page"] == 1
+    assert data["page_size"] == library.PAGE_DEFAULT
+    assert data["items"] == [1, 2]
+
+
+def test_api_photo_works_paginates_across_pages(server, env):
+    """真翻页：6 个作品按 page_size=2 拆 3 页，两页 id 不重复"""
+    _instance, port = server
+    for i in range(2, 7):
+        image_path = _make_image(str(env["photo_root"] / "作者A" / f"作品{i}" / "01.jpg"))
+        photo_db.add_author_with_works(
+            "作者A",
+            [(f"作品{i}", str(env["photo_root"] / "作者A" / f"作品{i}"), "", [(image_path, 0)])],
+        )
+
+    first = json.loads(_get(port, "/api/photos/works?page=1&page_size=2", cookie=TOKEN)[2])
+    second = json.loads(_get(port, "/api/photos/works?page=2&page_size=2", cookie=TOKEN)[2])
+    assert first["total"] == 6 and first["pages"] == 3 and len(first["works"]) == 2
+    assert len(second["works"]) == 2
+    assert not {w["id"] for w in first["works"]} & {w["id"] for w in second["works"]}
+
+
+def test_api_video_works_reports_pagination(server):
+    _instance, port = server
+    data = json.loads(_get(port, "/api/video/works?page=1&page_size=60", cookie=TOKEN)[2])
+    assert data["total"] == 1 and data["pages"] == 1 and len(data["works"]) == 1
+
+
+def test_api_audio_playlists_reports_pagination(server):
+    _instance, port = server
+    data = json.loads(_get(port, "/api/audio/playlists", cookie=TOKEN)[2])
+    assert data["total"] == 1 and data["pages"] == 1 and len(data["playlists"]) == 1
+
+
+def test_web_list_views_use_paged_grid():
+    """切标签卡顿的根因是全量渲染：前端必须分页请求 + 提供加载更多 + 重绘回第一页"""
+    js = _static_text("app.js")
+    assert "function pagedGrid(" in js
+    assert "params.set('page'" in js, "列表请求必须带 page 分页参数"
+    assert "加载更多" in js, "分页后必须有「加载更多」入口，否则第二页永远看不到"
+    assert js.count("state.repaint = wall.reload") == 3, "写真/视频/音频三个列表都要走分页重绘"
+    assert "pagedGrid({" in js
+    assert "'/api/photos/works'" in js and "'/api/video/works'" in js and "'/api/audio/playlists'" in js

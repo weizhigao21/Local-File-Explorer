@@ -328,53 +328,146 @@
     );
   }
 
+  // ---------------- 分页作品墙（写真/视频/音频共用） ----------------
+  /* 切换模块时只拉第一页（服务端分页），滚到底点「加载更多」再追加。
+   * 原来一次拉全量：几千个作品瞬间建几千个卡片节点 + 同时请求全部封面，
+   * 手机上切个标签要卡好几秒，这就是「切类型很卡」的根因。
+   */
+  function pagedGrid(options) {
+    const titleEl = sectionTitle('加载中…');
+    const grid = el('div', { class: 'grid' });
+    const more = el('button', { class: 'more', type: 'button', text: '加载更多', hidden: true });
+    const node = el('div', null, titleEl, grid, more);
+    let page = 0;
+    let pages = 1;
+    let total = 0;
+    let version = 0;
+    let busy = false;
+
+    more.addEventListener('click', () => { loadMore(); });
+
+    function fetchPage(next) {
+      const params = new URLSearchParams();
+      Object.keys(options.params || {}).forEach((key) => {
+        if (options.params[key]) params.set(key, String(options.params[key]));
+      });
+      if (state.search) params.set('q', state.search);
+      params.set('page', String(next));
+      return api(`${options.endpoint}?${params.toString()}`);
+    }
+
+    function showEmpty() {
+      grid.replaceChildren(
+        emptyState(
+          state.search && options.emptySearchTitle ? options.emptySearchTitle : options.emptyTitle,
+          state.search && options.emptySearchTitle ? ['换个关键词试试'] : options.emptyHints,
+        ),
+      );
+    }
+
+    function applyTitle(shown) {
+      titleEl.replaceChildren(
+        el('strong', { text: total ? `${options.unit(total)}，已显示 ${shown}` : '' }),
+      );
+    }
+
+    function updateMore(shown) {
+      if (page < pages) {
+        more.textContent = `已显示 ${shown} / ${total}，加载更多`;
+        more.disabled = false;
+        more.hidden = false;
+      } else {
+        more.hidden = true;
+      }
+    }
+
+    async function reload() {
+      const v = ++version;
+      // busy 时不直接 return：搜索防抖会在上一页还在路上时再触发 reload，
+      // 两个请求并发，靠 version 让旧响应被丢弃，最后一次的结果生效
+      busy = true;
+      page = 0;
+      pages = 1;
+      total = 0;
+      grid.replaceChildren(loadingState());
+      more.hidden = true;
+      try {
+        const data = await fetchPage(1);
+        if (v !== version) return;
+        page = data.page || 1;
+        pages = data.pages || 1;
+        total = data.total || 0;
+        if (!data[options.listKey].length) {
+          grid.replaceChildren();
+          showEmpty();
+          titleEl.replaceChildren(el('strong', { text: '' }));
+          return;
+        }
+        grid.replaceChildren(...data[options.listKey].map(options.renderCard));
+        applyTitle(total);
+        updateMore(total);
+      } finally {
+        busy = false;
+      }
+    }
+
+    async function loadMore() {
+      if (busy || page >= pages) return;
+      const v = version;
+      busy = true;
+      more.disabled = true;
+      more.textContent = '加载中…';
+      try {
+        const data = await fetchPage(page + 1);
+        // 拉取期间切换了搜索/筛选：这页数据作废
+        if (v !== version || data.page !== page + 1) return;
+        page = data.page;
+        pages = data.pages;
+        total = data.total;
+        data[options.listKey].forEach((item) => grid.append(options.renderCard(item)));
+        applyTitle(grid.childElementCount);
+        updateMore(grid.childElementCount);
+      } catch (error) {
+        more.textContent = `加载失败：${error.message}`;
+        more.disabled = false;
+        return;
+      } finally {
+        busy = false;
+      }
+      more.disabled = false;
+    }
+
+    return { node, reload };
+  }
+
   // ---------------- 写真 ----------------
   async function viewPhotoWorks(query, token) {
     const authorId = query.get('author') || '';
-    const listWrap = el('div');
-
-    const repaint = async () => {
-      listWrap.replaceChildren(loadingState());
-      const params = new URLSearchParams();
-      if (authorId) params.set('author_id', authorId);
-      if (state.search) params.set('q', state.search);
-      const data = await api(`/api/photos/works?${params.toString()}`);
-      if (token !== state.token) return;
-
-      if (!data.works.length) {
-        listWrap.replaceChildren(
-          emptyState(state.search ? '没有匹配的作品' : '写真库还是空的', [
-            state.search ? '换个关键词试试' : '在电脑上打开「写真」模块并扫描一次',
-          ]),
-        );
-        return;
-      }
-
-      listWrap.replaceChildren(
-        sectionTitle(`${data.works.length} 个作品`),
+    const wall = pagedGrid({
+      endpoint: '/api/photos/works',
+      listKey: 'works',
+      unit: (n) => `${n} 个作品`,
+      params: authorId ? { author_id: authorId } : {},
+      emptyTitle: '写真库还是空的',
+      emptySearchTitle: '没有匹配的作品',
+      emptyHints: ['在电脑上打开「写真」模块并扫描一次'],
+      renderCard: (work) =>
         el(
-          'div',
-          { class: 'grid' },
-          ...data.works.map((work) =>
-            el(
-              'button',
-              { class: 'card', type: 'button', onclick: () => { location.hash = `#/photo/w/${work.id}`; } },
-              (() => {
-                const box = coverBox(work.cover, '', (work.name || '·').slice(0, 1));
-                box.append(el('span', { class: 'badge', text: `${work.image_count} 张` }));
-                return box;
-              })(),
-              el(
-                'div',
-                { class: 'meta' },
-                el('div', { class: 'title', text: work.name }),
-                el('div', { class: 'sub', text: work.author || '' }),
-              ),
-            ),
+          'button',
+          { class: 'card', type: 'button', onclick: () => { location.hash = `#/photo/w/${work.id}`; } },
+          (() => {
+            const box = coverBox(work.cover, '', (work.name || '·').slice(0, 1));
+            box.append(el('span', { class: 'badge', text: `${work.image_count} 张` }));
+            return box;
+          })(),
+          el(
+            'div',
+            { class: 'meta' },
+            el('div', { class: 'title', text: work.name }),
+            el('div', { class: 'sub', text: work.author || '' }),
           ),
         ),
-      );
-    };
+    });
 
     view.replaceChildren(loadingState());
     const authors = await api('/api/photos/authors');
@@ -407,9 +500,9 @@
       ),
     );
 
-    view.replaceChildren(chips, listWrap);
-    state.repaint = repaint;
-    await repaint();
+    view.replaceChildren(chips, wall.node);
+    state.repaint = wall.reload;
+    await wall.reload();
   }
 
   async function viewPhotoWork(workId, token) {
@@ -562,47 +655,40 @@
 
   // ---------------- 音频 ----------------
   async function viewAudioRoot(token) {
-    view.replaceChildren(loadingState());
-    const data = await api('/api/audio/playlists');
-    if (token !== state.token) return;
-
-    if (!data.playlists.length) {
-      view.replaceChildren(
-        emptyState('音频库还是空的', ['在电脑上打开「音频」模块并扫描一次', '歌单按目录层级自动生成']),
-      );
-      return;
-    }
-
-    view.replaceChildren(
-      sectionTitle(`${data.playlists.length} 个歌单`),
-      el(
-        'div',
-        { class: 'grid' },
-        ...data.playlists.map((playlist) =>
+    const wall = pagedGrid({
+      endpoint: '/api/audio/playlists',
+      listKey: 'playlists',
+      unit: (n) => `${n} 个歌单`,
+      params: {},
+      emptyTitle: '音频库还是空的',
+      emptyHints: ['在电脑上打开「音频」模块并扫描一次', '歌单按目录层级自动生成'],
+      renderCard: (playlist) =>
+        el(
+          'button',
+          {
+            class: 'card',
+            type: 'button',
+            onclick: () => { location.hash = `#/audio/p/${playlist.id}`; },
+          },
+          coverBox(playlist.has_cover ? playlist.cover : '', 'square', '♪'),
           el(
-            'button',
-            {
-              class: 'card',
-              type: 'button',
-              onclick: () => { location.hash = `#/audio/p/${playlist.id}`; },
-            },
-            coverBox(playlist.has_cover ? playlist.cover : '', 'square', '♪'),
-            el(
-              'div',
-              { class: 'meta' },
-              el('div', { class: 'title', text: playlist.name }),
-              el('div', {
-                class: 'sub',
-                text: [
-                  playlist.track_count ? `${playlist.track_count} 首` : '',
-                  playlist.child_count ? `${playlist.child_count} 个子集` : '',
-                ].filter(Boolean).join(' · ') || '空歌单',
-              }),
-            ),
+            'div',
+            { class: 'meta' },
+            el('div', { class: 'title', text: playlist.name }),
+            el('div', {
+              class: 'sub',
+              text: [
+                playlist.track_count ? `${playlist.track_count} 首` : '',
+                playlist.child_count ? `${playlist.child_count} 个子集` : '',
+              ].filter(Boolean).join(' · ') || '空歌单',
+            }),
           ),
         ),
-      ),
-    );
+    });
+
+    view.replaceChildren(wall.node);
+    state.repaint = wall.reload;
+    await wall.reload();
   }
 
   async function viewAudioPlaylist(playlistId, token) {
@@ -891,58 +977,39 @@
   // ---------------- 视频 ----------------
   async function viewVideoWorks(query, token) {
     const authorId = query.get('author') || '';
-    const listWrap = el('div');
-
-    const repaint = async () => {
-      listWrap.replaceChildren(loadingState());
-      const params = new URLSearchParams();
-      if (authorId) params.set('author_id', authorId);
-      if (state.search) params.set('q', state.search);
-      const data = await api(`/api/video/works?${params.toString()}`);
-      if (token !== state.token) return;
-
-      if (!data.works.length) {
-        listWrap.replaceChildren(
-          emptyState(state.search ? '没有匹配的作品' : '视频库还是空的', [
-            state.search ? '换个关键词试试' : '在电脑上打开「视频」模块并扫描一次',
-          ]),
-        );
-        return;
-      }
-
-      listWrap.replaceChildren(
-        sectionTitle(`${data.works.length} 个作品`),
+    const wall = pagedGrid({
+      endpoint: '/api/video/works',
+      listKey: 'works',
+      unit: (n) => `${n} 个作品`,
+      params: authorId ? { author_id: authorId } : {},
+      emptyTitle: '视频库还是空的',
+      emptySearchTitle: '没有匹配的作品',
+      emptyHints: ['在电脑上打开「视频」模块并扫描一次'],
+      renderCard: (work) =>
         el(
-          'div',
-          { class: 'grid' },
-          ...data.works.map((work) =>
-            el(
-              'button',
-              {
-                class: 'card',
-                type: 'button',
-                onclick: () => { location.hash = `#/video/w/${work.id}`; },
-              },
-              (() => {
-                const box = coverBox(work.cover, 'wide', '▶');
-                box.append(el('span', { class: 'badge', text: `${work.video_count} 个` }));
-                return box;
-              })(),
-              el(
-                'div',
-                { class: 'meta' },
-                el('div', { class: 'title', text: work.name }),
-                el('div', {
-                  class: 'sub',
-                  text: [work.author, work.total_duration_ms ? fmtDuration(work.total_duration_ms) : '']
-                    .filter(Boolean).join(' · '),
-                }),
-              ),
-            ),
+          'button',
+          {
+            class: 'card',
+            type: 'button',
+            onclick: () => { location.hash = `#/video/w/${work.id}`; },
+          },
+          (() => {
+            const box = coverBox(work.cover, 'wide', '▶');
+            box.append(el('span', { class: 'badge', text: `${work.video_count} 个` }));
+            return box;
+          })(),
+          el(
+            'div',
+            { class: 'meta' },
+            el('div', { class: 'title', text: work.name }),
+            el('div', {
+              class: 'sub',
+              text: [work.author, work.total_duration_ms ? fmtDuration(work.total_duration_ms) : '']
+                .filter(Boolean).join(' · '),
+            }),
           ),
         ),
-      );
-    };
+    });
 
     view.replaceChildren(loadingState());
     const authors = await api('/api/video/authors');
@@ -975,9 +1042,9 @@
       ),
     );
 
-    view.replaceChildren(chips, listWrap);
-    state.repaint = repaint;
-    await repaint();
+    view.replaceChildren(chips, wall.node);
+    state.repaint = wall.reload;
+    await wall.reload();
   }
 
   async function viewVideoWork(workId, token) {

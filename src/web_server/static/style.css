@@ -276,6 +276,24 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
 
 .chip.active .count { color: rgba(36, 21, 15, 0.65); }
 
+/* 分页「加载更多」：占满一行的胶囊按钮，disabled 时降透明度 */
+.more {
+  display: block;
+  width: 100%;
+  margin: 18px 0 10px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--text-2);
+  font-size: 13.5px;
+  text-align: center;
+}
+
+.more:active { background: var(--card-hi); }
+
+.more:disabled { opacity: 0.55; }
+
 /* 卡片墙 */
 
 .grid {

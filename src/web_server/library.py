@@ -80,6 +80,36 @@ def _basename(path):
     return os.path.basename(str(path or "").replace("\\", "/"))
 
 
+# ==================== 分页 ====================
+
+# 网页端列表默认每页条数 / 上限（page_size 参数超出会被钳回来）
+PAGE_DEFAULT = 60
+PAGE_MAX = 200
+
+
+def _paged(items, page, page_size):
+    """内存分页：返回 items / total / page / pages，page_size<=0 时按默认值"""
+    total = len(items)
+    try:
+        page = max(int(page or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = int(page_size or PAGE_DEFAULT)
+    except (TypeError, ValueError):
+        page_size = PAGE_DEFAULT
+    page_size = min(max(page_size, 1), PAGE_MAX)
+    start = (page - 1) * page_size
+    return {
+        "items": items[start:start + page_size],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        # ceil：4 页 × 60 = 240 条也能在第 4 页装下 241 条
+        "pages": max(1, -(-total // page_size)),
+    }
+
+
 def _exists(path):
     try:
         return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -145,6 +175,11 @@ def photo_works(author_id=None, keyword=""):
         }
         for w in works
     ]
+
+
+def photo_works_page(author_id=None, keyword="", page=1, page_size=0):
+    """分页版写真作品列表（网页端用）：切到写真页只拉一页，不再一次全量"""
+    return _paged(photo_works(author_id, keyword), page, page_size)
 
 
 def photo_work(work_id):
@@ -315,6 +350,11 @@ def audio_playlists(parent=""):
     return [_playlist_brief(p, by_path, child_counts, track_counts) for p in items]
 
 
+def audio_playlists_page(parent="", page=1, page_size=0):
+    """分页版歌单列表（网页端用）"""
+    return _paged(audio_playlists(parent), page, page_size)
+
+
 def _track_counts_by_path():
     """{歌单路径: 曲目数}（一次 GROUP BY，避免每个歌单查一遍）"""
     rows = _rows(
@@ -447,6 +487,11 @@ def video_works(author_id=None, keyword=""):
         }
         for w in works
     ]
+
+
+def video_works_page(author_id=None, keyword="", page=1, page_size=0):
+    """分页版视频作品列表（网页端用）"""
+    return _paged(video_works(author_id, keyword), page, page_size)
 
 
 def video_work(work_id):
