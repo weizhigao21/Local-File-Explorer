@@ -13,6 +13,9 @@ a = Analysis(
     datas=[
         # 应用图标
         (str(ROOT / 'data' / 'ui.ico'), 'data'),
+        # 网页端静态资源（手机/平板访问的页面），必须随包带上，
+        # 否则打包后「手机访问」一打开就是 404
+        (str(ROOT / 'src' / 'web_server' / 'static'), 'web_server/static'),
     ],
     hiddenimports=[
         'PyQt6.QtMultimedia',

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#17130f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="本地资源">
+<meta name="format-detection" content="telephone=no">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/style.css">
+<title>本地资源</title>
+</head>
+<body>
+
+<header id="topbar">
+  <div class="bar-row">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span id="brand-title">本地资源</span>
+      <span class="crumb" id="crumb"></span>
+    </div>
+    <button class="icon-btn" id="search-toggle" type="button" aria-label="搜索">搜索</button>
+  </div>
+
+  <nav class="tabs" id="tabs" hidden>
+    <button type="button" data-tab="photo">写真</button>
+    <button type="button" data-tab="audio">音频</button>
+    <button type="button" data-tab="video">视频</button>
+  </nav>
+
+  <div id="search-wrap" hidden>
+    <input id="search-input" type="search" placeholder="搜索作品或作者" enterkeyhint="search"
+           autocomplete="off" autocorrect="off" spellcheck="false">
+  </div>
+</header>
+
+<main id="view"></main>
+
+<div id="subtitle-line" hidden></div>
+
+<section id="player" hidden aria-label="播放控制">
+  <img class="p-cover" id="p-cover" alt="">
+  <div class="p-main">
+    <div class="p-title" id="p-title">未在播放</div>
+    <div class="p-sub" id="p-sub"></div>
+  </div>
+  <div class="p-seek-row">
+    <span class="p-time" id="p-pos">00:00</span>
+    <input type="range" id="p-seek" min="0" max="1000" value="0" step="1" aria-label="播放进度">
+    <span class="p-time" id="p-dur">--:--</span>
+    <button type="button" class="p-speed" id="p-speed" aria-label="倍速">1.0×</button>
+  </div>
+  <div class="p-controls">
+    <button type="button" id="p-prev" aria-label="上一首"></button>
+    <button type="button" id="p-play" class="main-play" aria-label="播放/暂停"></button>
+    <button type="button" id="p-next" aria-label="下一首"></button>
+  </div>
+</section>
+
+<div id="video-overlay" hidden>
+  <div class="v-top">
+    <button type="button" class="v-close" id="v-close" aria-label="关闭"></button>
+    <div class="v-title" id="v-title"></div>
+  </div>
+  <video id="video" controls playsinline webkit-playsinline preload="metadata"></video>
+  <div class="v-note" id="v-note" hidden></div>
+</div>
+
+<div id="lightbox" hidden>
+  <div class="lb-top">
+    <span id="lb-count"></span>
+    <button type="button" class="v-close" id="lb-close" aria-label="关闭"></button>
+  </div>
+  <div class="lb-stage" id="lb-stage"><img id="lb-img" alt=""></div>
+  <button type="button" class="lb-nav prev" id="lb-prev" aria-label="上一张"></button>
+  <button type="button" class="lb-nav next" id="lb-next" aria-label="下一张"></button>
+</div>
+
+<div id="toast"></div>
+<audio id="audio" preload="metadata"></audio>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

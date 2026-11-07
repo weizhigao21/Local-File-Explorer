@@ -70,6 +70,8 @@ from ui.player_theme import (
     P_TEXT_DIM,
     P_TEXT_FAINT,
     P_WHITE,
+    attention_overlay_qss,
+    attention_toast_qss,
     card_qss,
     cover_qss,
     header_qss,
@@ -114,6 +116,10 @@ _MINI_W = 560           # 迷你态窗口默认宽（横向仍可拉）
 _MINI_TRANSITION_MS = 180   # 迷你↔完整态的窗口几何过渡时长
 _QUEUE_NAME_MAX = 128   # 队列曲名省略宽（240 卡内刨去序号/尾标/边距）
 _MINI_TITLE_MAX = 124   # 迷你态曲名省略宽（130px 信息列）
+# 「同一音频已经开着」的高亮：亮 180ms / 灭 140ms，闪 3 轮约 1s 后自动复原
+_ATTENTION_ON_MS = 180
+_ATTENTION_OFF_MS = 140
+_ATTENTION_CYCLES = 3
 
 
 def _elide(text, width, pixel_size=12):
@@ -206,6 +212,12 @@ class PlayerWindow(QMainWindow):
         self._current_sec = 0
         self._total_sec = 0
         self._queue = []
+        # 高亮层在 _build_ui 末尾创建；resize() 早于它，先占位避免 resizeEvent 访问落空
+        self._attention = None
+        self._attention_toast = None
+        self._attention_timer = None
+        self._attention_on = False
+        self._attention_pulses = 0
 
         self.setWindowTitle("播放器")
         self.setMinimumSize(_WIN_MIN_W, _WIN_MIN_H)
@@ -226,6 +238,9 @@ class PlayerWindow(QMainWindow):
             self.setWindowIcon(icon)
 
         self._build_ui()
+        self._attention_timer = QTimer(self)
+        self._attention_timer.setInterval(_ATTENTION_ON_MS)
+        self._attention_timer.timeout.connect(self._pulse_attention)
         self._bind_controller()
         self._setup_shortcuts()
         # 构造期就把置顶标志定下来（独立播放模式不经过 show_player）。
@@ -692,6 +707,20 @@ class PlayerWindow(QMainWindow):
         # stretch=1 会优先拿走全部空间，这里拿 0，不影响完整布局。
         root.addStretch(0)
 
+        # ---- 「已经开着」高亮层：整窗赤陶描边 + 提示条 ----
+        # 必须最后创建：Qt 按兄弟控件的创建顺序堆叠，早建会被卡片压住看不见。
+        # 不吃鼠标事件，闪的时候点播放/拖进度都照常生效。
+        self._attention = QFrame(central)
+        self._attention.setObjectName("attentionOverlay")
+        self._attention.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._attention.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._attention.setStyleSheet(attention_overlay_qss())
+        self._attention_toast = QLabel("该音频已打开 · 已切回窗口", self._attention)
+        self._attention_toast.setObjectName("attentionToast")
+        self._attention_toast.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._attention_toast.setStyleSheet(attention_toast_qss())
+        self._attention.hide()
+
     def _soft_shadow(self, widget, blur=12, dy=2, alpha=18):
         """卡片的柔阴影（设计稿 box-shadow: 0 2px 12px rgba(120,90,60,0.05~0.06)）"""
         shadow = QGraphicsDropShadowEffect(widget)
@@ -1037,6 +1066,90 @@ class PlayerWindow(QMainWindow):
             index = 0
         self.playback.set_playback_rate(_SPEEDS[(index + 1) % len(_SPEEDS)])
 
+    # ==================== 打开音频（去重 + 显色提示）====================
+    @staticmethod
+    def track_key(tracks):
+        """同一份音频的判定键：规范化后的路径序列（忽略大小写 / 相对路径差异）
+
+        文件关联转发过来的路径可能与库里的写法大小写不同、或带相对路径前缀，
+        直接比字符串会漏判，于是又从头播一遍。
+        """
+        return tuple(
+            os.path.normcase(os.path.abspath(track.get("path") or ""))
+            for track in (tracks or []) if track.get("path")
+        )
+
+    def _same_audio_already_open(self, tracks):
+        """当前是不是正开着同一份音频（单文件看当前曲目，多选/文件夹看整条队列）"""
+        wanted = self.track_key(tracks)
+        if not wanted or not self.playback.current_track:
+            return False
+        # is_active：已载入媒体（播放或暂停）。队列被清空/程序退出后 current_track
+        # 可能还留着，这时不能把「打开」误判成重复而挡住重新播放。
+        if not getattr(self.playback, "is_active", False):
+            return False
+        if self.track_key([self.playback.current_track]) == wanted:
+            return True
+        return self.track_key(self.playback.queue) == wanted
+
+    def open_tracks(self, tracks):
+        """所有「打开音频」入口的统一实现
+
+        文件关联/命令行转发、窗口内「打开文件…」、拖放文件都走这里。同一份音频
+        已经在播放时**不重建队列、不从头播放**，只把现有窗口提到前面并闪一轮
+        强调色提示「已经开着」；不同音频则照常换队列开播。
+        返回 True 表示这次打开请求已被处理（启动流程据此决定是否显示启动器）。
+        """
+        if not tracks:
+            return False
+        if self._same_audio_already_open(tracks):
+            self.show_player()
+            self.flash_attention()
+            return True
+        self.playback.play_tracks(tracks, 0)
+        self.show_player()
+        return True
+
+    def flash_attention(self):
+        """显色提示：整窗赤陶描边 + 提示条闪 3 轮，约 1s 后自动复原"""
+        self._stop_attention()
+        self._attention_on = True
+        self._attention.setVisible(True)
+        self._position_attention()
+        self._attention_pulses = _ATTENTION_CYCLES * 2 - 1
+        self._attention_timer.setInterval(_ATTENTION_ON_MS)
+        self._attention_timer.start()
+
+    def _pulse_attention(self):
+        if self._attention_pulses <= 0:
+            self._stop_attention()
+            return
+        self._attention_on = not self._attention_on
+        self._attention.setVisible(self._attention_on)
+        self._attention_timer.setInterval(
+            _ATTENTION_OFF_MS if not self._attention_on else _ATTENTION_ON_MS)
+        self._attention_pulses -= 1
+
+    def _stop_attention(self):
+        if self._attention_timer is not None:
+            self._attention_timer.stop()
+        self._attention_on = False
+        self._attention_pulses = 0
+        if self._attention is not None:
+            self._attention.hide()
+
+    def _position_attention(self):
+        """高亮层铺满 central，提示条居中贴在顶栏上（常规态 / 迷你态都可见）"""
+        if self._attention is None:
+            return
+        central = self.centralWidget()
+        if central is None:
+            return
+        self._attention.setGeometry(central.rect())
+        self._attention_toast.adjustSize()
+        self._attention_toast.move(
+            max(0, (central.width() - self._attention_toast.width()) // 2), 8)
+
     def _open_files(self):
         start = os.path.dirname((self._track or {}).get("path") or "") or os.path.expanduser("~")
         extensions = " ".join(f"*{ext}" for ext in sorted(AUDIO_EXTENSIONS))
@@ -1045,10 +1158,7 @@ class PlayerWindow(QMainWindow):
         )
         if not paths:
             return
-        tracks = tracks_from_paths(paths)
-        if tracks:
-            self.playback.play_tracks(tracks, 0)
-            self.show_player()
+        self.open_tracks(tracks_from_paths(paths))
 
     def _toggle_queue(self, checked):
         self.queue_panel.setVisible(checked)
@@ -1199,15 +1309,23 @@ class PlayerWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self._subtitle_timer.start()
+        self._position_attention()
 
     def hideEvent(self, event):
         self._subtitle_timer.stop()
+        self._stop_attention()   # 别在隐藏的窗口上继续闪，下次露出时留个残影
         super().hideEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 高亮层不是布局子项，窗口缩放/迷你态切换后必须自己跟着铺满
+        self._position_attention()
 
     def shutdown(self):
         """退出程序时真正关闭窗口"""
         self._allow_close = True
         self._subtitle_timer.stop()
+        self._stop_attention()
         for signal, slot in (
             (self.playback.trackChanged, self._on_track_changed),
             (self.playback.metadataChanged, self._on_metadata),
@@ -1251,10 +1369,7 @@ class PlayerWindow(QMainWindow):
 
     def dropEvent(self, event):
         paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        tracks = tracks_from_paths(paths)
-        if tracks:
-            self.playback.play_tracks(tracks, 0)
-            self.show_player()
+        if self.open_tracks(tracks_from_paths(paths)):
             event.acceptProposedAction()
 
 

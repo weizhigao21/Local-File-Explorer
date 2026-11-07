@@ -216,6 +216,28 @@ QListWidget::item:selected {{ background-color: {P_WHITE}; color: {P_TEXT};
 """
 
 
+def attention_overlay_qss() -> str:
+    """「同一音频已经开着」的高亮描边
+
+    用 #objectName 选择器：QFrame {} 会级联到内部 QLabel（QLabel 是 QFrame 子类），
+    给提示条也描一圈框。底色写 `background: transparent`（不是 background-color
+    带 alpha）——Qt 会静默丢弃带透明度的 background-color。
+    """
+    return (
+        f"#attentionOverlay {{ background: transparent;"
+        f" border: 3px solid {P_ACCENT}; border-radius: 8px; }}"
+    )
+
+
+def attention_toast_qss() -> str:
+    """描边中央的赤陶提示条：不透明底色 + 白字，圆角按半高取 8px"""
+    return (
+        f"#attentionToast {{ background-color: {P_ACCENT}; color: {P_WHITE};"
+        " border: none; border-radius: 8px; padding: 4px 12px;"
+        " font-size: 11px; font-weight: 600; }"
+    )
+
+
 def subtitle_theme() -> dict:
     """传给 SubtitleView(theme=...) 的陶色配色"""
     return {
@@ -240,5 +262,6 @@ __all__ = [
     "pill_btn_qss", "skip_btn_qss", "play_btn_qss",
     "mini_slider_qss", "speed_chip_qss", "util_btn_qss",
     "transport_pill_qss", "vol_pill_qss", "slider_qss", "time_label_qss",
-    "tag_qss", "queue_panel_qss", "queue_list_qss", "subtitle_theme",
+    "tag_qss", "queue_panel_qss", "queue_list_qss",
+    "attention_overlay_qss", "attention_toast_qss", "subtitle_theme",
 ]

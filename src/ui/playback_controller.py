@@ -106,6 +106,18 @@ class PlaybackController(QObject):
             return False
         return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
+    @property
+    def is_active(self):
+        """已载入媒体且未停止（播放或暂停）
+
+        用于「同一个音频是不是已经开着」：只判队列不够——clear()/shutdown() 之后
+        队列虽然清空，但中途 stop 过、或 play_tracks 因文件缺失失败时 current_track
+        仍可能指向旧曲目，这时不该把新的打开请求当成重复而挡掉。
+        """
+        if self._player is None:
+            return False
+        return self._player.playbackState() != QMediaPlayer.PlaybackState.StoppedState
+
     # ==================== 播放器（延迟初始化） ====================
     def _ensure_player(self):
         """首次真正播放时才创建 QMediaPlayer / QAudioOutput"""

@@ -29,6 +29,29 @@ DLSITE_COVER_DIR = os.path.join(_DATA_DIR, "dlsite_covers")
 # 缩略图缓存目录（在 data 下，与其他数据文件统一）
 THUMBNAIL_DIR = os.path.join(_DATA_DIR, "thumbnails")
 
+# ==================== 视频模块 ====================
+
+# 视频库数据库（与写真、音频各自独立，互不影响彼此的迁移）
+VIDEO_DB_PATH = os.path.join(_DATA_DIR, "video_manager.db")
+
+# 视频封面（ffmpeg 抽帧）缓存目录
+VIDEO_THUMB_DIR = os.path.join(_DATA_DIR, "video_thumbs")
+
+# 网页端（手机/平板）缩图缓存：按 md5 + 宽度命名，同一张图只缩一次
+WEB_CACHE_DIR = os.path.join(_DATA_DIR, "web_cache")
+
+# 网页端允许的缩图宽度（前端只用这几档，防止被随意拉大当图床用）
+WEB_THUMB_WIDTHS = (320, 640, 1280)
+
+# 网页面板默认端口与上限
+WEB_DEFAULT_PORT = 8735
+
+# 支持的视频扩展名（扫描白名单）
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".avi", ".wmv", ".mov", ".flv", ".ts", ".m2ts",
+    ".m4v", ".webm", ".rmvb", ".rm", ".mpg", ".mpeg", ".3gp", ".vob",
+}
+
 # 作品级缩略图尺寸（用于作品卡片）
 THUMBNAIL_SIZE = 240
 
@@ -39,7 +62,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.8.17"
+APP_VERSION = "1.9.0"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -50,6 +73,8 @@ USER_CONFIG_PATH = os.path.join(_DATA_DIR, "config.json")
 _DEFAULT_USER_CONFIG = {
     "PHOTO_ROOT": r"E:\hhh\写真",
     "AUDIO_ROOTS": [r"E:\音频"],
+    # 视频库根目录：作者/作品/视频文件 三级结构（与写真同构）
+    "VIDEO_ROOT": r"E:\hhh\视频",
     "USE_GPU": True,
     "GPU_FRIENDLY_FORMAT": True,
     "UI_SCALE": 125,
@@ -62,6 +87,16 @@ _DEFAULT_USER_CONFIG = {
     "PLAYER_AUTO_QUEUE": False,      # 打开播放器时自动展开播放队列
     "PLAYER_ON_TOP": False,          # 播放器窗口始终置顶
     "PLAYER_EMBEDDED_COVER": True,   # 文件夹没封面时，用音频文件自带的内嵌封面
+    # 视频播放器行为
+    "VIDEO_RESUME": True,            # 记住每个视频看到哪，下次接着播
+    "VIDEO_VOLUME": 80,              # 视频音量（0-100）
+    "VIDEO_AUTOPLAY_NEXT": True,     # 一集播完自动播下一个
+    "VIDEO_SPEED": 1.0,              # 上次使用的倍速
+    # 手机/平板网页访问（内置 HTTP 服务）
+    "WEB_PORT": WEB_DEFAULT_PORT,    # 监听端口
+    "WEB_TOKEN": "",                 # 访问令牌，首次启动自动生成
+    "WEB_ALLOW_LAN": True,           # True=局域网可访问；False=仅本机
+    "WEB_AUTO_START": False,         # 程序启动时自动开服
 }
 
 # 当前生效的用户配置（运行时可改，通过 save_user_config() 写盘）
@@ -78,6 +113,41 @@ def _normalize_audio_roots(value):
     return cleaned or list(_DEFAULT_USER_CONFIG["AUDIO_ROOTS"])
 
 
+def _normalize_video_volume(value):
+    """视频音量归一化到 0-100 的整数（配置文件可能被手改成 "80"/800）"""
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError):
+        return _DEFAULT_USER_CONFIG["VIDEO_VOLUME"]
+
+
+def _normalize_video_speed(value):
+    """倍速归一化到 0.5-2.0（越界或非数字回落到 1.0）"""
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if speed <= 0:
+        return 1.0
+    return max(0.5, min(2.0, speed))
+
+
+def _normalize_web_port(value):
+    """网页端口归一化：非数字、越界或落在特权段（<1024）都回落到默认端口"""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return WEB_DEFAULT_PORT
+    if port < 1024 or port > 65535:
+        return WEB_DEFAULT_PORT
+    return port
+
+
+def _normalize_web_token(value):
+    """访问令牌只保留 URL 安全字符，去掉用户粘贴时带进来的空格/引号"""
+    return "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in "-_")
+
+
 def _load_user_config():
     """启动时从 config.json 加载用户配置，缺失字段用默认值"""
     global _user_config
@@ -92,6 +162,18 @@ def _load_user_config():
                     continue
                 if k == "AUDIO_ROOTS":
                     v = _normalize_audio_roots(v)
+                elif k == "VIDEO_ROOT":
+                    v = str(v or "").strip() or _DEFAULT_USER_CONFIG["VIDEO_ROOT"]
+                elif k == "VIDEO_VOLUME":
+                    v = _normalize_video_volume(v)
+                elif k == "VIDEO_SPEED":
+                    v = _normalize_video_speed(v)
+                elif k == "WEB_PORT":
+                    v = _normalize_web_port(v)
+                elif k == "WEB_TOKEN":
+                    v = _normalize_web_token(v)
+                elif k == "WEB_ALLOW_LAN":
+                    v = bool(v)
                 elif k == "DL_PROXY":
                     v = str(v or "").strip()
                 merged[k] = v
@@ -118,6 +200,18 @@ def set_user_config(key: str, value):
         raise KeyError(f"未知配置项: {key}")
     if key == "AUDIO_ROOTS":
         value = _normalize_audio_roots(value)
+    elif key == "VIDEO_ROOT":
+        value = str(value or "").strip()
+    elif key == "VIDEO_VOLUME":
+        value = _normalize_video_volume(value)
+    elif key == "VIDEO_SPEED":
+        value = _normalize_video_speed(value)
+    elif key == "WEB_PORT":
+        value = _normalize_web_port(value)
+    elif key == "WEB_TOKEN":
+        value = _normalize_web_token(value)
+    elif key == "WEB_ALLOW_LAN":
+        value = bool(value)
     elif key == "DL_PROXY":
         value = str(value or "").strip()
     _user_config[key] = value
@@ -132,6 +226,7 @@ _load_user_config()
 
 # 暴露为模块级属性（兼容旧的 config.PHOTO_ROOT 访问方式）
 PHOTO_ROOT = _user_config["PHOTO_ROOT"]
+VIDEO_ROOT = _user_config["VIDEO_ROOT"]
 AUDIO_ROOTS = list(_user_config["AUDIO_ROOTS"])
 AUDIO_ROOT = AUDIO_ROOTS[0]  # 兼容旧代码：第一个音频根目录
 USE_GPU = _user_config["USE_GPU"]
@@ -143,3 +238,11 @@ DL_PROXY = _user_config["DL_PROXY"]
 PLAYER_AUTO_QUEUE = _user_config["PLAYER_AUTO_QUEUE"]
 PLAYER_ON_TOP = _user_config["PLAYER_ON_TOP"]
 PLAYER_EMBEDDED_COVER = _user_config["PLAYER_EMBEDDED_COVER"]
+VIDEO_RESUME = _user_config["VIDEO_RESUME"]
+VIDEO_VOLUME = _user_config["VIDEO_VOLUME"]
+VIDEO_AUTOPLAY_NEXT = _user_config["VIDEO_AUTOPLAY_NEXT"]
+VIDEO_SPEED = _user_config["VIDEO_SPEED"]
+WEB_PORT = _user_config["WEB_PORT"]
+WEB_TOKEN = _user_config["WEB_TOKEN"]
+WEB_ALLOW_LAN = _user_config["WEB_ALLOW_LAN"]
+WEB_AUTO_START = _user_config["WEB_AUTO_START"]

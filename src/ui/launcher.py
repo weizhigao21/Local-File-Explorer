@@ -63,8 +63,8 @@ MODULES = [
         "id": "video",
         "icon": "\U0001F4FA",  # 📺
         "title": "视频",
-        "description": "浏览和管理本地视频资源\n支持分类收藏和播放",
-        "status": "coming_soon",
+        "description": "浏览和管理本地视频资源\n作者-作品-视频三级结构，内置播放",
+        "status": "ready",
     },
     {
         "id": "audio",
@@ -178,6 +178,7 @@ class LauncherWindow(QMainWindow):
 
     playerRequested = pyqtSignal()
     systemRequested = pyqtSignal()
+    webRequested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -260,6 +261,16 @@ class LauncherWindow(QMainWindow):
         system_btn.setStyleSheet(player_btn.styleSheet())
         system_btn.clicked.connect(self.systemRequested.emit)
         sub_row.addWidget(system_btn)
+        sub_row.addSpacing(8)
+
+        # 手机/平板访问：不是资源模块，放顶部比塞进卡片网格更合理
+        # （五张 240px 卡片加间距会超出最小窗口宽度，第四张开始就会被压扁）
+        web_btn = QPushButton("📱 手机访问")
+        web_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        web_btn.setToolTip("启动内置网页服务，手机/平板用浏览器听音乐、看写真、看视频")
+        web_btn.setStyleSheet(player_btn.styleSheet())
+        web_btn.clicked.connect(self.webRequested.emit)
+        sub_row.addWidget(web_btn)
         sub_row.addSpacing(12)
 
         scale_label = QLabel("UI缩放:")
@@ -336,6 +347,9 @@ class LauncherWindow(QMainWindow):
 
     def open_module(self, module_id):
         """外部入口（命令行 --module）按 id 打开模块"""
+        if module_id == "web":
+            self._open_module({"id": "web", "title": "手机访问", "status": "ready"})
+            return
         self._on_card_clicked(module_id)
 
     def _open_module(self, module):
@@ -373,6 +387,28 @@ class LauncherWindow(QMainWindow):
 
             win = AudioMainWindow(on_back_to_launcher=_on_audio_closed)
             win.playerRequested.connect(self.playerRequested.emit)
+            self._module_windows[mid] = win
+            self.hide()
+            win.show()
+        elif mid == "video":
+            from ui.video_view import VideoMainWindow
+
+            def _on_video_closed():
+                self._on_module_closed(mid)
+                self.show()
+
+            win = VideoMainWindow(on_back_to_launcher=_on_video_closed)
+            self._module_windows[mid] = win
+            self.hide()
+            win.show()
+        elif mid == "web":
+            from ui.server_window import ServerWindow
+
+            def _on_web_closed():
+                self._on_module_closed(mid)
+                self.show()
+
+            win = ServerWindow(on_back_to_launcher=_on_web_closed)
             self._module_windows[mid] = win
             self.hide()
             win.show()

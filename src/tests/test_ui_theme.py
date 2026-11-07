@@ -35,13 +35,13 @@ def qapp():
 
 
 def test_palette_single_sourced():
-    """三个 UI 模块的共享配色令牌必须与 theme_base 取值一致（不得各写一份）"""
-    from ui import audio_theme, launcher, photo_theme, theme_base
+    """四个 UI 模块的共享配色令牌必须与 theme_base 取值一致（不得各写一份）"""
+    from ui import audio_theme, launcher, photo_theme, theme_base, video_theme
 
     mismatches = []
     for name in SHARED_TOKENS:
         expected = getattr(theme_base, name)
-        for mod in (audio_theme, photo_theme, launcher):
+        for mod in (audio_theme, photo_theme, video_theme, launcher):
             if not hasattr(mod, name):
                 continue
             actual = getattr(mod, name)
@@ -54,9 +54,9 @@ def test_palette_single_sourced():
 
 def test_theme_modules_reexport_tokens():
     """主题模块必须继续对外导出令牌（既有 `from ui.photo_theme import ACCENT` 不能断）"""
-    from ui import audio_theme, launcher, photo_theme, theme_base
+    from ui import audio_theme, launcher, photo_theme, theme_base, video_theme
 
-    for mod in (audio_theme, photo_theme, launcher):
+    for mod in (audio_theme, photo_theme, video_theme, launcher):
         assert hasattr(mod, "ACCENT"), f"{mod.__name__} 不再导出 ACCENT"
         assert mod.ACCENT == theme_base.ACCENT
 
@@ -64,6 +64,9 @@ def test_theme_modules_reexport_tokens():
     assert photo_theme.ACCENT_PRESSED == "#9E4B30"
     # audio_theme 的模块独有样式
     assert "QPushButton" in audio_theme.BTN_QSS
+    # video_theme 的模块独有样式
+    assert "QPushButton" in video_theme.BTN_QSS
+    assert video_theme.BADGE_BG.startswith("#") and len(video_theme.BADGE_BG) == 7
 
 
 def test_all_ui_modules_import(qapp):
@@ -82,9 +85,13 @@ def test_all_ui_modules_import(qapp):
 
 
 def test_core_layers_do_not_import_qt():
-    """核心层（resource_manager / audio_manager）不得依赖 Qt —— 保持算法层与 GUI 解耦"""
+    """核心层（含 web_server）不得依赖 Qt —— 保持算法层 / 服务层与 GUI 解耦
+
+    web_server 也必须在里面：它要能在没有 QApplication 的线程里跑，
+    一旦有人 import 了 Qt 就会变成「服务起在 UI 线程之外但用了 GUI 模块」。
+    """
     offenders = []
-    for pkg in ("resource_manager", "audio_manager"):
+    for pkg in ("resource_manager", "audio_manager", "video_manager", "web_server"):
         pkg_dir = os.path.join(os.path.dirname(UI_DIR), pkg)
         for name in sorted(os.listdir(pkg_dir)):
             if not name.endswith(".py"):

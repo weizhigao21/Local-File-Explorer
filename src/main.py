@@ -26,8 +26,8 @@ def _parse_args(argv):
         prog="本地资源管理器",
         description="本地资源管理器 / 音频播放器",
     )
-    parser.add_argument("--module", choices=("photo", "audio"), default=None,
-                        help="启动后直接进入指定模块")
+    parser.add_argument("--module", choices=("photo", "audio", "video", "web"), default=None,
+                        help="启动后直接进入指定模块（web = 手机访问控制台）")
     parser.add_argument("--player", action="store_true",
                         help="只打开独立播放器窗口（完整尺寸）")
     parser.add_argument("--play", nargs="+", default=[], metavar="FILE",
@@ -46,19 +46,19 @@ def _input_files(args):
     return list(args.play) + list(args.files)
 
 
-def _play_files(files, playback, player):
-    """把文件/文件夹展开成队列并开始播放；返回是否有内容可播"""
-    tracks = tracks_from_paths(files)
-    if not tracks:
-        return False
-    playback.play_tracks(tracks, 0)
-    player.show_player()
-    return True
+def _play_files(files, player):
+    """把文件/文件夹展开成队列并交给播放器；返回是否有动作被执行
+
+    去重与「已经开着」的显色提示由 PlayerWindow.open_tracks() 统一负责。
+    这里绝不能自己 play_tracks —— 每次从资源管理器再打开同一个音频都会
+    重建队列、从头播放，把用户当前的进度冲掉。
+    """
+    return player.open_tracks(tracks_from_paths(files))
 
 
-def _apply_args(args, launcher, player, playback):
+def _apply_args(args, launcher, player):
     """按参数执行动作；返回是否有动作被执行"""
-    if _play_files(_input_files(args), playback, player):
+    if _play_files(_input_files(args), player):
         return True
     if args.player:
         player.show_player()
@@ -139,6 +139,17 @@ def main():
             SystemIntegrationDialog(player).exec()
 
         launcher.systemRequested.connect(open_system_settings)
+        launcher.webRequested.connect(lambda: launcher.open_module("web"))
+
+        # 配置里勾了「随程序启动」就在这里先把服务拉起来：窗口不打开也能用手机访问
+        if getattr(config, "WEB_AUTO_START", False):
+            from web_server import WebServerError, get_server
+
+            try:
+                port = get_server().start()
+                print(f"[网页服务] 随程序启动，端口 {port}")
+            except WebServerError as e:
+                print(f"[网页服务] 自动启动失败：{e}")
 
     # 关掉最后一个窗口就退出（不再挂托盘常驻进程）。
     app.setQuitOnLastWindowClosed(True)
@@ -148,7 +159,7 @@ def main():
         print("[热键] 全局热键注册失败（可能被其他程序占用），窗口内快捷键仍可用")
 
     def handle_remote(argv):
-        _apply_args(_parse_args(argv), launcher, player, playback)
+        _apply_args(_parse_args(argv), launcher, player)
 
     instance.messageReceived.connect(handle_remote)
 
@@ -157,10 +168,15 @@ def main():
         hotkeys.unregister()
         player.shutdown()
         reset_playback_controller()
+        # 网页服务是守护线程，进程退出本也会结束；显式停一次让端口立刻释放，
+        # 否则刚关掉程序就重新打开会撞「端口被占用」
+        from web_server import get_server
+
+        get_server().stop()
 
     app.aboutToQuit.connect(cleanup)
 
-    if not _apply_args(cli_args, launcher, player, playback):
+    if not _apply_args(cli_args, launcher, player):
         launcher.show()
     return app.exec()
 

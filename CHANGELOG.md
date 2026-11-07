@@ -4,6 +4,131 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.9.0] - 2026-11-07
+
+手机 / 平板访问上线：电脑上点一下「📱 手机访问」，同一个 Wi-Fi 下用浏览器就能
+听音乐、看写真、看视频，不用装 App。
+
+### 新增
+- **服务层 `web_server/`（纯 Python，禁止 Qt）**：
+  - `app.py`：标准库 `ThreadingHTTPServer` + 路由表；Cookie / Query / Header 三通道令牌鉴权；
+    媒体按 Range 流式（206 / 416 / HEAD / ETag 304）；mkv、avi 等浏览器不认的容器用 ffmpeg
+    转封装成 fMP4 管道直出（只转封装不重编码画面，音频统一转 AAC）。
+  - `http_util.py`：Range 解析、MIME 表、静态路径归属校验（防目录穿越）、字幕转 WebVTT。
+  - `library.py`：三个模块的只读数据视图；缺封面时按需生成（写真用 PIL、视频用 ffmpeg）；
+    图片 `?w=` 缩放结果缓存到 `data/web_cache`。
+  - `static/`：`index.html` + `app.js` + `style.css`，hash 路由、深色沉浸主题、
+    移动端 safe-area 适配、输入框 16px（防 iOS 自动放大）。
+- **网页端能力**：
+  - 写真：作者筛选、作品卡墙、图片网格、全屏看图（左右滑动 / 点按半屏翻页、相邻图预加载）。
+  - 音频：歌单层级、曲目列表、底部播放条（进度、上下首、0.75×–2×）、
+    字幕按时间轴同步显示、Media Session 锁屏控制。
+  - 视频：作者 / 作品 / 视频列表、原生播放器、续播点与桌面共用（每 10 秒 + 暂停 + 关页落库）、
+    播完自动下一集、容器不支持时一键转封装试播。
+- **桌面端控制窗口 `ui/server_window.py`**：运行状态、局域网地址、复制链接、浏览器预览、
+  端口与「仅本机」开关、令牌重置；启动器顶部新增「📱 手机访问」；`--module web` 可直达。
+- **配置**：`WEB_PORT` / `WEB_TOKEN` / `WEB_ALLOW_LAN` / `WEB_AUTO_START`。
+
+### 安全
+- 媒体只按数据库 id 暴露，前端传不进任何路径；静态资源按 `commonpath` 校验归属。
+- 令牌用 `hmac.compare_digest` 比较，支持 `?t=` / Cookie / `X-Token`；首次带 `t` 访问顺手种一年期 Cookie。
+- CSP 只允许同源脚本与媒体，禁止外链。
+
+### 顺手修掉的坑
+- **控制窗口点 ✕ 关掉后启动器不回来**（`closeEvent` 只停了状态刷新计时器，漏了通知启动器，
+  关窗后桌面空无一物、看着像程序退了）→ 关窗时把启动器叫回前台；服务照旧不停。
+- `[hidden]` 被 `.tabs{display:flex}` 盖掉 → 首页仍显示标签栏、详情页仍显示搜索按钮；
+  加 `[hidden]{display:none!important}` 统一兜底。
+- 播放条半透明导致下面的曲目行透出来 → 改实色，并把倍速收进第二行，窄屏标题不再被截断。
+- `author_id` 缺省被当成 0 去查，首页永远是空列表 → 缺省转 `None`。
+- Range `bytes=-0` 假装成功、`bytes=--5` 被当成越界 → 分别按 416 / 忽略处理。
+
+### 测试
+- 新增 `tests/test_web_server.py`（86 项）：Range 参数化（含 416、格式错误、多段）、MIME、
+  静态路径穿越、VTT 转换、可播性判断、令牌生成与持久化、三模块数据视图、封面按需生成、
+  端到端 401 / 200+Cookie / 206 / 416 / 304 / HEAD / 穿越 404 / 进度上报，
+  以及前端资源守卫（index 引用、`[hidden]` 规则、播放条实色）。
+- 「核心层禁 Qt」守卫纳入 `web_server`。
+- **531 passed**（原 445 + 新增 86），ruff 干净。
+
+## [v1.8.19] - 2026-11-07
+
+启动器里的第三张卡「视频」不再是「开发中」：真正的视频库上线——作者/作品/视频三级结构、
+封面墙、内置播放器（续播 / 倍速 / 全屏 / 外部兜底）。
+
+### 新增
+- **核心层 `video_manager/`（纯 Python，禁止 Qt）**：
+  - `scanner.py`：根/作者/作品三级增量扫描，作品目录递归收集视频，按名称自然排序
+    （第 1、2、…、10 集）；空目录不入库；根目录读不到时抛错而不是把记录删空。
+  - `database.py`：`authors / works / videos / progress` 四表，沿用写真模块的
+    长连接 + `INSERT OR IGNORE` 回查主键范式；续播点按**文件路径**存，重新入库不丢。
+  - `probe.py`：ffprobe 读时长/分辨率/编码，ffmpeg 抽帧做封面；两者缺失都只降级不报错，
+    Windows 下带 `CREATE_NO_WINDOW` 不闪黑框，抽帧写临时文件再改名避免坏封面。
+  - `progress.py`：续播规则纯函数（`resume_position` / `decide_progress` /
+    `format_duration` / `next_index` / `should_keep_current_session`），窗口只调用不算数。
+- **UI 层**：`video_view.py`（作者侧栏 + 作品卡墙 + 视口懒加载 + 扫描状态条）、
+  `video_detail.py`（作品内视频列表：序号/已看进度/时长，双击或回车播放，右键可
+  用系统播放器打开 / 在资源管理器显示 / 重置进度）、`video_widgets.py`
+  （16:9 封面卡 + 时长角标 + 封面懒生成池 + 扫描线程 + 设置对话框）、
+  `video_player.py`（QtMultimedia 内置播放器）、`video_theme.py`（转发 theme_base 令牌）。
+- **内置播放器**：`play_list(videos, index)` 是唯一播放入口；同一视频重复打开只提窗；
+  每 5 秒/暂停/切换/关窗落一次续播点，看完自动清空；一集播完自动下一集；
+  倍速 0.5×–2×、音量、双击画面全屏（F11 / Esc）、空格与 ←/→/PgUp/PgDn 快捷键；
+  编码不支持时提示并给「用系统播放器打开」。
+- 启动器视频卡改为 `ready`，`--module video` 可直接进入；`config.json` 新增
+  `VIDEO_ROOT / VIDEO_RESUME / VIDEO_AUTOPLAY_NEXT / VIDEO_VOLUME / VIDEO_SPEED`。
+
+### 顺手修掉的坑
+- 详情页曾同时出现两个「返回」（顶栏一个、页内一个）→ 只保留页内那个。
+- 播放器刚载入时进度显示 `--:--` → 改为 `00:00`（`"--:--" 只表示时长未知`）。
+- 没有建表时读续播点会抛 `no such table: progress` 把播放器带崩 → 播放器自己
+  `init_db()`，且读写续播点全部吞掉 sqlite 错误退化成「从头播」。
+
+### 测试
+- 新增 `tests/test_video_core.py`（46 项）：扩展名白名单、三级扫描、自然排序、
+  增量增删、空作品跳过、取消不误删、封面路径稳定性、续播/看完/时长格式化、
+  `decide_progress` 三态决策、续播点按路径存活与 `update_video_duration` 只补空值。
+- 新增 `tests/test_video_ui.py`（17 项）：启动器视频卡为 ready、卡片标题走
+  `truncate_title` 且不越界、时长角标是真胶囊且在封面内、播放器唯一入口与唯一换源、
+  窗口 QSS 必须用 `#objectName`、`QFrame {}` 禁用、详情行高不许裁字、两个窗口冒烟。
+- `test_ui_theme.py` 的令牌单一来源与「核心层禁 Qt」守卫纳入 `video_theme` / `video_manager`。
+- **445 passed**（新增 63 项，基线 382），ruff 干净；离屏截图验证卡片墙/详情页/播放器布局，
+  抽帧封面与续播（保存 4.5s → 重开从 00:04 继续）实测通过。
+
+## [v1.8.18] - 2026-11-06
+
+正在播放 A 时反复打开同一个音频：不再重建队列、不再从头播、不再开出第二个窗口，
+只把已经开着的播放器提到前面并**闪一轮赤陶色描边 + 提示条**「该音频已打开 · 已切回窗口」。
+
+### 根因
+- 四条「打开音频」入口（命令行/文件关联、二次启动转发、窗口内「打开文件…」、拖放）
+  都各自调用 `playback.play_tracks(tracks, 0)` + `show_player()`。只要再打开一次同一个
+  文件，就会把当前进度冲掉并重新顶起窗口 —— 用户看到的「重复打开」其实是重复开播。
+- 冷启动竞态：打包版解压要 1~3 秒，两个进程可能同时探测不到对方。旧
+  `SingleInstance.start()` 在 `QLocalServer.listen()` 失败时仍「按主实例继续运行」，
+  于是两个进程都建界面，真的会各开一个播放窗。
+
+### 修复
+- 新增 `PlayerWindow.open_tracks(tracks)` 作为**唯一**打开入口：先把路径规范化成判定键
+  （忽略大小写 / 相对路径前缀），与当前曲目、当前队列比对；命中且媒体仍在播放/暂停时
+  只 `show_player()` + `flash_attention()`，否则照常换队列开播。`main.py` 不再直接
+  `play_tracks`；打开文件对话框与拖放也改走它。
+- 显色提示：整窗 3px 赤陶描边 + 顶部提示条，亮 180ms / 灭 140ms 闪 3 轮自动复原。
+  高亮层用 `#objectName` 选择器、`WA_TransparentForMouseEvents`（点击照样穿透）、
+  不透明底色；`resizeEvent` 里跟着 central 铺满，迷你态也可见。
+- `PlaybackController.is_active`（播放或暂停）参与判定：`clear()` / 文件缺失导致开播
+  失败时不能把旧队列误判成「已经开着」，否则用户再也打不开这个文件。
+- `app_instance` 加 Windows 命名互斥体（内核持有、崩溃自动释放）。`listen()` 失败时
+  带重试把参数转给赢家并退出，不再两个进程都当主实例；非 Windows / API 失败自动
+  退回原来的 socket 探测，不阻塞启动。
+
+### 测试
+- 新增 `tests/test_duplicate_open.py`（10 项）：路径规范化、同音频不重建队列并闪高亮、
+  不同音频仍替换、未激活/开播失败不误挡、高亮层鼠标穿透与自动复原、四条入口静态守卫、
+  `listen` 失败转发、互斥体按 key 隔离。
+- 离屏抓图像素验证：窗边与提示条采样从 `#F4EFE7` / `#E5DBCA` 变成 `#B85C3E`，
+  闪完完全复原；**382 passed**，ruff 干净。
+
 ## [v1.8.17] - 2026-10-31
 
 修「字幕滚动时旁边的滚动条上下抖动」。
