@@ -659,19 +659,31 @@ input[type="range"]::-moz-range-thumb {
 
 /* ---------------- 视频浮层 ---------------- */
 
+/* 视频浮层不靠 flex 撑高度，也不靠父容器的 bottom:0：
+   Android 7 的 WebView（Chrome 78 那一代）用独立 SurfaceView 渲染 <video>，
+   画面位置按文档流算，Fixed 容器里再套 flex 子项很容易错位——
+   实测现象就是「视频在列表最下面播，浮层没盖住屏幕」。
+   所以：浮层自己 fixed 铺满，<video> 也直接 fixed 铺满，两层各自独立定位。 */
 #video-overlay {
   position: fixed;
   top: 0;
-  right: 0;
-  bottom: 0;
   left: 0;
+  width: 100%;
+  height: 100%;
   z-index: 60;
   background: #000;
-  display: flex;
-  flex-direction: column;
+  display: block;
 }
 
 #video-overlay[hidden] { display: none; }
+
+/* 兜底：万一某个内核没把 fixed 当视口定位，至少把背后那些内容全收起来，
+   屏幕上只剩播放器——总比「视频跑到列表下面」强 */
+body.video-open #topbar,
+body.video-open #view,
+body.video-open #player,
+body.video-open #subtitle-line,
+body.video-open #toast { display: none !important; }
 
 .v-top {
   position: absolute;
@@ -710,11 +722,14 @@ input[type="range"]::-moz-range-thumb {
 }
 
 #video {
-  flex: 1;
+  position: fixed;
+  top: 0;
+  left: 0;
   width: 100%;
-  min-height: 0;
+  height: 100%;
   background: #000;
   object-fit: contain;
+  display: block;
 }
 
 .v-note {

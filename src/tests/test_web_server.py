@@ -772,3 +772,59 @@ def test_static_js_is_served_with_a_script_mime(tmp_path):
 
     assert http_util.guess_content_type("app.js").startswith("application/javascript")
     assert http_util.guess_content_type("style.css").startswith("text/css")
+
+
+def _css_rule(css, selector):
+    """取出某个顶层选择器的声明块（够用：只找第一个 `selector {`）"""
+    marker = selector + " {"
+    start = css.index(marker) + len(marker)
+    end = css.index("}", start)
+    return css[start:end]
+
+
+def test_video_overlay_is_viewport_fixed():
+    """Android 7 的 WebView 用独立图层渲染 <video>，按文档流算位置
+
+    只写 top/right/bottom/left 的 fixed 在个别机型上会被算成「页面最后一块」，
+    现象就是用户说的「视频在列表最下面播放」。浮层和 video 各自要 width/height 100%。
+    """
+    css = _static_text("style.css")
+    overlay = _css_rule(css, "#video-overlay")
+    assert "position: fixed" in overlay
+    assert "width: 100%" in overlay, "浮层必须有显式宽度，别指望 left/right 拉出来"
+    assert "height: 100%" in overlay, "浮层必须有显式高度，别指望 top/bottom 拉出来"
+
+    video = _css_rule(css, "#video")
+    assert "position: fixed" in video, "video 自己也要 fixed，不能靠父容器定位"
+    assert "width: 100%" in video and "height: 100%" in video
+    assert "flex:" not in video, "用 flex 撑高度在老 WebView 上算不出尺寸"
+
+
+def test_body_video_open_hides_page_behind_player():
+    """兜底：万一内核不认 fixed，屏上也只剩播放器，而不是「视频躲在列表下面」"""
+    css = _static_text("style.css")
+    for selector in (
+        "body.video-open #topbar",
+        "body.video-open #view",
+        "body.video-open #player",
+    ):
+        assert selector in css, f"缺少 {selector}，视频浮层盖不住背后的页面"
+
+    js = _static_text("app.js")
+    assert "classList.add('video-open')" in js, "打开视频时没给 body 加 video-open"
+    assert "classList.remove('video-open')" in js, "关闭视频时没摘掉 video-open"
+
+
+def test_app_js_forces_video_fullscreen_as_fallback():
+    """几何不对就地改内联样式——CSS 万一失效也能把画面拉回全屏"""
+    js = _static_text("app.js")
+    assert "function ensureVideoFullscreen(" in js
+    assert "getBoundingClientRect" in js
+    assert js.count("ensureVideoFullscreen();") >= 3, "打开、切集、转屏三处都要校正"
+
+
+def test_compat_ignores_injected_third_party_errors():
+    """小米/输入法会往页面注入脚本，它们自己报错不该弹红条吓用户"""
+    js = _static_text("compat.js")
+    assert "function isOurScript(" in js
+    assert "/static/" in js, "要靠 /static/ 判断报错是不是自家脚本发的"

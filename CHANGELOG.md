@@ -4,6 +4,30 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.9.3] - 2026-11-07
+
+### 修复
+- **平板上点开视频后，画面跑到「视频列表最下面」去播，没有盖住屏幕**。
+  Android 7 的 WebView（Chrome 78）用独立 SurfaceView 渲染 `<video>`，画面位置按文档流计算，
+  fixed 容器里再套一层 `display:flex` 子项时算不出正确坐标。
+  - `#video-overlay` 与 `#video` 改为**各自 `position: fixed` + `width/height: 100%`**，
+    不再靠父容器的 `bottom: 0` 或 `flex: 1` 撑尺寸。
+  - 新增 `body.video-open`：打开视频时把顶栏、列表、播放条、字幕行全部 `display: none`。
+    即使某个内核完全不认 fixed，屏幕上也只剩播放器，不会「视频躲在列表下面」。
+  - 新增 `ensureVideoFullscreen()`：打开 / 切集 / 转屏时量一次真实几何，
+    不对就写内联样式硬拉回全屏（同时 `console.warn` 出原始数据，方便排障）。
+- **底部红色错误条会挂在正常页面上**。`compat.js` 的 `window.onerror` 原来照单全收：
+  - 只处理来源含 `/static/` 的报错；小米输入法/浏览器注入脚本自己的异常忽略掉（原来会误报成我们的问题）。
+  - 界面已渲染出内容时，错误只进 `console.error`，不再弹条——能用的页面不该被提示条挡住。
+  - 提示条可点击收起，最多留 12 秒，并限制高度 45% 内滚动。
+- 搜索框取值加防御：老 WebView 的输入法组合事件偶发 `event.target.value` 为 `undefined`，
+  直接 `.trim()` 会抛 `Cannot read property 'trim' of undefined`。
+
+### 测试
+- 545 → 549：新增浮层几何守卫（`#video-overlay`/`#video` 必须 fixed + 100%）、
+  `body.video-open` 兜底守卫、`ensureVideoFullscreen` 调用点守卫、第三方报错过滤守卫；
+  三条均用注入式验证确认会红。
+
 ## [v1.9.2] - 2026-11-07
 
 ### 修复

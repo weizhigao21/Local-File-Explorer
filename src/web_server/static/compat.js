@@ -169,24 +169,66 @@
         'style',
         'position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:10px 12px;' +
           'background:#8c3b2f;color:#fff;font:12px/1.6 sans-serif;' +
-          'white-space:pre-wrap;word-break:break-all'
+          'white-space:pre-wrap;word-break:break-all;max-height:45%;overflow:auto'
       );
+      bar.title = '点一下收起';
+      bar.onclick = function () {
+        if (bar.parentNode) bar.parentNode.removeChild(bar);
+      };
       (document.body || document.documentElement).appendChild(bar);
     }
     bar.textContent =
       '页面没能正常显示：' + detail + '\n浏览器：' + navigator.userAgent;
+    // 提示条自己也会挡住底部内容，12 秒后自动收起
+    clearTimeout(showError.timer);
+    showError.timer = setTimeout(function () {
+      if (bar.parentNode) bar.parentNode.removeChild(bar);
+    }, 12000);
   }
 
-  window.onerror = function (message, source, line) {
+  /** 这条报错是不是我们自己的脚本发的
+   *
+   * Android 上不少浏览器/输入法会往页面里注入脚本，它们自己出错时
+   * window.onerror 照样会收到——那不是本页的问题，弹红条只会把人吓一跳。
+   */
+  function isOurScript(source) {
+    var text = String(source || '');
+    if (!text) return true; // 匿名（eval/inline）无法判断，当自己的处理
+    return text.indexOf('/static/') !== -1;
+  }
+
+  window.onerror = function (message, source, line, column) {
+    if (!isOurScript(source)) {
+      try {
+        console.warn('[外部脚本报错，已忽略]', message, source, line);
+      } catch (e) {
+        /* 没有 console 就算了 */
+      }
+      return false;
+    }
     var file = String(source || '').split('/').pop();
-    showError(String(message) + (file ? '（' + file + ':' + line + '）' : ''));
+    var where = file ? '（' + file + ':' + line + (column ? ':' + column : '') + '）' : '';
+    var detail = String(message) + where;
+    // 界面已经渲染出来了就别弹条：这条提示是给「整页空白」用的，
+    // 一个局部小错也把它挂到底部，只会挡住内容、让人以为页面坏了。
+    var view = document.getElementById('view');
+    if (view && view.children.length) {
+      try {
+        console.error('[页面局部报错]', detail);
+      } catch (e) {
+        /* ignore */
+      }
+      return false;
+    }
+    showError(detail);
     return false;
   };
 
   // 兜底：JS 若一声不响地没跑起来（例如更老的语法错误），6 秒后 #view 仍是空的
   setTimeout(function () {
     var view = document.getElementById('view');
-    if (view && !view.children.length) {
+    var bar = document.getElementById('compat-bar');
+    if (view && !view.children.length && !bar) {
       showError('界面没有渲染出来，可能是浏览器内核版本过旧');
     }
   }, 6000);

@@ -207,7 +207,9 @@
 
   let searchTimer = null;
   $('search-input').addEventListener('input', (event) => {
-    const value = event.target.value.trim();
+    // 老 WebView 的输入法组合事件偶发 target 不是 input，value 会取到 undefined
+    const raw = event && event.target ? event.target.value : '';
+    const value = String(raw === undefined || raw === null ? '' : raw).trim();
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       state.search = value;
@@ -987,12 +989,43 @@
     );
   }
 
+  /** 把 <video> 硬拉回全屏
+   *
+   * Android 7 那代 WebView 用独立图层渲染 <video>，个别机型按文档流定位，
+   * 画面就落到列表下方（用户看到的「视频在列表最下面播」）。
+   * 这里量一次真实几何，不对就写内联样式覆盖——CSS 生效时这段不会动手。
+   */
+  function ensureVideoFullscreen() {
+    const v = videoEl;
+    const style = window.getComputedStyle(v);
+    const rect = v.getBoundingClientRect();
+    const width = window.innerWidth || document.documentElement.clientWidth;
+    const height = window.innerHeight || document.documentElement.clientHeight;
+    const bad =
+      style.position !== 'fixed' ||
+      Math.abs(rect.top) > 1 ||
+      Math.abs(rect.left) > 1 ||
+      rect.width < width - 1 ||
+      rect.height < height - 1;
+    if (!bad) return;
+    v.style.position = 'fixed';
+    v.style.top = '0';
+    v.style.left = '0';
+    v.style.right = 'auto';
+    v.style.bottom = 'auto';
+    v.style.width = '100%';
+    v.style.height = '100%';
+    console.warn('[video] 播放器位置异常，已强制全屏', style.position, rect, width, height);
+  }
+
   async function openVideo(workId, videos, index) {
     const overlay = $('video-overlay');
     overlay.hidden = false;
     document.body.style.overflow = 'hidden';
+    document.body.classList.add('video-open');
     state.video.workId = workId;
     state.video.videos = videos;
+    ensureVideoFullscreen();
     await loadVideo(index);
   }
 
@@ -1020,6 +1053,7 @@
     } else {
       useRemux();
     }
+    ensureVideoFullscreen();
     videoEl.play().catch(() => {
       /* 自动播放被拦截时用户点一下即可 */
     });
@@ -1112,6 +1146,10 @@
     }
   });
 
+  window.addEventListener('resize', () => {
+    if (!$('video-overlay').hidden) ensureVideoFullscreen();
+  });
+
   window.addEventListener('pagehide', () => {
     if (!$('video-overlay').hidden && !state.video.remux) saveVideoProgress(true);
   });
@@ -1131,6 +1169,15 @@
     $('v-note').hidden = true;
     state.video.info = null;
     document.body.style.overflow = '';
+    document.body.classList.remove('video-open');
+    // 清掉 ensureVideoFullscreen() 写下的内联样式，别影响下一次
+    videoEl.style.position = '';
+    videoEl.style.top = '';
+    videoEl.style.left = '';
+    videoEl.style.right = '';
+    videoEl.style.bottom = '';
+    videoEl.style.width = '';
+    videoEl.style.height = '';
   }
 
   $('v-close').addEventListener('click', closeVideo);
