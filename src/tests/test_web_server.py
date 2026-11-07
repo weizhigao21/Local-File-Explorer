@@ -10,6 +10,7 @@
 import ast
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import wave
@@ -569,6 +570,25 @@ def test_index_references_existing_assets():
         assert os.path.isfile(os.path.join(STATIC_DIR, name)), f"{name} 不存在"
 
 
+def test_static_assets_carry_current_version():
+    """`?v=` 必须等于 APP_VERSION
+
+    服务端给静态资源 1 天缓存（max-age=86400）。版本号不变，平板升级后浏览器
+    会继续用缓存里的旧 app.js —— 看起来就是「明明修好了，平板上还是坏的」。
+    """
+    from resource_manager import config as app_config
+
+    html = _static_text("index.html")
+    refs = re.findall(r"/static/[A-Za-z0-9_.]+", html)
+    versions = re.findall(r"/static/[A-Za-z0-9_.]+\?v=([0-9.]+)", html)
+
+    assert refs, "index.html 没有引用任何静态资源"
+    assert len(versions) == len(refs), "有静态资源没带 ?v=，升级后会被浏览器缓存住"
+    assert all(v == app_config.APP_VERSION for v in versions), (
+        f"?v= 与 APP_VERSION({app_config.APP_VERSION}) 不一致：{sorted(set(versions))}"
+    )
+
+
 def test_css_hidden_rule_beats_flex_display():
     """`[hidden]` 会被 .tabs{display:flex} 盖掉——这条 !important 是修过的坑"""
     from web_server.app import STATIC_DIR
@@ -722,7 +742,9 @@ def test_app_js_has_no_object_spread():
 def test_compat_js_loads_before_app_js():
     """垫片必须在 app.js 之前执行，顺序反了等于没垫"""
     html = _static_text("index.html")
-    assert html.index("compat.js") < html.index("app.js"), "compat.js 必须排在 app.js 前面"
+    compat_at = html.index('src="/static/compat.js')
+    app_at = html.index('src="/static/app.js')
+    assert compat_at < app_at, "compat.js 必须排在 app.js 前面"
 
 
 def test_compat_defines_the_apis_old_webviews_lack():
