@@ -313,3 +313,104 @@ def test_update_video_duration_only_fills_blanks(library):
     db.update_video_duration(path, 1000)
     videos = db.get_work_videos(db.list_works()[0]["id"])
     assert videos[0]["duration_ms"] == 90000
+
+# ==================== 两层库：顶层文件夹本身就是作品 ====================
+
+def _make_flat(root, name, videos):
+    """根目录下直接就是一个剧集文件夹，视频躺在它里面（没有「作者」这一层）"""
+    folder = os.path.join(str(root), name)
+    os.makedirs(folder, exist_ok=True)
+    for video in videos:
+        open(os.path.join(folder, video), "wb").close()
+    return folder
+
+
+def test_two_level_library_treats_folder_as_work(library):
+    """根/剧集/第01集.mp4 —— 老逻辑把剧集当作者、再找子文件夹当作品，视频全被丢弃"""
+    _make_flat(library, "瑞克和莫蒂 第八季 (2025)", ["S08E01.mp4", "S08E02.mp4"])
+
+    stats = scanner.scan()
+
+    assert stats["added"] == 2
+    authors = db.list_authors()
+    assert [a["name"] for a in authors] == ["视频"], "两层库应由根目录名兜一个归集作者"
+    assert authors[0]["work_count"] == 1
+
+    works = db.list_works()
+    assert [w["name"] for w in works] == ["瑞克和莫蒂 第八季 (2025)"]
+    assert [v["name"] for v in db.get_work_videos(works[0]["id"])] == [
+        "S08E01.mp4", "S08E02.mp4",
+    ]
+
+
+def test_mixed_two_and_three_level_library(library):
+    """同一个根目录里既有三层（社团/作品）又有两层（剧集），两边都要入库"""
+    _make_work(library, "社团A", "作品一", ["1.mp4"])
+    _make_flat(library, "单剧集合", ["第01集.mp4"])
+
+    scanner.scan()
+
+    authors = {a["name"]: a for a in db.list_authors()}
+    assert set(authors) == {"社团A", "视频"}
+    assert authors["社团A"]["work_count"] == 1
+    assert authors["视频"]["work_count"] == 1
+    assert db.count_videos() == 2
+
+
+def test_videos_directly_in_root_become_a_work(library):
+    """根目录自己躺着一堆视频：没有子文件夹也不能整批丢掉"""
+    for name in ("第01集.mp4", "第02集.mp4"):
+        open(os.path.join(str(library), name), "wb").close()
+
+    stats = scanner.scan()
+
+    assert stats["added"] == 2
+    works = db.list_works()
+    assert [w["name"] for w in works] == ["视频（根目录）"]
+    assert works[0]["video_count"] == 2
+
+
+def test_flat_work_rescan_and_delete(library):
+    """两层作品同样走增量：二次扫描不重复、删目录后作品跟着消失"""
+    folder = _make_flat(library, "剧集", ["1.mp4"])
+    scanner.scan()
+
+    stats = scanner.scan()
+    assert stats["added"] == 0
+    assert stats["skipped"] == 1
+
+    open(os.path.join(folder, "2.mp4"), "wb").close()
+    assert scanner.scan()["added"] == 1
+
+    import shutil
+
+    shutil.rmtree(folder)
+    stats = scanner.scan()
+    assert stats["deleted_works"] == 1
+    assert db.count_videos() == 0
+
+
+def test_folder_previously_indexed_as_author_is_reclaimed(library):
+    """老版本把这个文件夹记成了「作者」（0 个作品）：重扫要纠正，作者记录得清掉"""
+    _make_flat(library, "剧集", ["1.mp4"])
+    db.add_author("剧集")
+
+    scanner.scan()
+
+    assert [a["name"] for a in db.list_authors()] == ["视频"]
+    assert [w["name"] for w in db.list_works()] == ["剧集"]
+    assert db.count_videos() == 1
+
+
+def test_count_authors_matches_scanned_units(library):
+    """进度条总数（count_authors）必须等于实际扫描单元数，否则进度永远到不了 100%"""
+    _make_work(library, "社团A", "作品一", ["1.mp4"])
+    _make_flat(library, "剧集", ["1.mp4"])
+    open(os.path.join(str(library), "根部.mp4"), "wb").close()
+
+    assert scanner.count_authors() == 3
+
+    seen = []
+    scanner.scan(progress_callback=lambda kind, name, *_args: seen.append(name)
+                 if kind == "author" else None)
+    assert len(seen) == 3

@@ -1,5 +1,15 @@
 """视频库增量扫描（根目录/作者/作品/视频文件，纯 Python）
 
+层级判定规则（v1.9.1）：
+    **顶层目录自己直接躺着视频 → 它本身就是「作品」**；否则它当「作者」，往下找作品。
+    所以三种库结构都能用：
+      根/剧集/第01集.mp4          → 剧集 = 作品（归到以根目录名命的「归集作者」下）
+      根/社团/作品/第01集.mp4      → 社团 = 作者，作品 = 作品
+      根/第01集.mp4               → 根目录自己当一个作品
+    老逻辑只认三层，两层库（很常见）里的视频会被整批静默丢弃。
+    代价：若某个「作者」目录里既有子文件夹、又直接躺着视频，会被合并成一个作品
+    （宁可在卡片上看到全部，也不要悄悄少几个文件）。
+
 与写真模块的扫描同一套心智，差别只有两点：
 1. 视频的「一张图」是多个视频文件，缩略图要等 ffmpeg 抽帧，所以扫描阶段**只记
    封面路径不生成图**（生成交给 UI 的懒加载池，滚动到才抽，首扫不再卡几分钟）；
@@ -39,10 +49,53 @@ def count_authors():
     root = config.VIDEO_ROOT
     if not os.path.isdir(root):
         return 0
-    return sum(
+    total = sum(
         1 for name in os.listdir(root)
         if os.path.isdir(os.path.join(root, name))
     )
+    if _loose_videos(root):
+        total += 1  # 根目录自己躺着的视频也算一个扫描单元
+    return total
+
+
+def _loose_videos(path):
+    """目录**顶层**的视频文件（不进子目录），按路径自然排序
+
+    用途只有一个：判断「这个目录本身是不是一个作品」。
+    常见于「根/剧集名/第01集.mp4」这种两层库——顶层目录下面直接就是视频，
+    它没有子文件夹可以当作品，按老逻辑整批视频会被静默丢掉。
+    """
+    videos = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False) and is_video(entry.path):
+                        stat = entry.stat()
+                        videos.append(
+                            (entry.path, entry.name, int(stat.st_mtime), int(stat.st_size))
+                        )
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    videos.sort(key=lambda item: natural_key(item[0]))
+    return videos
+
+
+def _flat_author_name(root):
+    """两层库没有「作者」这一层，用一个归集作者把作品挂住
+
+    名字取根目录自己的名字（如「动漫」），比「未分类」更有信息量；
+    根目录是盘符（"F:\\"）时 basename 为空，退化成「未分类」。
+    """
+    name = os.path.basename(os.path.normpath(root)).strip()
+    return name or "未分类"
+
+
+def _root_work_name(root):
+    """根目录自身作为作品时的名字（根目录直接放了一堆视频的情况）"""
+    return f"{_flat_author_name(root)}（根目录）"
 
 
 def _collect_videos(work_path):
@@ -201,6 +254,72 @@ def _scan_author(author_name, author_path, stats, progress_callback, cancel_even
         )
 
 
+def _sync_flat_works(author_name, items, stats, progress_callback, cancel_event,
+                     author_count, total_authors):
+    """把「本身就是作品」的顶层目录收进归集作者下
+
+    items: [(work_name, work_path), ...]
+    与 `_scan_author` 同一套增量语义，差别只在作品不是「作者目录的子目录」，
+    而是顶层目录本身。
+    """
+    author_id = db.get_author_id(author_name)
+    if author_id is None:
+        author_id = db.add_author(author_name)
+
+    existing_works = db.list_works_by_author(author_id)
+    disk_work_paths = set()
+    new_works = []
+
+    for work_name, work_path in items:
+        if cancel_event and cancel_event.is_set():
+            return
+
+        try:
+            current_videos, read_errors = _collect_videos(work_path)
+        except OSError as e:
+            print(f"[扫描作品跳过] 无法读取 {work_path}: {e}")
+            disk_work_paths.add(work_path)
+            continue
+        except Exception as e:  # noqa: BLE001 - 单个作品异常不能中断整轮扫描
+            print(f"[扫描作品失败] {work_path}: {e}")
+            traceback.print_exc()
+            disk_work_paths.add(work_path)
+            continue
+
+        if read_errors:
+            disk_work_paths.add(work_path)
+        if not current_videos:
+            continue
+
+        disk_work_paths.add(work_path)
+
+        if work_path in existing_works:
+            work_id, _, _ = existing_works[work_path]
+            _sync_work_videos(work_id, current_videos, stats, allow_delete=(read_errors == 0))
+        else:
+            new_works.append(
+                (work_name, work_path, thumbnail_path(work_path), current_videos)
+            )
+            stats["added"] += len(current_videos)
+
+        if progress_callback:
+            progress_callback(
+                "work", author_name, work_name, len(current_videos),
+                author_count, total_authors,
+            )
+
+    for work_path, (work_id, _, _) in existing_works.items():
+        if work_path not in disk_work_paths:
+            db.delete_work(work_id)
+            stats["deleted_works"] += 1
+
+    if new_works:
+        db.add_author_with_works(author_name, new_works)
+        stats["probed"] += _probe_new_videos(
+            [row for _, _, _, videos in new_works for row in videos]
+        )
+
+
 def _gc_thumbnails():
     """清理孤儿封面：VIDEO_THUMB_DIR 下数据库未引用的 .jpg"""
     if not os.path.isdir(config.VIDEO_THUMB_DIR):
@@ -257,34 +376,68 @@ def scan(progress_callback=None, author_done_callback=None, cancel_event=None,
         except OSError as e:
             raise FileNotFoundError(f"无法读取视频目录 {root}: {e}") from e
 
+        # 先把每个顶层目录分类：自己就躺着视频的算「作品」，否则算「作者往下找作品」。
+        # 不分类直接当作者，两层库（根/剧集/第01集.mp4）会一个视频都进不了库。
+        units = []
         for author_name in author_dirs:
+            author_path = os.path.join(root, author_name)
+            if not os.path.isdir(author_path):
+                continue
+            units.append(("work" if _loose_videos(author_path) else "author",
+                          author_name, author_path))
+
+        flat_author = _flat_author_name(root)
+        if _loose_videos(root):
+            units.append(("work", _root_work_name(root), root))
+
+        flat_items = []
+        for kind, unit_name, unit_path in units:
             if cancel_event and cancel_event.is_set():
                 cancelled = True
                 break
 
-            author_path = os.path.join(root, author_name)
-            if not os.path.isdir(author_path):
-                continue
-
             author_count += 1
-            disk_author_names.add(author_name)
 
+            if kind == "author":
+                disk_author_names.add(unit_name)
+                try:
+                    _scan_author(
+                        unit_name, unit_path, stats,
+                        progress_callback, cancel_event, author_count, total_authors,
+                    )
+                except Exception as e:  # noqa: BLE001 - 单作者失败不能中断整轮
+                    print(f"[扫描作者失败] {unit_name}: {e}")
+                    traceback.print_exc()
+            else:
+                # 归集作者必须提前登记，否则会被下面的「作者已消失」清理误删
+                disk_author_names.add(flat_author)
+                flat_items.append((unit_name, unit_path))
+
+            if author_done_callback:
+                author_done_callback(unit_name, 0)
+            if progress_callback:
+                progress_callback("author", unit_name, None, 0, author_count, total_authors)
+
+        if flat_items and not cancelled:
             try:
-                _scan_author(
-                    author_name, author_path, stats,
+                _sync_flat_works(
+                    flat_author, flat_items, stats,
                     progress_callback, cancel_event, author_count, total_authors,
                 )
             except Exception as e:  # noqa: BLE001 - 单作者失败不能中断整轮
-                print(f"[扫描作者失败] {author_name}: {e}")
+                print(f"[扫描作者失败] {flat_author}: {e}")
                 traceback.print_exc()
-
-            if author_done_callback:
-                author_done_callback(author_name, 0)
-            if progress_callback:
-                progress_callback("author", author_name, None, 0, author_count, total_authors)
 
         # 删除磁盘上已消失的作者：取消时不做，disk_author_names 只含遍历到的部分
         if not cancelled:
+            # 两层库的归集作者也在这里一并消失（最后一个剧集文件夹被删掉时）。
+            # 它的作品是被 delete_author 级联清掉的，不会经过 _sync_flat_works，
+            # 所以先按现有作品数把统计补上，否则界面提示永远是「删除 0 个作品」。
+            if flat_author not in disk_author_names:
+                flat_id = existing_authors.get(flat_author)
+                if flat_id is not None:
+                    stats["deleted_works"] += len(db.list_works_by_author(flat_id))
+
             for author_name, author_id in existing_authors.items():
                 if author_name not in disk_author_names:
                     db.delete_author(author_id)

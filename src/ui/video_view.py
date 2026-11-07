@@ -97,7 +97,7 @@ class VideoMainWindow(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        label = QLabel("作者列表")
+        label = QLabel("作者 / 分类")
         label.setStyleSheet(
             f"color: {TEXT_MUTED}; font-size: 11px; padding: 2px;"
             " background: transparent; border: none;"
