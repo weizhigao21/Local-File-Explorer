@@ -21,6 +21,7 @@ from audio_manager import database as audio_db
 from audio_manager import subtitles as audio_subtitles
 from resource_manager import config
 from resource_manager import database as photo_db
+from resource_manager.utils import natural_key as photo_natural_key
 from video_manager import database as video_db
 from video_manager import probe
 from video_manager import scanner as video_scanner
@@ -60,20 +61,91 @@ def _lock_for(key):
         return lock
 
 
+_local = threading.local()
+
+# 一个请求要发好几条 SQL，而「新建连接 → 查 → 关闭」每次要 3~4 ms，
+# 实测这才是列表接口的主要开销（查询本身 0.15 ms）。按线程复用连接后，
+# 音频列表 21 ms → 3 ms，总览也顺带从 26 ms 掉到个位数。
+# ThreadingHTTPServer 每条连接一个线程，连接寿命跟着请求走，不会无限增长。
+_conn_guard = threading.Lock()
+_conn_threads: set = set()      # 持有连接缓存的线程（只用于限流）
+CONN_THREADS_MAX = 24
+
+
+def _db_path(db_module):
+    """各库的 sqlite 路径（读取当时的 config，测试换临时目录也能跟上）"""
+    path = getattr(db_module, "DB_PATH", "")
+    if path:
+        return str(path)
+    name = getattr(db_module, "__name__", "")
+    if name.startswith("resource_manager"):
+        return config.DB_PATH
+    if name.startswith("video_manager"):
+        return config.VIDEO_DB_PATH
+    return ""
+
+
+def _conn(db_module):
+    """取本线程该库的连接；超出上限就返回 None，调用方退回短连接"""
+    path = _db_path(db_module)
+    if not path:
+        return None
+    store = getattr(_local, "conns", None)
+    if store is None:
+        with _conn_guard:
+            # 线程退出后 ident 还留在集合里，顺手按当前存活线程清一遍
+            _conn_threads.intersection_update(
+                {thread.ident for thread in threading.enumerate()}
+            )
+            if len(_conn_threads) >= CONN_THREADS_MAX:
+                return None
+            _conn_threads.add(threading.get_ident())
+        store = _local.conns = {}
+    conn = store.get(path)
+    if conn is not None:
+        return conn
+    try:
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        # 桌面端同时在扫描/写进度时，读到写事务中间态不该直接报 database is locked，
+        # 等一会儿就过去了（WAL 下读不阻塞写，这里保险起见）
+        conn.execute("PRAGMA busy_timeout = 3000")
+    except sqlite3.Error:
+        return None
+    store[path] = conn
+    return conn
+
+
 def _rows(db_module, sql, params=()):
-    with db_module.get_conn() as conn:
-        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    conn = _conn(db_module)
+    if conn is None:
+        with db_module.get_conn() as short:
+            return [dict(row) for row in short.execute(sql, params).fetchall()]
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
 def _row(db_module, sql, params=()):
-    with db_module.get_conn() as conn:
-        row = conn.execute(sql, params).fetchone()
-        return dict(row) if row else None
+    conn = _conn(db_module)
+    if conn is None:
+        with db_module.get_conn() as short:
+            row = short.execute(sql, params).fetchone()
+            return dict(row) if row else None
+    row = conn.execute(sql, params).fetchone()
+    return dict(row) if row else None
 
 
 def _count(db_module, table):
     row = _row(db_module, f"SELECT COUNT(*) AS c FROM {table}")
     return int(row["c"]) if row else 0
+
+
+def _scalar(db_module, sql, params=()):
+    """单值查询（COUNT 之类），查不到按 0 返回"""
+    row = _row(db_module, sql, params)
+    if not row:
+        return 0
+    value = next(iter(row.values()), 0)
+    return int(value or 0)
 
 
 def _basename(path):
@@ -86,10 +158,12 @@ def _basename(path):
 PAGE_DEFAULT = 60
 PAGE_MAX = 200
 
+# 作品内图片页：卡片更密，一页给两倍，滚到底续页时少发几次请求
+IMAGE_PAGE_DEFAULT = 120
 
-def _paged(items, page, page_size):
-    """内存分页：返回 items / total / page / pages，page_size<=0 时按默认值"""
-    total = len(items)
+
+def _page_args(page, page_size):
+    """把请求参数钳成 (page, page_size)；非法值落回默认"""
     try:
         page = max(int(page or 1), 1)
     except (TypeError, ValueError):
@@ -98,16 +172,27 @@ def _paged(items, page, page_size):
         page_size = int(page_size or PAGE_DEFAULT)
     except (TypeError, ValueError):
         page_size = PAGE_DEFAULT
-    page_size = min(max(page_size, 1), PAGE_MAX)
-    start = (page - 1) * page_size
+    return page, min(max(page_size, 1), PAGE_MAX)
+
+
+def _page_result(items, total, page, page_size):
+    """拼出前端统一的分页响应（内存分页与 SQL 分页共用）"""
     return {
-        "items": items[start:start + page_size],
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
         # ceil：4 页 × 60 = 240 条也能在第 4 页装下 241 条
         "pages": max(1, -(-total // page_size)),
     }
+
+
+def _paged(items, page, page_size):
+    """内存分页：返回 items / total / page / pages，page_size<=0 时按默认值"""
+    total = len(items)
+    page, page_size = _page_args(page, page_size)
+    start = (page - 1) * page_size
+    return _page_result(items[start:start + page_size], total, page, page_size)
 
 
 def _exists(path):
@@ -224,11 +309,19 @@ def _photo_thumb_path(work_path):
     return os.path.join(config.THUMBNAIL_DIR, f"{digest}.jpg")
 
 
-def photo_work_images(work_id):
+def photo_work_images(work_id, page=1, page_size=0):
+    """作品内图片（分页）：一册写真可能两千多张，一次全吐会把手机端建满 DOM
+
+    实测最大的一册 2025 张 → 300KB JSON、约 1.2 万个节点，老平板上要卡好几秒。
+    改为按页拉，滚到底再续。
+    """
     work = photo_work(work_id)
     if not work:
         return None
-    images = photo_db.get_images_by_work(work_id)
+    order = _image_order(work_id)
+    total = len(order)
+    page, page_size = _page_args(page, page_size or IMAGE_PAGE_DEFAULT)
+    start = (page - 1) * page_size
     return {
         "work": {
             "id": work["id"],
@@ -237,18 +330,52 @@ def photo_work_images(work_id):
         },
         "images": [
             {
-                "id": img["id"],
-                "name": _basename(img["path"]),
-                "thumb": f"/media/photo/{img['id']}?w=640",
+                "id": img_id,
+                "thumb": f"/media/photo/{img_id}?w=640",
                 # 看图用的主图：1600 宽在手机/平板上已经超过屏幕像素密度所需，
                 # 体积却只有原图（常见 10~40MB）的几十分之一
-                "full": f"/media/photo/{img['id']}?w=1600",
+                "full": f"/media/photo/{img_id}?w=1600",
                 # 真要 100% 放大看细节时才点「原图」，按需加载
-                "orig": f"/media/photo/{img['id']}",
+                "orig": f"/media/photo/{img_id}",
             }
-            for img in images
+            for img_id in order[start:start + page_size]
         ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, -(-total // page_size)),
     }
+
+
+# 作品内图片顺序缓存：{work_id: (签名, [图片 id, ...])}
+# 自然排序（1,2,10 而不是 1,10,2）只能在 Python 里做，一册两千多张要排序 15 ms；
+# 分页后同一个作品会被连续请求十几次，这里按「行数 + 最大 mtime」判失效。
+_IMAGE_ORDER_CACHE: dict[int, tuple] = {}
+_IMAGE_ORDER_MAX = 64
+
+
+def _image_order(work_id):
+    """作品内图片 id 列表（自然排序），带缓存"""
+    signature = _row(
+        photo_db,
+        "SELECT COUNT(*) AS c, MAX(mtime) AS m FROM images WHERE work_id = ?",
+        (work_id,),
+    ) or {}
+    key = (int(signature.get("c") or 0), signature.get("m"))
+    cached = _IMAGE_ORDER_CACHE.get(work_id)
+    if cached and cached[0] == key:
+        return cached[1]
+
+    rows = _rows(
+        photo_db, "SELECT id, path FROM images WHERE work_id = ?", (work_id,)
+    )
+    # 与桌面一致的自然排序：1.jpg, 2.jpg, ..., 10.jpg
+    rows.sort(key=lambda row: photo_natural_key(row["path"]))
+    order = [int(row["id"]) for row in rows]
+    if len(_IMAGE_ORDER_CACHE) >= _IMAGE_ORDER_MAX:
+        _IMAGE_ORDER_CACHE.clear()
+    _IMAGE_ORDER_CACHE[work_id] = (key, order)
+    return order
 
 
 def photo_image_path(image_id):
@@ -306,95 +433,183 @@ def scaled_photo(path, width):
 
 # ==================== 音频 ====================
 
-def _playlist_cover(playlist, by_path, depth=0):
-    """歌单封面：自己没有就用最近一层父歌单的（与桌面 catalog 的继承规则一致）"""
-    cover = playlist.get("cover") or ""
-    if _exists(cover):
-        return cover
-    if depth >= 6:
-        return ""
-    parent = by_path.get(playlist.get("parent_path") or "")
-    if not parent:
-        return ""
-    return _playlist_cover(parent, by_path, depth + 1)
+# 歌单封面最多向上找几层（与桌面 catalog 的继承规则一致）
+_COVER_DEPTH = 6
+
+_PLAYLIST_COLS = "id, name, path, parent_path, cover, tags, track_count"
 
 
-def _playlist_brief(playlist, by_path, child_counts, track_counts):
+def _in_list(values):
+    """拼 SQL 的占位符；空列表由调用方提前返回"""
+    return ",".join("?" * len(values))
+
+
+def _inherited_covers(playlists):
+    """{歌单 id: 封面路径}，自己没有就沿 parent_path 向上继承最近一层
+
+    按「层」批量查：一页 60 个歌单往往同属一个父目录，逐条走父链要几百次查询，
+    这里每层只发一条 SQL，最多 6 层——而封面继承正是音频页最热的路径。
+    """
+    resolved = {}
+    pending = {}
+    for item in playlists:
+        cover = item.get("cover") or ""
+        if _exists(cover):
+            resolved[item["id"]] = cover
+        elif item.get("parent_path"):
+            pending[item["id"]] = item["parent_path"]
+
+    # 已经查过的父路径缓存起来：同一层里多个歌单共用一个父目录时只查一次，
+    # 但**不能**因为「查过」就跳过——上一层的父可能正是下一层要继续往上走的起点
+    cache = {}
+    for _ in range(_COVER_DEPTH):
+        if not pending:
+            break
+        missing = [p for p in set(pending.values()) if p and p not in cache]
+        if missing:
+            rows = _rows(
+                audio_db,
+                f"SELECT id, path, cover, parent_path FROM playlists "
+                f"WHERE path IN ({_in_list(missing)})",
+                tuple(missing),
+            )
+            for row in rows:
+                cache[row["path"]] = row
+
+        next_pending = {}
+        for playlist_id, parent_path in pending.items():
+            parent = cache.get(parent_path)
+            if not parent:
+                continue
+            cover = parent.get("cover") or ""
+            if _exists(cover):
+                resolved[playlist_id] = cover
+            elif parent.get("parent_path"):
+                next_pending[playlist_id] = parent["parent_path"]
+        pending = next_pending
+
+    return resolved
+
+
+def _track_counts(playlist_ids):
+    """{歌单 id: 曲目数}（只统计给定的这些歌单，不再全表 GROUP BY）"""
+    if not playlist_ids:
+        return {}
+    rows = _rows(
+        audio_db,
+        f"SELECT playlist_id, COUNT(*) AS c FROM tracks "
+        f"WHERE playlist_id IN ({_in_list(playlist_ids)}) GROUP BY playlist_id",
+        tuple(playlist_ids),
+    )
+    return {int(row["playlist_id"]): int(row["c"] or 0) for row in rows}
+
+
+def _child_counts(paths):
+    """{歌单路径: 子歌单数}"""
+    if not paths:
+        return {}
+    rows = _rows(
+        audio_db,
+        f"SELECT parent_path, COUNT(*) AS c FROM playlists "
+        f"WHERE parent_path IN ({_in_list(paths)}) GROUP BY parent_path",
+        tuple(paths),
+    )
+    return {row["parent_path"]: int(row["c"] or 0) for row in rows}
+
+
+def _playlist_briefs(playlists):
+    """把歌单行补成前端要的字段（曲目数/子集数/封面继承一次批量算完）"""
+    if not playlists:
+        return []
     # 以 tracks 表的实际行数为准：老库的 track_count 可能是 0（扫描器没回填），
     # 直接用会显示成「空歌单」，而点进去明明有歌。
-    return {
-        "id": playlist["id"],
-        "name": playlist["name"],
-        "track_count": int(track_counts.get(playlist["path"], playlist.get("track_count") or 0)),
-        "child_count": int(child_counts.get(playlist["path"], 0)),
-        "tags": playlist.get("tags") or "",
-        "cover": f"/media/audio-cover/{playlist['id']}",
-        "has_cover": bool(_playlist_cover(playlist, by_path)),
-        "parent_path": playlist.get("parent_path") or "",
-    }
+    track_counts = _track_counts([item["id"] for item in playlists])
+    child_counts = _child_counts([item["path"] for item in playlists])
+    covers = _inherited_covers(playlists)
+    return [
+        {
+            "id": item["id"],
+            "name": item["name"],
+            "track_count": int(track_counts.get(item["id"], item.get("track_count") or 0)),
+            "child_count": int(child_counts.get(item["path"], 0)),
+            "tags": item.get("tags") or "",
+            "cover": f"/media/audio-cover/{item['id']}",
+            "has_cover": bool(covers.get(item["id"])),
+            "parent_path": item.get("parent_path") or "",
+        }
+        for item in playlists
+    ]
 
 
 def audio_playlists(parent=""):
-    """指定层级下的歌单；parent="" 即顶层"""
-    playlists = audio_db.list_playlists()
-    by_path = {p["path"]: p for p in playlists}
-    child_counts = {}
-    for p in playlists:
-        key = p.get("parent_path") or ""
-        child_counts[key] = child_counts.get(key, 0) + 1
-
-    parent = parent or ""
-    items = [p for p in playlists if (p.get("parent_path") or "") == parent]
-    items.sort(key=lambda p: p["name"])
-    track_counts = _track_counts_by_path()
-    return [_playlist_brief(p, by_path, child_counts, track_counts) for p in items]
+    """指定层级下的全部歌单（parent="" 即顶层）"""
+    rows = _rows(
+        audio_db,
+        f"SELECT {_PLAYLIST_COLS} FROM playlists WHERE parent_path = ? ORDER BY name",
+        (parent or "",),
+    )
+    return _playlist_briefs(rows)
 
 
 def audio_playlists_page(parent="", page=1, page_size=0):
-    """分页版歌单列表（网页端用）"""
-    return _paged(audio_playlists(parent), page, page_size)
-
-
-def _track_counts_by_path():
-    """{歌单路径: 曲目数}（一次 GROUP BY，避免每个歌单查一遍）"""
+    """分页版歌单列表（网页端用）：SQL 里就切好页，不再把整库读进内存"""
+    parent = parent or ""
+    page, page_size = _page_args(page, page_size)
+    total = _scalar(
+        audio_db, "SELECT COUNT(*) AS c FROM playlists WHERE parent_path = ?", (parent,)
+    )
     rows = _rows(
         audio_db,
-        "SELECT p.path AS path, COUNT(t.id) AS c FROM playlists p "
-        "LEFT JOIN tracks t ON t.playlist_id = p.id GROUP BY p.id",
+        f"SELECT {_PLAYLIST_COLS} FROM playlists WHERE parent_path = ? "
+        f"ORDER BY name LIMIT ? OFFSET ?",
+        (parent, page_size, (page - 1) * page_size),
     )
-    return {row["path"]: int(row["c"] or 0) for row in rows}
+    return _page_result(_playlist_briefs(rows), total, page, page_size)
+
+
+def _playlist_row(playlist_id):
+    """单个歌单行（走本线程连接，封面列表页一次要请求几十个）"""
+    return _row(
+        audio_db,
+        f"SELECT {_PLAYLIST_COLS} FROM playlists WHERE id = ?",
+        (playlist_id,),
+    )
 
 
 def audio_playlist(playlist_id):
-    playlist = audio_db.get_playlist(playlist_id)
+    playlist = _playlist_row(playlist_id)
     if not playlist:
         return None
 
-    playlists = audio_db.list_playlists()
-    by_path = {p["path"]: p for p in playlists}
-    child_counts = {}
-    for p in playlists:
-        key = p.get("parent_path") or ""
-        child_counts[key] = child_counts.get(key, 0) + 1
+    children = _playlist_briefs(_rows(
+        audio_db,
+        f"SELECT {_PLAYLIST_COLS} FROM playlists WHERE parent_path = ? ORDER BY name",
+        (playlist["path"],),
+    ))
 
-    track_counts = _track_counts_by_path()
-    children = [
-        _playlist_brief(p, by_path, child_counts, track_counts)
-        for p in playlists
-        if (p.get("parent_path") or "") == playlist["path"]
-    ]
-    children.sort(key=lambda p: p["name"])
+    # 返回值里带上父歌单 id：网页端详情页的「返回上级」靠它，否则只能按系统返回键
+    parent_path = playlist.get("parent_path") or ""
+    parent = _row(
+        audio_db, "SELECT id FROM playlists WHERE path = ?", (parent_path,)
+    ) if parent_path else None
 
-    tracks = audio_db.list_tracks(playlist_id)
+    covers = _inherited_covers([playlist])
+    tracks = _rows(
+        audio_db,
+        "SELECT id, playlist_id, title, path, duration, track_number "
+        "FROM tracks WHERE playlist_id = ? ORDER BY track_number, title",
+        (playlist_id,),
+    )
     return {
         "playlist": {
             "id": playlist["id"],
             "name": playlist["name"],
             "tags": playlist.get("tags") or "",
             "cover": f"/media/audio-cover/{playlist['id']}",
-            "has_cover": bool(_playlist_cover(playlist, by_path)),
-            "parent_path": playlist.get("parent_path") or "",
-            "track_count": int(track_counts.get(playlist["path"], 0)),
+            "has_cover": bool(covers.get(playlist["id"])),
+            "parent_path": parent_path,
+            "parent_id": int(parent["id"]) if parent else 0,
+            "track_count": len(tracks),
         },
         "children": children,
         "tracks": [
@@ -419,12 +634,10 @@ def audio_track(track_id):
 
 
 def audio_cover_path(playlist_id):
-    playlist = audio_db.get_playlist(playlist_id)
+    playlist = _playlist_row(playlist_id)
     if not playlist:
         return ""
-    playlists = audio_db.list_playlists()
-    by_path = {p["path"]: p for p in playlists}
-    return _playlist_cover(playlist, by_path)
+    return _inherited_covers([playlist]).get(playlist["id"], "")
 
 
 def audio_subtitle_cues(track_id):

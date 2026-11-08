@@ -140,6 +140,16 @@ img { display: block; }
 
 .icon-btn:active { background: var(--card-hi); }
 
+/* 返回上级：只放图标，尺寸和有文字的按钮一致，拇指够得着 */
+.icon-btn.back {
+  margin-left: 0;
+  margin-right: 10px;
+  width: 34px;
+  padding: 0;
+}
+
+.icon-btn.back svg { width: 20px; height: 20px; }
+
 /* ---------------- 标签页 ---------------- */
 
 .tabs {
@@ -950,7 +960,9 @@ body.video-open #toast { display: none !important; }
   place-items: center;
   overflow: hidden;
   min-height: 0;
-  touch-action: pan-y;
+  /* 缩放/拖动全由自己处理：交给浏览器就会变成「整页放大」，顶栏也跟着变大，
+     而且手势冲突时翻页会失灵。none 之后捏合与单指拖动都归 JS。 */
+  touch-action: none;
 }
 
 .lb-stage img {
@@ -958,7 +970,13 @@ body.video-open #toast { display: none !important; }
   max-height: 100%;
   object-fit: contain;
   transition: opacity 0.18s ease;
+  transform-origin: center center;
+  will-change: transform;
 }
+
+/* 只有「切换倍速档」这类整段动画才加 transition：跟手拖动时必须零延迟，
+   否则手指划走了图还慢半拍 */
+.lb-stage img.zooming { transition: opacity 0.18s ease, transform 0.18s ease; }
 
 .lb-stage img.loading { opacity: 0.25; }
 

@@ -8,6 +8,7 @@
 不依赖 ffmpeg：封面抽帧用桩替换，测试机没装 ffmpeg 也能全绿。
 """
 import ast
+import gzip
 import json
 import os
 import re
@@ -1184,3 +1185,199 @@ def test_server_window_has_token_toggle():
         assert "require_token" in keyword_names, (
             f"start() 调用没传 require_token，关令牌开关会不生效: {ast.unparse(call)[:80]}"
         )
+
+
+# ==================== 分页与传输（v1.11.0） ====================
+
+def _insert_images(work_id, names, base):
+    with photo_db.get_conn() as conn:
+        for name in names:
+            conn.execute(
+                "INSERT OR IGNORE INTO images (work_id, path) VALUES (?, ?)",
+                (work_id, str(base / name)),
+            )
+
+
+def _app_source():
+    """读 web_server/app.py 源码：传输层行为光靠函数单测钉不住"""
+    from web_server.app import STATIC_DIR
+
+    path = os.path.join(os.path.dirname(STATIC_DIR), "app.py")
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _image_names(page):
+    return [os.path.basename(library.photo_image_path(item["id"])) for item in page["images"]]
+
+
+def test_photo_images_are_paged_in_natural_order(seeded):
+    """一册两千多张不能一次全吐：接口必须分页，且跨页顺序与桌面一致（1,2,10）"""
+    base = seeded["root"] / "册子"
+    photo_db.add_author_with_works("作者C", [("作品C", str(base), "", [])])
+    work_id = max(work["id"] for work in library.photo_works())
+    _insert_images(work_id, ["2.jpg", "10.jpg", "1.jpg"], base)
+
+    first = library.photo_work_images(work_id, 1, 2)
+    second = library.photo_work_images(work_id, 2, 2)
+    assert first["total"] == 3 and first["pages"] == 2
+    assert _image_names(first) == ["1.jpg", "2.jpg"]
+    assert _image_names(second) == ["10.jpg"]
+    assert library.photo_work_images(work_id, 3, 2)["images"] == []
+
+
+def test_photo_image_order_cache_sees_new_images(seeded):
+    """顺序缓存按「行数 + mtime」失效：新扫进来的图不能因为缓存而消失"""
+    base = seeded["root"] / "册子"
+    photo_db.add_author_with_works("作者C", [("作品C", str(base), "", [])])
+    work_id = max(work["id"] for work in library.photo_works())
+    _insert_images(work_id, ["1.jpg"], base)
+    assert library.photo_work_images(work_id, 1, 10)["total"] == 1
+
+    _insert_images(work_id, ["2.jpg"], base)
+    assert library.photo_work_images(work_id, 1, 10)["total"] == 2
+
+
+def test_photo_image_payload_has_no_unused_fields(seeded):
+    """前端只用 thumb/full/orig 和序号：文件名白占 40 字节/张，两千张就是 80KB"""
+    work_id = library.photo_works()[0]["id"]
+    image = library.photo_work_images(work_id)["images"][0]
+    assert set(image) == {"id", "thumb", "full", "orig"}
+
+
+def test_json_response_is_gzipped_when_client_accepts(server, seeded):
+    """列表 JSON 字段名大量重复，gzip 后只剩十分之一"""
+    _instance, port = server
+    work_id = library.photo_works()[0]["id"]
+    _insert_images(work_id, [f"extra{i:03d}.jpg" for i in range(40)], seeded["root"] / "extra")
+
+    status, headers, body = _get(
+        port, f"/api/photos/works/{work_id}/images?page_size=200", cookie=TOKEN,
+        headers={"Accept-Encoding": "gzip"},
+    )
+    assert status == 200
+    assert headers.get("Content-Encoding") == "gzip"
+    assert headers.get("Vary") == "Accept-Encoding"
+    data = json.loads(gzip.decompress(body).decode("utf-8"))
+    assert data["total"] >= 41
+
+
+@pytest.mark.parametrize("header,expected", [
+    ("gzip", True),
+    ("gzip, deflate, br", True),
+    ("deflate", False),
+    ("gzip;q=0", False),
+    ("", False),
+    (None, False),
+])
+def test_accepts_gzip(header, expected):
+    from web_server.app import _accepts_gzip
+
+    assert _accepts_gzip(header) is expected
+
+
+def test_token_cookie_is_httponly(server):
+    """前端从不读这个 cookie，加 HttpOnly 少一条被 XSS 拿走令牌的路"""
+    _instance, port = server
+    _status, headers, _body = _get(port, f"/?t={TOKEN}")
+    cookie = headers.get("Set-Cookie") or ""
+    assert "lrm_token=" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+
+
+def test_audio_playlist_reports_parent_id(seeded):
+    """子歌单要能退回父歌单：只给 parent_path 前端换不出上级链接"""
+    parent_id = audio_db.add_playlist("父歌单", str(seeded["root"] / "audio"))
+    children = {"name": "子歌单", "path": str(seeded["root"] / "audio" / "子歌单")}
+    child_id = audio_db.add_playlist(
+        children["name"], children["path"], parent_path=str(seeded["root"] / "audio")
+    )
+
+    detail = library.audio_playlist(child_id)
+    assert detail["playlist"]["parent_id"] == parent_id
+    assert library.audio_playlist(parent_id)["playlist"]["parent_id"] == 0
+
+
+def test_audio_playlists_page_does_not_scan_whole_table(seeded):
+    """按父路径直接取一页：老实现每次都把整库读进内存（2265 个歌单要 58 ms）"""
+    import inspect
+
+    source = inspect.getsource(library.audio_playlists_page)
+    assert "LIMIT ? OFFSET ?" in source
+    assert "list_playlists()" not in source, "不许再全表 list_playlists()"
+
+
+def test_media_supports_sendfile_with_fallback():
+    """大文件走零拷贝；平台不支持时必须有分块循环兜底，否则老系统上直接不发数据"""
+    from web_server.app import STATIC_DIR  # noqa: F401 - 触发模块导入
+
+    source = _app_source()
+    assert "sendfile" in source
+    assert "file_obj.read(min(http_util.CHUNK_SIZE, remaining))" in source
+
+
+def test_remux_is_single_flight():
+    """快速切集会同时起多个 ffmpeg，全都更慢——必须限成一次一路"""
+    source = _app_source()
+    assert "_REMUX_SLOTS.acquire(" in source
+    assert source.count("_REMUX_SLOTS.release()") == 2, "启动失败与 finally 各要放一次"
+
+
+# ==================== 前端守卫：分页 / 缩放 / 返回上级 ====================
+
+def test_photo_work_page_uses_paged_grid():
+    """作品内图片也必须分页：最大一册 2025 张，全量渲染要建一万多个节点"""
+    js = _static_text("app.js")
+    assert "pageSize: 120" in js
+    assert "onclick: () => openLightbox(wall, index)" in js, "浮层要拿到整册序号，不能只给本页序号"
+    assert "source.loadMore" in js, "翻到已加载末尾要能续页，否则最后一张翻不过去"
+
+
+def test_grid_auto_loads_on_scroll():
+    """滚到底自动续页：只剩「加载更多」按钮的话，用户会以为到底了"""
+    js = _static_text("app.js")
+    assert "function maybeAutoLoad(" in js
+    assert "window.addEventListener('scroll'" in js
+    assert "state.autoLoad" in js
+
+
+def test_lightbox_supports_pinch_and_double_tap_zoom():
+    """写真没有缩放等于没有细节：捏合与双击都要落在自己的 transform 上"""
+    js = _static_text("app.js")
+    css = _static_text("style.css")
+    assert "function zoomAt(" in js and "function resetZoom(" in js
+    assert "'pinch'" in js and "touchDistance(" in js
+    assert "touch-action: none" in css, "交给浏览器就会变成整页放大，顶栏跟着变大"
+    assert ".lb-stage img.zooming" in css, "切档位要动画，跟手拖动不能有延迟"
+
+
+def test_detail_pages_expose_back_button():
+    """iOS 加到主屏后没有返回键，详情页必须自带退路"""
+    html = _static_text("index.html")
+    js = _static_text("app.js")
+    assert 'id="back-btn"' in html
+    assert "backBtn.dataset.target" in js
+    assert "data.playlist.parent_id" in js, "子歌单要退回父歌单，不是直接回模块首页"
+
+
+def test_audio_cover_inherits_through_multiple_levels(seeded):
+    """三层继承：祖父有封面时，孙子也要拿到（按层批量查很容易在这里漏）"""
+    from PIL import Image
+
+    root = seeded["root"] / "audio" / "top"
+    cover = root / "cover.jpg"
+    os.makedirs(root, exist_ok=True)
+    Image.new("RGB", (60, 60), (30, 60, 90)).save(cover, "JPEG")
+
+    top = audio_db.add_playlist("顶层", str(root), cover=str(cover))
+    mid = audio_db.add_playlist("中层", str(root / "mid"), parent_path=str(root))
+    leaf = audio_db.add_playlist("底层", str(root / "mid" / "leaf"), parent_path=str(root / "mid"))
+
+    page = library.audio_playlists_page("", 1, 60)
+    by_id = {item["id"]: item for item in page["items"]}
+    assert by_id[top]["has_cover"] is True
+
+    leaf_brief = library.audio_playlist(mid)["children"][0]
+    assert leaf_brief["id"] == leaf
+    assert leaf_brief["has_cover"] is True, "封面只继承了一层，说明父链断了"

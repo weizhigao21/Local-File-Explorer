@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import gzip
 import hmac
 import json
 import os
@@ -38,6 +39,14 @@ MAX_JSON_BODY = 64 * 1024
 
 # 转发给 ffmpeg 的块大小
 RELAY_CHUNK = 64 * 1024
+
+# JSON 小于这个体积不值得压缩（gzip 头尾就有 20 字节）
+GZIP_MIN_BODY = 1024
+
+# 转封装同时只跑一个：快速切集会同时起好几个 ffmpeg，每个都在抢 CPU，
+# 结果是全都更慢、而且手机上半天出不来画面
+_REMUX_SLOTS = threading.Semaphore(1)
+REMUX_WAIT_SECONDS = 20
 
 # 列表接口默认分页：切换模块只拉一页，几万条也不会把手机端拖死
 DEFAULT_PAGE_SIZE = library.PAGE_DEFAULT
@@ -176,9 +185,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False
 
         if from_query:
-            # 从链接/二维码进来的：顺手种 cookie，后面 <img>/<video> 才能免参数加载
+            # 从链接/二维码进来的：顺手种 cookie，后面 <img>/<video> 才能免参数加载。
+            # HttpOnly：前端从不读这个值（靠 same-origin 自动带），关掉 XSS 拿令牌那条路。
             self._extra_headers.append(
-                ("Set-Cookie", f"{COOKIE_NAME}={token}; Path=/; Max-Age=31536000; SameSite=Lax")
+                ("Set-Cookie",
+                 f"{COOKIE_NAME}={token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax")
             )
         return True
 
@@ -213,14 +224,18 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _json(self, data, status=200, max_age=0):
         body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         cache = "no-store" if not max_age else f"private, max-age={max_age}"
-        self._send_headers(
-            status,
-            [
-                ("Content-Type", "application/json; charset=utf-8"),
-                ("Content-Length", str(len(body))),
-                ("Cache-Control", cache),
-            ],
-        )
+        headers = [
+            ("Content-Type", "application/json; charset=utf-8"),
+            # gzip 与否取决于请求头，缓存必须按它分开存
+            ("Vary", "Accept-Encoding"),
+            ("Cache-Control", cache),
+        ]
+        # 列表接口的字段名大量重复，gzip 收益极高：实测 300KB → 30KB（10%）
+        if len(body) >= GZIP_MIN_BODY and _accepts_gzip(self.headers.get("Accept-Encoding")):
+            body = gzip.compress(body, 6)
+            headers.append(("Content-Encoding", "gzip"))
+        headers.append(("Content-Length", str(len(body))))
+        self._send_headers(status, headers)
         if self.command != "HEAD":
             self.wfile.write(body)
 
@@ -286,8 +301,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             return None
 
         remaining = end - start + 1
+        sent = _sendfile(self, path, start, remaining)
+        remaining -= sent
+        if remaining <= 0:
+            return None
+
+        # sendfile 不可用（或对端中途断开）时退回分块读：剩下的照样发完
         with open(path, "rb") as file_obj:
-            file_obj.seek(start)
+            file_obj.seek(start + sent)
             while remaining > 0:
                 chunk = file_obj.read(min(http_util.CHUNK_SIZE, remaining))
                 if not chunk:
@@ -324,7 +345,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def api_photo_images(self, match, query):
-        data = library.photo_work_images(int(match.group(1)))
+        data = library.photo_work_images(
+            int(match.group(1)),
+            _int_param(query, "page", 1),
+            _int_param(query, "page_size", library.IMAGE_PAGE_DEFAULT),
+        )
         if data is None:
             return self._json({"error": "作品不存在"}, 404)
         return self._json(data, max_age=30)
@@ -468,6 +493,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not ffmpeg:
             return self._json({"error": "服务器未安装 ffmpeg，无法转封装"}, 503)
 
+        # 同一时刻只转一路：第二个请求排队等，等不到就明确告诉前端
+        if not _REMUX_SLOTS.acquire(timeout=REMUX_WAIT_SECONDS):
+            return self._json({"error": "正在转封装另一集，请稍后再试"}, 503)
+
         creationflags = 0
         if os.name == "nt":
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -491,19 +520,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                 creationflags=creationflags,
             )
         except OSError as e:
+            _REMUX_SLOTS.release()
             return self._json({"error": f"启动 ffmpeg 失败: {e}"}, 500)
 
         # 没有 Content-Length 的流式响应：告诉客户端「读到连接关闭为止」
         self.close_connection = True
-        self._send_headers(
-            200,
-            [
-                ("Content-Type", "video/mp4"),
-                ("Cache-Control", "no-store"),
-                ("Accept-Ranges", "none"),
-            ],
-        )
         try:
+            self._send_headers(
+                200,
+                [
+                    ("Content-Type", "video/mp4"),
+                    ("Cache-Control", "no-store"),
+                    ("Accept-Ranges", "none"),
+                ],
+            )
             while True:
                 chunk = proc.stdout.read(RELAY_CHUNK)
                 if not chunk:
@@ -518,6 +548,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 proc.stdout.close()
             with suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
+            _REMUX_SLOTS.release()
         return None
 
 
@@ -686,6 +717,44 @@ def _bind_error_message(error, port):
     if code in (10013, 13):
         return f"没有权限监听端口 {port}（1024 以下端口需要管理员权限）"
     return f"启动失败：{error}"
+
+
+def _accepts_gzip(header):
+    """客户端是否接受 gzip（只看 q=0 以外的情况，够用了）"""
+    for part in str(header or "").split(","):
+        pieces = part.split(";")
+        if pieces[0].strip().lower() != "gzip":
+            continue
+        for param in pieces[1:]:
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q" and value.strip().startswith("0"):
+                return False
+        return True
+    return False
+
+
+def _sendfile(handler, path, offset, count):
+    """把文件区间零拷贝推给 socket，返回实际发出的字节数
+
+    `socket.sendfile` 在内核态直接把文件页送到网络，省掉「读进 Python 再写出」
+    的两趟拷贝——传几 GB 的视频时 CPU 占用明显低一截。
+    平台不支持或对端中途断开时返回 0，调用方退回普通分块循环。
+    """
+    if count <= 0:
+        return 0
+    connection = getattr(handler, "connection", None)
+    sender = getattr(connection, "sendfile", None)
+    if sender is None:
+        return 0
+    try:
+        # 响应头还压在 wfile 的缓冲里，必须先推出去，
+        # 否则文件内容会排到响应头前面，客户端直接解析失败
+        handler.wfile.flush()
+        with open(path, "rb") as file_obj:
+            sent = sender(file_obj, offset, count)
+        return max(0, int(sent or 0))
+    except (OSError, ValueError):
+        return 0
 
 
 def _int_param(query, name, default=0):
