@@ -12,9 +12,9 @@
 <!-- 静态资源的 ?v= 必须跟着 APP_VERSION 走（tests/test_web_server.py 会校验）。
      服务端给静态资源 1 天缓存，平板升级后不清缓存就会继续跑旧 app.js，
      看起来像「明明修了还是坏的」。 -->
-<link rel="icon" href="/static/icon.svg?v=1.10.2" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/static/icon.svg?v=1.10.2">
-<link rel="stylesheet" href="/static/style.css?v=1.10.2">
+<link rel="icon" href="/static/icon.svg?v=1.10.3" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon.svg?v=1.10.3">
+<link rel="stylesheet" href="/static/style.css?v=1.10.3">
 <title>本地资源</title>
 </head>
 <body>
@@ -69,7 +69,16 @@
     <button type="button" class="v-close" id="v-close" aria-label="关闭"></button>
     <div class="v-title" id="v-title"></div>
   </div>
-  <video id="video" controls playsinline webkit-playsinline preload="metadata"></video>
+  <!-- 不用原生 controls：原生进度条每拖一格就提交一次 seek，长 GOP 片子
+       每次要 200ms 上下（见 app.js 里的说明）。这里自绘一条，松手才 seek。 -->
+  <video id="video" playsinline webkit-playsinline preload="metadata"></video>
+  <div class="v-controls" id="v-controls">
+    <button type="button" class="v-btn" id="v-play" aria-label="播放/暂停"></button>
+    <span class="v-time" id="v-pos">00:00</span>
+    <input type="range" id="v-seek" min="0" max="1000" step="1" value="0" aria-label="视频进度">
+    <span class="v-time" id="v-dur">--:--</span>
+    <button type="button" class="v-btn" id="v-full" aria-label="全屏"></button>
+  </div>
   <div class="v-note" id="v-note" hidden></div>
 </div>
 
@@ -89,7 +98,7 @@
 <div id="toast"></div>
 <audio id="audio" preload="metadata"></audio>
 
-<script src="/static/compat.js?v=1.10.2"></script>
-<script src="/static/app.js?v=1.10.2"></script>
+<script src="/static/compat.js?v=1.10.3"></script>
+<script src="/static/app.js?v=1.10.3"></script>
 </body>
 </html>

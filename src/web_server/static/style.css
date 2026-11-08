@@ -77,20 +77,26 @@ img { display: block; }
   height: var(--top-h);
   display: flex;
   align-items: center;
-  gap: 10px;
   padding: 0 14px;
 }
+
+/* flex 容器里的 `gap` 是 Chrome 84 才支持的；这台平板是 Android 7 + Chrome 78
+   内核，那一条会被整条忽略，表现为「所有控件挤成一团」。凡是原来用 gap 的
+   flex 行/列，一律换成相邻兄弟外边距——现代内核里间距完全一致，不会叠加。
+   （grid 的 gap 是 Chrome 66 就有的，不用动。） */
+.bar-row > * + * { margin-left: 10px; }
 
 .brand {
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 9px;
   font-size: 16px;
   font-weight: 650;
   letter-spacing: 0.02em;
   min-width: 0;
 }
+
+.brand > * + * { margin-left: 9px; }
 
 .brand-dot {
   width: 9px;
@@ -138,9 +144,11 @@ img { display: block; }
 
 .tabs {
   display: flex;
-  gap: 6px;
   padding: 0 12px 10px;
 }
+
+/* 三个 tab 都是 flex:1（basis 0），间距从自由空间里扣，宽度仍然严格三等分 */
+.tabs > * + * { margin-left: 6px; }
 
 .tabs button {
   flex: 1;
@@ -192,12 +200,13 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
 .section-title {
   display: flex;
   align-items: baseline;
-  gap: 8px;
   margin: 4px 2px 12px;
   font-size: 13px;
   color: var(--text-3);
   letter-spacing: 0.04em;
 }
+
+.section-title > * + * { margin-left: 8px; }
 
 .section-title strong { color: var(--text-2); font-size: 15px; font-weight: 600; }
 
@@ -208,7 +217,6 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
 .home-card {
   display: flex;
   align-items: center;
-  gap: 14px;
   padding: 18px 16px;
   border-radius: 16px;
   background: linear-gradient(135deg, var(--card) 0%, var(--bg-2) 100%);
@@ -216,6 +224,9 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
   text-align: left;
   width: 100%;
 }
+
+/* 必须放在 .home-go 之前：那条 margin-left:auto 要能盖住这里的兄弟间距 */
+.home-card > * + * { margin-left: 14px; }
 
 .home-card:active { border-color: var(--line-hi); }
 
@@ -242,12 +253,13 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
 
 .chips {
   display: flex;
-  gap: 8px;
   overflow-x: auto;
   padding: 0 2px 12px;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
 }
+
+.chips > * + * { margin-left: 8px; }
 
 .chips::-webkit-scrollbar { display: none; }
 
@@ -262,10 +274,11 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
   border: 1px solid var(--line);
   display: inline-flex;
   align-items: center;
-  gap: 6px;
 }
 
-.chip .count { color: var(--text-3); font-size: 11px; }
+/* 这个计数是 chip 的最后一个子节点，但 chip 的第一个子节点是文本节点，
+   `> * + *` 匹配不到匿名文本项，所以只能直接给这个 span 补间距 */
+.chip .count { color: var(--text-3); font-size: 11px; margin-left: 6px; }
 
 .chip.active {
   color: var(--accent-ink);
@@ -413,12 +426,13 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
 
 /* 列表行（曲目 / 视频） */
 
-.list { display: flex; flex-direction: column; gap: 8px; }
+.list { display: flex; flex-direction: column; }
+
+.list > * + * { margin-top: 8px; }
 
 .row {
   display: flex;
   align-items: center;
-  gap: 12px;
   width: 100%;
   padding: 12px 13px;
   border-radius: 12px;
@@ -426,6 +440,8 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
   border: 1px solid var(--line);
   text-align: left;
 }
+
+.row > * + * { margin-left: 12px; }
 
 .row:active { border-color: var(--line-hi); }
 .row.playing { border-color: rgba(212, 136, 106, 0.55); background: var(--card-hi); }
@@ -456,9 +472,11 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
   font-size: 11.5px;
   color: var(--text-3);
   display: flex;
-  gap: 8px;
   flex-wrap: wrap;
 }
+
+/* 换了行的话，第二行行首会多缩进 8px——比所有字段粘成一串好接受 */
+.row .sub > * + * { margin-left: 8px; }
 
 .row .dur {
   flex: none;
@@ -564,10 +582,11 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
 .p-controls {
   display: flex;
   align-items: center;
-  gap: 2px;
   grid-row: 1;
   grid-column: 3;
 }
+
+.p-controls > * + * { margin-left: 2px; }
 
 .p-controls button {
   width: 36px;
@@ -596,9 +615,10 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
   grid-column: 1 / -1;
   display: flex;
   align-items: center;
-  gap: 7px;
   min-width: 0;
 }
+
+.p-seek-row > * + * { margin-left: 7px; }
 
 .p-speed {
   flex: none;
@@ -711,11 +731,12 @@ body.video-open #toast { display: none !important; }
   z-index: 2;
   display: flex;
   align-items: center;
-  gap: 10px;
   padding: calc(8px + var(--safe-top)) 12px 16px;
   background: linear-gradient(to bottom, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0));
   pointer-events: none;
 }
+
+.v-top > * + * { margin-left: 10px; }
 
 .v-top > * { pointer-events: auto; }
 
@@ -750,11 +771,104 @@ body.video-open #toast { display: none !important; }
   display: block;
 }
 
+/* ---------------- 视频控件条（自绘，替代原生 controls） ----------------
+   原生进度条拖一格就 seek 一次，每次都要从上个关键帧重新解码，长 GOP 的片子
+   单次 200ms 上下，连拖几十格就是连续卡顿。自绘这条只在松手时 seek 一次。
+   和 .v-top 一样必须自己 fixed：老 WebView 里 <video> 是独立图层。 */
+.v-controls {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  padding: 10px 14px calc(10px + var(--safe-bottom));
+  /* 单一层渐变（老 GPU 上比多层叠加便宜）：控件那一行压到 0.6~0.88，
+     再往上淡出。动画片/写真这种亮底画面上也压得住白字。 */
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.88) 0%, rgba(0, 0, 0, 0.62) 62%, rgba(0, 0, 0, 0) 100%);
+  transition: opacity 0.22s ease;
+}
+
+.v-controls > * + * { margin-left: 8px; }
+
+/* 播放中一段时间没操作就把控件淡出，画面干净；点一下视频再回来 */
+#video-overlay.v-idle .v-controls,
+#video-overlay.v-idle .v-top {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.v-top { transition: opacity 0.22s ease; }
+
+.v-btn {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border-radius: 50%;
+  color: #f4ece1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.v-btn svg {
+  width: 22px;
+  height: 22px;
+  display: block;
+}
+
+.v-btn:active { background: rgba(255, 255, 255, 0.14); }
+
+.v-time {
+  flex: none;
+  min-width: 34px;
+  font-size: 11.5px;
+  color: #d9cabb;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+#v-seek {
+  flex: 1 1 auto;
+  min-width: 60px;
+  height: 30px;
+}
+
+/* 手机/平板上是主控键：轨道和滑块都比列表里那条默认的粗一号，手指才好按
+   （7.9 寸 1920×1200 的屏，CSS 1px ≈ 0.13mm，16px 滑块约 4mm 宽） */
+#v-seek::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.34);
+}
+
+#v-seek::-webkit-slider-thumb {
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+}
+
+#v-seek::-moz-range-track {
+  height: 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.34);
+}
+
+#v-seek::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+}
+
+/* 转封装流不可 seek：滑块变灰，别让人以为拖了没反应 */
+#v-seek:disabled { opacity: 0.4; }
+
 .v-note {
   position: absolute;
   left: 16px;
   right: 16px;
-  bottom: calc(84px + var(--safe-bottom));
+  bottom: calc(74px + var(--safe-bottom));
   padding: 14px 16px;
   border-radius: 14px;
   background: rgba(28, 22, 17, 0.94);

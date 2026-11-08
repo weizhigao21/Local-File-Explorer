@@ -832,6 +832,163 @@ def test_compat_ignores_injected_third_party_errors():
     assert "/static/" in js, "要靠 /static/ 判断报错是不是自家脚本发的"
 
 
+# ==================== 视频拖动进度条（v1.10.3） ====================
+#
+# 背景：原生 <video controls> 的进度条是「拖一格 seek 一次」。1080p（GOP 250）
+# 实测单次 seek 198ms、p90 357ms（同片 GOP 30 只要 34ms）——拖 30 格就是 6 秒
+# 连续卡顿，用户感受就是「拖动进度条非常卡」。改成自绘条：拖动全程只动滑块和
+# 数字，松手才写一次 currentTime。下面几条守卫防它退回原生控件或退回逐格 seek。
+
+def _js_block(js, header):
+    """从 header 起截出配对的 `{...}`（够用于静态守卫：这几个函数里没有花括号字符串）"""
+    start = js.index(header)
+    index = js.index("{", start)
+    depth = 0
+    for pos in range(index, len(js)):
+        if js[pos] == "{":
+            depth += 1
+        elif js[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:pos + 1]
+    raise AssertionError(f"{header} 的花括号没配对")
+
+
+def test_video_uses_own_progress_bar():
+    """<video> 不能再带 controls：原生条和自绘条会叠在一起，且原生条逐格 seek"""
+    html = _static_text("index.html")
+    tag = re.search(r"<video[^>]*>", html)
+    assert tag, "index.html 里找不到 <video>"
+    assert "controls" not in tag.group(0), "原生 controls 又回来了：拖动会变成逐格 seek"
+
+    for element in ('id="v-seek"', 'id="v-play"', 'id="v-pos"', 'id="v-dur"', 'id="v-full"'):
+        assert element in html, f"缺少 {element}，自绘控件不完整"
+
+    overlay = html[html.index('<div id="video-overlay"'):]
+    assert 'id="v-seek"' in overlay, "进度条必须在视频浮层内部"
+
+
+def test_video_seek_only_commits_on_release():
+    """拖动时只许改显示，松手才 seek —— 这条是「拖一格 seek 一次」的止血带"""
+    js = _static_text("app.js")
+
+    # 注释里写着「绝不能写 currentTime」，先抹掉注释再判断真的代码
+    on_input = _strip_comments_and_strings(_js_block(js, "vSeek.addEventListener('input'"))
+    assert "currentTime" not in on_input, (
+        "input 回调里又写了 currentTime：每一格拖动都会触发一次解码级 seek"
+    )
+
+    commit = _strip_comments_and_strings(_js_block(js, "function commitVideoSeek("))
+    assert "currentTime" in commit, "松手时必须真的 seek"
+    assert "dataset.dragging" in commit, "缺少拖动态判断，pointerup 会重复 seek"
+
+    assert "vSeek.addEventListener('change', commitVideoSeek)" in js
+    assert "vSeek.addEventListener('pointerup', commitVideoSeek)" in js, (
+        "有的内核只在 pointerup 上报松手，两个都要接"
+    )
+    # 触摸屏上松手还可能只报 pointercancel / touchend：都要接，
+    # 而且重复触发必须是空操作（靠 dataset.dragging 清标记），不能连 seek 三次
+    for event in ("pointercancel", "touchend"):
+        assert f"vSeek.addEventListener('{event}', commitVideoSeek)" in js, (
+            f"没有接 {event}：触摸屏上松手可能收不到 change，拖动会不生效"
+        )
+
+
+def test_video_controls_do_not_fade_while_paused():
+    """暂停时控件必须留着：淡出后用户找不到播放按钮，会以为播放器坏了"""
+    js = _static_text("app.js")
+    show = _js_block(js, "function showVideoControls(")
+    assert "!videoEl.paused" in show, "淡出没有区分是否在播放"
+    assert "v-idle" in show
+
+
+def test_video_seek_bar_is_disabled_for_remux_stream():
+    """转封装是 ffmpeg 管道流（Accept-Ranges: none），拖了也没用，必须置灰"""
+    js = _static_text("app.js")
+    remux = _js_block(js, "function useRemux(")
+    assert "setVideoSeekable(false)" in remux, "转封装模式下进度条没置灰"
+
+
+def test_video_controls_bar_is_self_positioned():
+    """控件条也得自己 fixed：老 WebView 里 <video> 是独立图层，靠父容器定位会跑偏"""
+    css = _static_text("style.css")
+    bar = _css_rule(css, ".v-controls")
+    assert "position: fixed" in bar
+    assert "bottom: 0" in bar
+    assert "z-index" in bar, "没有层级会被 <video> 盖住"
+
+    idle_at = css.index("#video-overlay.v-idle")
+    idle = css[idle_at:css.index("}", idle_at)]
+    assert "opacity: 0" in idle
+    assert "pointer-events: none" in idle, "淡出后残留的透明层会吃掉点击"
+
+
+def test_video_buttons_are_big_enough_for_fingers():
+    """7.9 寸 1920×1200（CSS 1px≈0.13mm）上，34px 的按钮只有 4mm 宽，按不准
+
+    触摸目标按 36px 起算（≈4.7mm），进度条再高一点才好拖。
+    """
+    css = _static_text("style.css")
+    button = _css_rule(css, ".v-btn")
+    for prop in ("width", "height"):
+        value = re.search(rf"{prop}:\s*(\d+)px", button)
+        assert value, f".v-btn 没写死 {prop}"
+        assert int(value.group(1)) >= 36, f".v-btn 的 {prop} 太小，手指按不准"
+
+    seek = _css_rule(css, "#v-seek")
+    height = re.search(r"height:\s*(\d+)px", seek)
+    assert int(height.group(1)) >= 28, "进度条的触摸高度太小，平板上很难拖"
+
+
+def test_video_time_updates_do_not_touch_dom_pointlessly():
+    """timeupdate 每秒来 4 次：内容没变还写 textContent/value 会白烧一次重排
+
+    Tegra K1 + 2GB 那级设备上，这类「小便宜」很实在。
+    """
+    js = _static_text("app.js")
+    assert "function setText(" in js
+
+    sync = _js_block(js, "function syncVideoTime(")
+    assert "setText(" in sync, "时间文字没走 setText，每次都会重排"
+    assert "vSeek.value !== value" in sync, "滑块位置没比较就赋值，会反复重排进度条"
+
+
+def test_flex_rows_do_not_rely_on_gap():
+    """flex 容器的 `gap` 是 Chrome 84 才支持的
+
+    用户的平板是 Android 7 + Chrome 78 内核（小米平板 1 / MI PAD），
+    那一条会被整条忽略，表现就是「控件全挤成一团」。原来用 gap 的 flex 行/列
+    统一改成相邻兄弟外边距；grid 的 gap 是 Chrome 66 就有的，不用动。
+    """
+    css = _static_text("style.css")
+    flex_rows = [
+        ".bar-row", ".brand", ".tabs", ".section-title", ".home-card", ".chips",
+        ".list", ".row", ".p-controls", ".p-seek-row", ".v-top", ".v-controls",
+    ]
+    for selector in flex_rows:
+        body = _css_rule(css, selector)
+        assert "gap:" not in body, f"{selector} 又用 flex gap 了，老内核上会挤在一起"
+        assert f"{selector} > * + *" in css, f"{selector} 缺少相邻兄弟外边距兜底"
+
+    # chip 的首个子节点是文本节点（`* + *` 匹配不到匿名文本项），只能给计数单独补
+    assert "margin-left: 6px" in _css_rule(css, ".chip .count")
+
+
+def test_video_fullscreen_falls_back_to_native_player():
+    """Android 7 的 WebView（UA 带 wv）里元素级全屏常常静默失败
+
+    宿主 App 不实现 onShowCustomView，requestFullscreen() 会「成功返回但什么都不发生」，
+    所以 800ms 后要量一次，没进全屏就退到 <video> 自己的全屏通道，别让按钮看着像坏的。
+    """
+    js = _static_text("app.js")
+    assert "function enterNativeVideoFullscreen(" in js
+    assert "webkitEnterFullscreen" in js, "没走原生视频全屏这条退路"
+
+    handler = _js_block(js, "$('v-full').addEventListener(")
+    assert "enterNativeVideoFullscreen()" in handler
+    assert "800" in handler, "静默失败后没有延时探测"
+
+
 # ==================== 多根目录配置（v1.10.0） ====================
 
 def test_normalize_roots_accepts_single_string_and_dedupes():

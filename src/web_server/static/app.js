@@ -25,6 +25,7 @@
     chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>',
     left: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>',
     right: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>',
+    full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V5.6A1.6 1.6 0 0 1 5.6 4H9M15 4h3.4A1.6 1.6 0 0 1 20 5.6V9M20 15v3.4A1.6 1.6 0 0 1 18.4 20H15M9 20H5.6A1.6 1.6 0 0 1 4 18.4V15"/></svg>',
   };
 
   const $ = (id) => document.getElementById(id);
@@ -74,6 +75,15 @@
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
     if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(0)} MB`;
     return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+
+  /** 只在内容真的变了才写 DOM
+   *
+   * 播放时 timeupdate 每秒来 4 次，每次都改 textContent / range.value 会让
+   * 老平板（Tegra K1 那级）反复重排进度条，纯属白烧性能。
+   */
+  function setText(node, text) {
+    if (node.textContent !== text) node.textContent = text;
   }
 
   function toast(text, ms = 2200) {
@@ -872,9 +882,10 @@
     const duration = audioEl.duration || 0;
     const seek = $('p-seek');
     if (duration > 0 && !seek.dataset.dragging) {
-      seek.value = String(Math.round((audioEl.currentTime / duration) * 1000));
+      const value = String(Math.round((audioEl.currentTime / duration) * 1000));
+      if (seek.value !== value) seek.value = value;
     }
-    $('p-pos').textContent = fmtClock(audioEl.currentTime);
+    setText($('p-pos'), fmtClock(audioEl.currentTime));
     syncSubtitle(audioEl.currentTime * 1000);
   });
 
@@ -1128,6 +1139,7 @@
   async function openVideo(workId, videos, index) {
     const overlay = $('video-overlay');
     overlay.hidden = false;
+    overlay.classList.remove('v-idle');
     document.body.style.overflow = 'hidden';
     document.body.classList.add('video-open');
     state.video.workId = workId;
@@ -1141,6 +1153,8 @@
     if (!video) return;
     state.video.index = index;
     state.video.remux = false;
+    setVideoSeekable(true);
+    syncVideoPlay();
     $('video-overlay').querySelector('.v-title').textContent = video.name;
     $('v-note').hidden = true;
 
@@ -1170,10 +1184,12 @@
     const info = state.video.info;
     if (!info) return;
     state.video.remux = true;
+    setVideoSeekable(false);
     videoEl.src = info.remux_url;
     showVideoNote('正在转封装播放：需要几秒才开始，此模式不能拖动进度条。', [
       { label: '用原格式试播', onclick: () => {
         state.video.remux = false;
+        setVideoSeekable(true);
         videoEl.src = info.url;
         videoEl.play().catch(() => {});
         $('v-note').hidden = true;
@@ -1215,6 +1231,169 @@
     }).catch(() => {});
   }
 
+  // ---------------- 视频控件（自绘进度条） ----------------
+  //
+  // 为什么不用原生 controls：原生进度条是「拖一格 seek 一次」，而每次 seek 都得
+  // 从上一个关键帧开始重新解码。实测 1080p（GOP 250）单次 seek 198ms、p90 357ms，
+  // 同片改成 GOP 30 只要 34ms —— 拖 30 格就是 6 秒的连续卡顿。
+  // 这里拖动全程只动滑块和数字，松手才真的写一次 currentTime。
+  const vSeek = $('v-seek');
+  const vOverlay = $('video-overlay');
+  let vIdleTimer = 0;
+
+  function videoDuration() {
+    const value = videoEl.duration;
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  /** 滑块位置（0~1000 千分比）→ 目标秒数 */
+  function videoTarget() {
+    const duration = videoDuration();
+    return duration ? (Number(vSeek.value) / 1000) * duration : 0;
+  }
+
+  function syncVideoPlay() {
+    $('v-play').innerHTML = videoEl.paused ? ICON.play : ICON.pause;
+  }
+
+  function syncVideoTime() {
+    const duration = videoDuration();
+    setText($('v-dur'), duration ? fmtClock(duration) : '--:--');
+    if (!vSeek.dataset.dragging) {
+      const now = videoEl.currentTime || 0;
+      setText($('v-pos'), fmtClock(now));
+      if (duration) {
+        const value = String(Math.round((now / duration) * 1000));
+        if (vSeek.value !== value) vSeek.value = value;
+      }
+    }
+  }
+
+  function showVideoControls() {
+    vOverlay.classList.remove('v-idle');
+    if (vIdleTimer) { clearTimeout(vIdleTimer); vIdleTimer = 0; }
+    // 播放中才淡出：暂停时控件必须留着，否则用户找不到播放按钮
+    if (!videoEl.paused && !state.video.remux) {
+      vIdleTimer = setTimeout(() => {
+        vIdleTimer = 0;
+        vOverlay.classList.add('v-idle');
+      }, 2600);
+    }
+  }
+
+  /** 松手才提交：一次拖动只产生一次真正的 seek */
+  function commitVideoSeek() {
+    if (!vSeek.dataset.dragging) return;
+    delete vSeek.dataset.dragging;
+    const target = videoTarget();
+    if (target > 0) videoEl.currentTime = target;
+    syncVideoTime();
+    showVideoControls();
+  }
+
+  function setVideoSeekable(ok) {
+    vSeek.disabled = !ok;
+    vSeek.value = '0';
+    $('v-pos').textContent = '00:00';
+    $('v-dur').textContent = '--:--';
+  }
+
+  vSeek.addEventListener('pointerdown', () => {
+    if (vSeek.disabled) return;
+    vSeek.dataset.dragging = '1';
+    showVideoControls();
+  });
+  vSeek.addEventListener('input', () => {
+    if (vSeek.disabled) return;
+    // 万一某个内核没先发 pointerdown，这里补上标记，免得到松手时提交不了
+    vSeek.dataset.dragging = '1';
+    // 这里绝对不能写 currentTime：拖动的每一格都 seek，就是卡顿本身
+    if (videoDuration()) setText($('v-pos'), fmtClock(videoTarget()));
+    showVideoControls();
+  });
+  // 触摸屏和 WebView 上「松手」可能是 change / pointerup / pointercancel / touchend
+  // 里的任意一个：全接上，谁先来谁提交，其余因为 dragging 已清掉而空操作
+  vSeek.addEventListener('change', commitVideoSeek);
+  vSeek.addEventListener('pointerup', commitVideoSeek);
+  vSeek.addEventListener('pointercancel', commitVideoSeek);
+  vSeek.addEventListener('touchend', commitVideoSeek);
+
+  videoEl.addEventListener('play', () => { syncVideoPlay(); showVideoControls(); });
+  videoEl.addEventListener('pause', () => { syncVideoPlay(); showVideoControls(); });
+  videoEl.addEventListener('timeupdate', syncVideoTime);
+  videoEl.addEventListener('durationchange', syncVideoTime);
+  videoEl.addEventListener('loadedmetadata', syncVideoTime);
+
+  // 点画面：控件已淡出就先唤回控件，否则才播/暂停（与常见播放器一致）
+  videoEl.addEventListener('click', () => {
+    if (vOverlay.classList.contains('v-idle')) {
+      showVideoControls();
+      return;
+    }
+    if (videoEl.paused) videoEl.play().catch(() => {});
+    else videoEl.pause();
+    showVideoControls();
+  });
+
+  $('v-play').addEventListener('click', () => {
+    if (videoEl.paused) videoEl.play().catch(() => {});
+    else videoEl.pause();
+    showVideoControls();
+  });
+
+  /** 兜底：交给系统播放器全屏
+   *
+   * 这台平板是 Android 7 的 WebView（UA 带 `wv`），宿主 App 不实现
+   * `onShowCustomView` 时元素级全屏会「调用成功但什么也不发生」，
+   * 只剩下 <video> 自己的全屏通道还可能通。
+   */
+  function enterNativeVideoFullscreen() {
+    try {
+      if (videoEl.webkitEnterFullscreen) videoEl.webkitEnterFullscreen();
+      else if (videoEl.webkitRequestFullscreen) videoEl.webkitRequestFullscreen();
+      else toast('这个浏览器不支持全屏，横过来看更舒服', 2600);
+    } catch (error) {
+      toast('这个浏览器不支持全屏，横过来看更舒服', 2600);
+    }
+  }
+
+  $('v-full').addEventListener('click', () => {
+    const doc = document;
+    if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+      try {
+        (doc.exitFullscreen || doc.webkitExitFullscreen).call(doc);
+      } catch (error) {
+        /* 退出失败也只能算了 */
+      }
+      showVideoControls();
+      return;
+    }
+
+    let asked = false;
+    try {
+      if (vOverlay.requestFullscreen) {
+        const pending = vOverlay.requestFullscreen();
+        if (pending && pending.catch) pending.catch(() => {});
+        asked = true;
+      } else if (vOverlay.webkitRequestFullscreen) {
+        vOverlay.webkitRequestFullscreen();
+        asked = true;
+      }
+    } catch (error) {
+      asked = false;
+    }
+
+    if (!asked) {
+      enterNativeVideoFullscreen();
+    } else {
+      // 静默失败（WebView 常见）就退到原生视频全屏，别让按钮看着像坏了
+      setTimeout(() => {
+        if (!doc.fullscreenElement && !doc.webkitFullscreenElement) enterNativeVideoFullscreen();
+      }, 800);
+    }
+    showVideoControls();
+  });
+
   videoEl.addEventListener('loadedmetadata', () => {
     const resume = state.video.resume;
     if (state.video.remux || !resume) return;
@@ -1238,6 +1417,9 @@
   videoEl.addEventListener('pause', () => { if (!state.video.remux) saveVideoProgress(false); });
   videoEl.addEventListener('ended', () => {
     if (!state.video.remux) saveVideoProgress(false);
+    // ended 时浏览器不发 pause 事件，图标和控件条得自己收尾（最后一集不会切集）
+    syncVideoPlay();
+    showVideoControls();
     const next = state.video.index + 1;
     if (next < state.video.videos.length) loadVideo(next);
   });
@@ -1272,6 +1454,9 @@
     videoEl.pause();
     videoEl.removeAttribute('src');
     videoEl.load();
+    vOverlay.classList.remove('v-idle');
+    if (vIdleTimer) { clearTimeout(vIdleTimer); vIdleTimer = 0; }
+    delete vSeek.dataset.dragging;
     $('video-overlay').hidden = true;
     $('v-note').hidden = true;
     state.video.info = null;
@@ -1306,6 +1491,8 @@
   $('p-play').innerHTML = ICON.play;
   $('p-prev').innerHTML = ICON.prev;
   $('p-next').innerHTML = ICON.next;
+  $('v-play').innerHTML = ICON.play;
+  $('v-full').innerHTML = ICON.full;
 
   if (!location.hash) location.hash = '#/';
   render();
