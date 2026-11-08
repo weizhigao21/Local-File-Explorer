@@ -960,3 +960,70 @@ def test_web_list_views_use_paged_grid():
     assert js.count("state.repaint = wall.reload") == 3, "写真/视频/音频三个列表都要走分页重绘"
     assert "pagedGrid({" in js
     assert "'/api/photos/works'" in js and "'/api/video/works'" in js and "'/api/audio/playlists'" in js
+
+
+# ==================== 访问令牌开关（v1.10.2） ====================
+
+def test_server_without_token_allows_anonymous():
+    """局域网自用关掉令牌：不带任何凭证也能打开页面和 API，链接里也不再拼 t="""
+    instance = WebServer()
+    port = instance.start(port=0, lan=False, token=TOKEN, require_token=False)
+    try:
+        status, _, body = _get(port, "/api/summary")
+        assert status == 200
+        assert json.loads(body)["version"] == config.APP_VERSION
+        status, _, _ = _get(port, "/")
+        assert status == 200
+        assert "t=" not in instance.url("127.0.0.1"), "关掉令牌后链接不应再带 t="
+    finally:
+        instance.stop()
+
+
+def test_server_with_token_still_rejects_anonymous():
+    """开关默认开着：无凭证仍是 401，链接带令牌"""
+    instance = WebServer()
+    port = instance.start(port=0, lan=False, token=TOKEN, require_token=True)
+    try:
+        status, _, _ = _get(port, "/api/summary")
+        assert status == 401
+        assert instance.url("127.0.0.1").endswith(f"?t={TOKEN}")
+    finally:
+        instance.stop()
+
+
+def test_web_require_token_config_defaults_and_normalize():
+    """默认启用令牌；开关值一律归一成 bool"""
+    assert config._DEFAULT_USER_CONFIG["WEB_REQUIRE_TOKEN"] is True
+    assert config._DEFAULT_USER_CONFIG["WEB_REQUIRE_TOKEN"] is bool(
+        config._DEFAULT_USER_CONFIG["WEB_REQUIRE_TOKEN"]
+    )
+
+
+def test_server_window_has_token_toggle():
+    """设置窗口必须有令牌开关，且所有 start() 调用都把开关状态传给服务"""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "ui" / "server_window.py"
+    ).read_text(encoding="utf-8")
+    assert "WEB_REQUIRE_TOKEN" in source
+    assert "_on_require_token_changed" in source
+
+    tree = ast.parse(source)
+    starts = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "start"
+        # self._server.start(...)；排除 self._timer.start() 这类同名调用
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_server"
+    ]
+    # _toggle_server / _reset_token / _on_settings_changed / _on_require_token_changed
+    assert len(starts) == 4, f"server_window 里 start() 调用数变了（{len(starts)}），补齐守卫"
+    for call in starts:
+        keyword_names = [kw.arg for kw in call.keywords]
+        assert "require_token" in keyword_names, (
+            f"start() 调用没传 require_token，关令牌开关会不生效: {ast.unparse(call)[:80]}"
+        )

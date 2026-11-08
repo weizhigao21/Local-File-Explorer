@@ -291,6 +291,17 @@ class ServerWindow(QMainWindow):
         token_row.addWidget(self.reset_btn)
 
         token_row.addStretch(1)
+
+        self.token_check = QCheckBox("启用令牌")
+        self.token_check.setChecked(bool(getattr(config, "WEB_REQUIRE_TOKEN", True)))
+        self.token_check.setStyleSheet(self._check_qss())
+        self.token_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.token_check.setToolTip(
+            "局域网自用可以关掉：关闭后打开链接即可，不再需要访问令牌。\n"
+            "注意：关闭后同一 Wi-Fi 里的任何人都能打开。"
+        )
+        self.token_check.toggled.connect(self._on_require_token_changed)
+        token_row.addWidget(self.token_check)
         layout.addLayout(token_row)
 
         return card
@@ -312,7 +323,7 @@ class ServerWindow(QMainWindow):
             "手机和电脑要连同一个 Wi-Fi（或同一路由器下的有线/无线混连）。",
             "第一次启动如果手机打不开，检查 Windows 防火墙是否允许本程序访问「专用网络」。",
             "关闭这个窗口不会停止服务，手机可以继续用；退出程序才会停止。",
-            "地址里的 t=… 是访问令牌，等于钥匙：发给别人的截图请打码。",
+            "启用了令牌时，地址里的 t=… 等于钥匙：发给别人的截图请打码；局域网自用可关掉。",
         ]
         for text in lines:
             label = QLabel(f"· {text}")
@@ -372,7 +383,11 @@ class ServerWindow(QMainWindow):
             self.addr_label.setText("")
 
         token = getattr(config, "WEB_TOKEN", "") or ""
+        require_token = bool(getattr(config, "WEB_REQUIRE_TOKEN", True))
         self.token_label.setText(token or "首次启动时自动生成")
+        # 关掉令牌后，令牌值和重置按钮都没意义了，一起置灰
+        self.token_label.setEnabled(require_token)
+        self.reset_btn.setEnabled(require_token)
 
     # ---------- 操作 ----------
 
@@ -387,6 +402,7 @@ class ServerWindow(QMainWindow):
             port = self._server.start(
                 port=self.port_spin.value(),
                 lan=self.lan_check.isChecked(),
+                require_token=self.token_check.isChecked(),
             )
         except WebServerError as e:
             QMessageBox.warning(self, "启动失败", str(e))
@@ -430,7 +446,11 @@ class ServerWindow(QMainWindow):
         self._server.stop()
         if was_running:
             try:
-                self._server.start(port=self.port_spin.value(), lan=self.lan_check.isChecked())
+                self._server.start(
+                    port=self.port_spin.value(),
+                    lan=self.lan_check.isChecked(),
+                    require_token=self.token_check.isChecked(),
+                )
             except WebServerError as e:
                 QMessageBox.warning(self, "重启失败", str(e))
         self.hint_label.setText("令牌已重置")
@@ -450,11 +470,38 @@ class ServerWindow(QMainWindow):
         if self._server.running:
             self._server.stop()
             try:
-                self._server.start(port=port, lan=lan)
+                self._server.start(
+                    port=port,
+                    lan=lan,
+                    require_token=self.token_check.isChecked(),
+                )
                 self.hint_label.setText(f"设置已生效，端口 {port}")
             except WebServerError as e:
                 QMessageBox.warning(self, "重启失败", f"{e}\n\n服务已停止。")
 
+        self._sync_state()
+
+    def _on_require_token_changed(self, checked):
+        """开关访问令牌：落盘并立刻重启服务生效（改鉴权不用换端口）"""
+        config.set_user_config("WEB_REQUIRE_TOKEN", bool(checked))
+        config.save_user_config()
+
+        if self._server.running:
+            self._server.stop()
+            try:
+                self._server.start(
+                    port=self.port_spin.value(),
+                    lan=self.lan_check.isChecked(),
+                    require_token=checked,
+                )
+            except WebServerError as e:
+                QMessageBox.warning(self, "重启失败", f"{e}\n\n服务已停止。")
+
+        self.hint_label.setText(
+            "已关闭令牌：手机打开地址即可访问"
+            if not checked
+            else "已启用令牌：手机需要带令牌的链接"
+        )
         self._sync_state()
 
     def _on_auto_start_changed(self, checked):

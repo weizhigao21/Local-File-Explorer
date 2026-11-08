@@ -63,7 +63,7 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 # 应用版本号
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.10.2"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -99,6 +99,7 @@ _DEFAULT_USER_CONFIG = {
     "WEB_TOKEN": "",                 # 访问令牌，首次启动自动生成
     "WEB_ALLOW_LAN": True,           # True=局域网可访问；False=仅本机
     "WEB_AUTO_START": False,         # 程序启动时自动开服
+    "WEB_REQUIRE_TOKEN": True,       # True=访问需要令牌；局域网自用可关闭
 }
 
 # 当前生效的用户配置（运行时可改，通过 save_user_config() 写盘）
@@ -197,7 +198,7 @@ def _load_user_config():
                     v = _normalize_web_port(v)
                 elif k == "WEB_TOKEN":
                     v = _normalize_web_token(v)
-                elif k == "WEB_ALLOW_LAN":
+                elif k in ("WEB_ALLOW_LAN", "WEB_REQUIRE_TOKEN"):
                     v = bool(v)
                 elif k == "DL_PROXY":
                     v = str(v or "").strip()
@@ -246,7 +247,7 @@ def set_user_config(key: str, value):
         value = _normalize_web_port(value)
     elif key == "WEB_TOKEN":
         value = _normalize_web_token(value)
-    elif key == "WEB_ALLOW_LAN":
+    elif key in ("WEB_ALLOW_LAN", "WEB_REQUIRE_TOKEN"):
         value = bool(value)
     elif key == "DL_PROXY":
         value = str(value or "").strip()
@@ -288,3 +289,4 @@ WEB_PORT = _user_config["WEB_PORT"]
 WEB_TOKEN = _user_config["WEB_TOKEN"]
 WEB_ALLOW_LAN = _user_config["WEB_ALLOW_LAN"]
 WEB_AUTO_START = _user_config["WEB_AUTO_START"]
+WEB_REQUIRE_TOKEN = _user_config["WEB_REQUIRE_TOKEN"]

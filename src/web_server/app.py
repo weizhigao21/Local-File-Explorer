@@ -151,6 +151,10 @@ class RequestHandler(BaseHTTPRequestHandler):
     # ---------- 鉴权 ----------
 
     def _authorized(self, path, query):
+        # 局域网自用可以整个关掉令牌（设置里关，重启服务生效）
+        if not getattr(self.server, "require_token", True):
+            return True
+
         token = getattr(self.server, "token", "") or ""
         if not token:
             return True
@@ -523,8 +527,9 @@ class _ThreadingServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, handler, token=""):
+    def __init__(self, address, handler, token="", require_token=True):
         self.token = token
+        self.require_token = require_token
         super().__init__(address, handler)
 
 
@@ -537,19 +542,25 @@ class WebServer:
         self.port = 0
         self.host = ""
         self.token = ""
+        self.require_token = True
         self.last_error = ""
 
     @property
     def running(self):
         return self._httpd is not None
 
-    def start(self, port=None, lan=None, token=None):
+    def start(self, port=None, lan=None, token=None, require_token=None):
         """启动服务，返回实际端口；失败抛 WebServerError
 
         token 传空 = 用配置里保存的令牌（没有就生成一个）；测试可显式指定。
+        require_token=False 时关闭鉴权（局域网自用）；None = 读配置。
         """
         if self._httpd is not None:
             return self.port
+
+        if require_token is None:
+            require_token = bool(getattr(config, "WEB_REQUIRE_TOKEN", True))
+        self.require_token = bool(require_token)
 
         errors = library.init_all()
         for message in errors:
@@ -562,7 +573,9 @@ class WebServer:
 
         self.token = token or ensure_token()
         try:
-            httpd = _ThreadingServer((host, port), RequestHandler, self.token)
+            httpd = _ThreadingServer(
+                (host, port), RequestHandler, self.token, self.require_token
+            )
         except OSError as e:
             self.last_error = _bind_error_message(e, port)
             raise WebServerError(self.last_error) from e
@@ -593,6 +606,8 @@ class WebServer:
         print("[网页服务] 已停止")
 
     def url(self, host="127.0.0.1", with_token=True):
+        # 令牌关掉时链接里就不带 t=（带了也没意义，还会暴露令牌）
+        with_token = with_token and self.require_token
         port = self.port or int(config.WEB_PORT)
         return build_url(host, port, self.token, with_token)
 
