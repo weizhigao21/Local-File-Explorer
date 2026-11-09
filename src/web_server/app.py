@@ -730,6 +730,9 @@ class WebServer:
             httpd.shutdown()
         with suppress(Exception):
             httpd.server_close()
+        # 正在后台转的那一集要一起收掉，否则会留下几百 MB 的 .part
+        with suppress(Exception):
+            transcode.shutdown()
         self._thread = None
         print("[网页服务] 已停止")
 

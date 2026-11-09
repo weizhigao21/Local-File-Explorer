@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -145,6 +146,7 @@ def test_sweep_noop_when_under_limit(tmp_path):
 def _clean_jobs():
     transcode.reset_jobs()
     yield
+    transcode.shutdown()
     transcode.reset_jobs()
 
 
@@ -346,3 +348,26 @@ def test_api_reports_mode_for_each_video(seeded):
             assert video["stream_url"].startswith("/media/video-stream/")
     finally:
         instance.stop()
+
+
+def test_shutdown_cancels_running_job_and_removes_part(tmp_path, monkeypatch):
+    """关服时在转的那一集必须收掉，否则留下几百 MB 的 .part"""
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"x" * 10)
+    video = {"id": 5, "path": str(src)}
+    monkeypatch.setattr(
+        transcode, "build_cmd",
+        lambda *a, **k: [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    job, _ = transcode.ensure_job(video, "ffmpeg", "libx264", str(tmp_path))
+    assert job is not None
+    for _ in range(200):
+        if os.path.exists(job.part_path):
+            break
+        time.sleep(0.05)
+
+    transcode.shutdown()
+
+    assert job.done.is_set(), "shutdown 没等任务结束"
+    assert not os.path.exists(job.part_path), "取消后 .part 没清掉"

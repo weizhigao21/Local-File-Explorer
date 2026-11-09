@@ -206,6 +206,8 @@ class TranscodeJob:
         self.ok = False
         self.error = ""
         self.started = time.monotonic()
+        self._cancelled = False
+        self._proc = None
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"transcode-{key}")
 
     def start(self):
@@ -215,6 +217,14 @@ class TranscodeJob:
     @property
     def running(self):
         return not self.done.is_set()
+
+    def cancel(self):
+        """关服/退出时用：杀掉 ffmpeg，`.part` 由 _run 的 finally 清掉"""
+        self._cancelled = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            with suppress(OSError):
+                proc.kill()
 
     def _run(self):
         try:
@@ -226,9 +236,12 @@ class TranscodeJob:
                     stdin=subprocess.DEVNULL,
                     creationflags=_creationflags(),
                 )
+                self._proc = proc
                 code = proc.wait()
-            size = os.path.getsize(self.part_path)
-            if code == 0 and size > 1024:
+            if self._cancelled:
+                with suppress(OSError):
+                    os.remove(self.part_path)
+            elif code == 0 and os.path.getsize(self.part_path) > 1024:
                 os.replace(self.part_path, self.final_path)
                 self.ok = True
                 sweep()
@@ -286,3 +299,16 @@ def reset_jobs():
     """测试用：清掉任务表（不杀进程）"""
     with _JOBS_LOCK:
         _JOBS.clear()
+
+
+def shutdown():
+    """关服/退出：杀掉所有在跑的转码，别让 ffmpeg 变成孤儿进程
+
+    正在转的那一集下次会重新转——这比留下一个几百 MB 的 `.part` 强。
+    """
+    with _JOBS_LOCK:
+        jobs = list(_JOBS.values())
+    for job in jobs:
+        job.cancel()
+    for job in jobs:
+        job.done.wait(timeout=5)
