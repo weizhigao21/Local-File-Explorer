@@ -1,4 +1,4 @@
-# 本地资源管理器 <sub>v1.14.0</sub>
+# 本地资源管理器 <sub>v1.15.0</sub>
 
 基于 PyQt6 的 Windows 本地资源管理工具，采用多模块架构。通过主启动器统一入口，按模块分类管理各类本地资源。
 
@@ -185,8 +185,10 @@ python src/main.py
 - **写真** - 作者筛选 → 作品 → 点图全屏看图，左右滑动或点屏幕左右半边翻页
 - **音频** - 进歌单点任意一首即播；底部播放条可拖进度、切上下首、0.75×–2× 倍速；有字幕会跟着时间轴走
 - **视频** - 进作品点集数播放；续播点和电脑共用（在手机看到一半，回电脑接着看）；播完自动下一集
-- **不认的格式** - `mkv` / `avi` 等浏览器放不了时会提示「转封装播放」：服务端用 ffmpeg 只换容器不重编码，
-  几秒后开始播放，但此模式不能拖动进度条
+- **不认的格式自动处理** - 容器不认（`mkv` / `avi` / `ts`）走换封装 `-c:v copy`，几秒开播；
+  编码不认（**HEVC** / VC-1 / RMVB）走显卡硬转 H.264（优先 NVENC，其次 QSV/AMF，最后 CPU），
+  首屏 2~3 秒出画面，转完存到 `data/transcode/` —— 下次同一集秒开、可拖动、可续播
+- **转码也能拖** - 转码中的流按 `?start=<秒>` 重新起转，拖动只重新缓冲几秒，不会整段卡死
 - **当 App 用** - 手机浏览器里选「添加到主屏幕」，图标和全屏体验都跟原生 App 差不多
 - **关窗口不停服** - 关掉电脑上的控制窗口，手机仍可继续用；退出程序才会停止服务
 
@@ -317,7 +319,8 @@ python src/main.py
     │   ├── probe.py            # ffprobe 读时长分辨率 + ffmpeg 抽帧做封面（缺失时降级）
     │   └── progress.py         # 续播规则纯函数（续播点、看完归零、时长格式化）
     ├── web_server/             # 手机/平板网页服务（纯 Python，禁止导入 Qt）
-    │   ├── app.py              # HTTP 服务：路由、令牌鉴权、Range 流式、ffmpeg 转封装管道
+    │   ├── app.py              # HTTP 服务：路由、令牌鉴权、Range 流式、ffmpeg 转封装/转码管道
+    │   ├── transcode.py        # 编码器探测（NVENC→QSV→AMF→libx264）、转码命令、后台任务与缓存淘汰
     │   ├── http_util.py        # Range 解析、MIME、静态路径归属校验、字幕转 VTT
     │   ├── library.py          # 三模块数据视图（缺封面按需生成、图片按宽度缩放缓存）
     │   └── static/             # 网页端页面：index.html / app.js / style.css / icon.svg
@@ -354,7 +357,7 @@ python src/main.py
     │   ├── system_dialog.py    # 系统集成对话框（注册为默认播放器）
     │   ├── hotkeys.py          # Windows 全局热键（Ctrl+Alt+Space / ← / →）
     │   └── audio_threads.py    # 音频后台线程（扫描、mtime 迁移、时长探测、DLsite 并行抓取）
-    └── tests/                  # 单元测试（680 条）
+    └── tests/                  # 单元测试（713 条）
         ├── conftest.py                # pytest 配置（固定 PyQt6 binding）
         ├── test_natural_key.py        # 自然排序
         ├── test_database.py           # 写真数据库
@@ -507,7 +510,7 @@ python -m pytest tests/ -q
 python -m ruff check .
 ```
 
-测试覆盖（共 680 条）：
+测试覆盖（共 713 条）：
 - `test_natural_key.py` - 自然排序逻辑（纯数字、混合、中文、多段、边界等 7 个场景）
 - `test_database.py` - 数据库 schema、CRUD、增量同步、级联删除、长连接、`INSERT OR IGNORE` 被忽略时的 id 复用（19 个场景）
 - `test_fingerprint_cache.py` - 目录指纹生成、缓存、变化检测、目录级指纹、v1→v2 迁移（27 个场景）
@@ -527,6 +530,7 @@ python -m ruff check .
 - `test_thread_lifecycle.py` - 关闭窗口时停止扫描线程、超时线程引用保留（7 个场景）
 - `test_ui_qss.py` - QSS 静态扫描 + Qt 实测不再产生 `Could not parse stylesheet`（3 个场景）
 - `test_ui_theme.py` - 设计令牌单一来源、各模块 re-export 一致性（4 个场景）
+- `test_video_transcode.py` - 网页播放方式判定（HEVC 必须重编码而不是换封装）、各编码器命令与质量参数、`-ss` 在 `-i` 之前、转码缓存命名/淘汰、后台任务落盘与失败清理（32 个场景）
 
 ## 资源目录结构要求
 

@@ -62,8 +62,15 @@ IMAGE_THUMBNAIL_DIR = os.path.join(THUMBNAIL_DIR, "img")
 # 支持的图片扩展名
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
+# 网页端转码缓存：浏览器不认的编码（HEVC 等）转成 H.264 后存这里，
+# 下次直接当普通 mp4 发（支持 Range，可拖动、可续播）
+TRANSCODE_DIR = os.path.join(_DATA_DIR, "transcode")
+
+# 转码缓存上限：超过就按最后访问时间淘汰最旧的。0 = 不限制
+TRANSCODE_MAX_BYTES = 20 * 1024 ** 3
+
 # 应用版本号
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
 
 # ==================== 用户可变配置（config.json） ====================
 

@@ -65,6 +65,12 @@ BROWSER_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".webm", ".mov", ".ogv"}
 # 浏览器普遍能解的编码。HEVC 只有 Safari 认，所以不算在内。
 BROWSER_VIDEO_CODECS = {"h264", "vp8", "vp9", "av1", "theora"}
 
+# 播放方式（见 video_mode）
+MODE_DIRECT = "direct"
+MODE_REMUX = "remux"
+MODE_TRANSCODE = "transcode"
+VIDEO_MODES = (MODE_DIRECT, MODE_REMUX, MODE_TRANSCODE)
+
 RANGE_INVALID = "invalid"
 
 
@@ -210,19 +216,30 @@ def cues_to_vtt(cues):
     return "\n".join(lines)
 
 
-def browser_playable(ext, codec=""):
-    """容器与编码都在浏览器支持范围内时才返回 True
+def video_mode(ext, codec=""):
+    """浏览器该怎么拿到这个视频：`direct` 直连 / `remux` 换容器 / `transcode` 重编码
+
+    两条互不相干的门槛，必须分开判断，否则会出现「转封装完还是黑屏」：
+    - 容器不在白名单（mkv/avi/ts…）→ 换封装就够（`-c:v copy`，几秒钟）
+    - 编码不在白名单（HEVC/VC-1/RMVB…）→ **换封装没用**，手机根本解不了 HEVC，
+      只能重编码成 H.264（GPU 转码，见 `web_server/transcode.py`）
 
     编码未知（ffprobe 没装/没探到）时按容器判断，让浏览器自己试——
     宁可试一次失败，也不要因为探测不到就直接把可播的文件拦下来。
     """
     ext = (ext or "").lower()
-    if ext not in BROWSER_VIDEO_EXTENSIONS:
-        return False
     codec = (codec or "").lower()
+    container_ok = ext in BROWSER_VIDEO_EXTENSIONS
     if not codec:
-        return True
-    return codec in BROWSER_VIDEO_CODECS
+        return MODE_DIRECT if container_ok else MODE_REMUX
+    if codec not in BROWSER_VIDEO_CODECS:
+        return MODE_TRANSCODE
+    return MODE_DIRECT if container_ok else MODE_REMUX
+
+
+def browser_playable(ext, codec=""):
+    """原文件能直接交给 `<video>` 吗（容器与编码都在支持范围内）"""
+    return video_mode(ext, codec) == MODE_DIRECT
 
 
 def parse_byte_size(text):

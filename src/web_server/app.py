@@ -21,6 +21,7 @@ import secrets
 import socket
 import subprocess
 import threading
+import time
 import traceback
 import urllib.parse
 from contextlib import suppress
@@ -28,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from resource_manager import config
 from video_manager import probe
-from web_server import http_util, library
+from web_server import http_util, library, transcode
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -48,6 +49,10 @@ GZIP_MIN_BODY = 1024
 _REMUX_SLOTS = threading.Semaphore(1)
 REMUX_WAIT_SECONDS = 20
 
+# 转码比转封装重得多（要吃 GPU/多核），同样只跑一路；转封装与转码分开计数，
+# 否则「一边转码一边翻看另一集」会互相卡死
+_TRANSCODE_SLOTS = threading.Semaphore(1)
+
 # 列表接口默认分页：切换模块只拉一页，几万条也不会把手机端拖死
 DEFAULT_PAGE_SIZE = library.PAGE_DEFAULT
 MAX_PAGE_SIZE = library.PAGE_MAX
@@ -57,6 +62,13 @@ SECURITY_HEADERS = (
     ("Referrer-Policy", "no-referrer"),
     ("X-Frame-Options", "SAMEORIGIN"),
 )
+
+
+def _creationflags():
+    """Windows 下起 ffmpeg 不能弹黑框"""
+    if os.name == "nt":
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return 0
 
 # 只允许本地资源：不允许外链脚本，避免网页被换成任意内容
 CSP_HTML = (
@@ -95,6 +107,7 @@ _ROUTE_DEFS = [
     ("GET", r"^/media/audio-cover/(\d+)$", "media_audio_cover"),
     ("GET", r"^/media/video/(\d+)$", "media_video"),
     ("GET", r"^/media/video-remux/(\d+)$", "media_video_remux"),
+    ("GET", r"^/media/video-stream/(\d+)$", "media_video_stream"),
     ("GET", r"^/media/video-cover/(\d+)$", "media_video_cover"),
 ]
 
@@ -496,37 +509,104 @@ class RequestHandler(BaseHTTPRequestHandler):
         return self._serve_file(path, content_type="image/jpeg", max_age=86400)
 
     def media_video_remux(self, match, query):
-        """浏览器不认的容器（mkv/avi…）走 ffmpeg 转封装成 fMP4 直接吐给前端
+        """旧接口，保留兼容：等同于 `/media/video-stream/<id>`"""
+        return self.media_video_stream(match, query)
 
-        只转封装不重编码画面（`-c:v copy`），CPU 占用很低；音频统一转 AAC，
-        否则 DTS/AC3/FLAC 音轨塞进 mp4 后浏览器大概率没声音。
+    def media_video_stream(self, match, query):
+        """按容器与编码自动选播放方式
 
-        代价：输出不可 seek（管道流），前端会明确提示「此模式不能拖动」。
+        - `direct`    ：浏览器直接认 → 原文件，支持 Range（可拖动、秒开）
+        - `remux`     ：只是容器不认（mkv/avi）→ `-c:v copy` 换封装，几秒钟
+        - `transcode` ：编码不认（HEVC…）→ H.264 重编码。转封装救不了 HEVC，
+                        这是「点了转封装还是黑屏」的根因。
+
+        `?start=<秒>` 供前端拖动/续播时重连（fMP4 流没有时长信息，
+        浏览器自己 seek 不了）。
         """
         video = library.video_by_id(int(match.group(1)))
         if not video or not os.path.isfile(video["path"]):
             return self._json({"error": "视频不存在"}, 404)
+
+        ext = os.path.splitext(video["path"])[1].lower()
+        mode = http_util.video_mode(ext, video.get("codec") or "")
+        start = _float_param(query, "start")
+
+        if mode == http_util.MODE_DIRECT:
+            return self._serve_file(video["path"], max_age=600)
+
+        if mode != http_util.MODE_TRANSCODE:
+            return self._stream_pipe(video, mode, start, None)
+
+        # ---- 重编码 ----
+        cached = transcode.cache_path(video)
+        if cached and os.path.isfile(cached):
+            return self._serve_file(cached, content_type="video/mp4", max_age=600)
+
         ffmpeg = probe.find_tool("ffmpeg")
         if not ffmpeg:
-            return self._json({"error": "服务器未安装 ffmpeg，无法转封装"}, 503)
+            return self._json({"error": "服务器未安装 ffmpeg，无法转码播放"}, 503)
+        encoder = transcode.pick_encoder(ffmpeg)
+        if not encoder:
+            return self._json({"error": "这台电脑没有可用的 H.264 编码器"}, 503)
 
-        # 同一时刻只转一路：第二个请求排队等，等不到就明确告诉前端
-        if not _REMUX_SLOTS.acquire(timeout=REMUX_WAIT_SECONDS):
-            return self._json({"error": "正在转封装另一集，请稍后再试"}, 503)
+        # 整集转码放后台：用户从续播点看、或者中途退出，都不影响它转完落盘
+        job, has_cache = transcode.ensure_job(video, ffmpeg, encoder)
+        if has_cache and cached:
+            return self._serve_file(cached, content_type="video/mp4", max_age=600)
+        if job and start <= 0:
+            return self._tail_job(job)
+        # 拖动 / 续播：即时从目标点转，后台那个 job 继续把整集备好
+        return self._stream_pipe(video, mode, start, encoder)
 
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    def _tail_job(self, job):
+        """跟着后台转码任务的输出文件读：写多少发多少，读完即整集结束"""
+        self.close_connection = True
+        deadline = job.started + 4 * 3600
+        try:
+            self._send_headers(
+                200,
+                [
+                    ("Content-Type", "video/mp4"),
+                    ("Cache-Control", "no-store"),
+                    ("Accept-Ranges", "none"),
+                ],
+            )
+            position = 0
+            while True:
+                path = job.final_path if job.done.is_set() else job.part_path
+                try:
+                    with open(path, "rb") as handle:
+                        handle.seek(position)
+                        chunk = handle.read(RELAY_CHUNK)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    self.wfile.write(chunk)
+                    position += len(chunk)
+                    continue
+                if job.done.is_set():
+                    break
+                if time.monotonic() > deadline:
+                    print(f"[网页转码] 任务超时放弃: {job.key}")
+                    break
+                time.sleep(0.05)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return
 
-        cmd = [
-            ffmpeg, "-nostdin", "-loglevel", "error",
-            "-i", video["path"],
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "160k", "-ac", "2",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-            "-f", "mp4", "pipe:1",
-        ]
+    def _stream_pipe(self, video, mode, start, encoder):
+        """起 ffmpeg 把 fMP4 边转边吐给前端（用于换封装与拖动重连）"""
+        ffmpeg = probe.find_tool("ffmpeg")
+        if not ffmpeg:
+            return self._json({"error": "服务器未安装 ffmpeg，无法处理这个视频"}, 503)
+
+        transcoding = mode == http_util.MODE_TRANSCODE
+        slots = _TRANSCODE_SLOTS if transcoding else _REMUX_SLOTS
+        if not slots.acquire(timeout=REMUX_WAIT_SECONDS):
+            busy = "正在转码另一集，请稍后再试" if transcoding else "正在转封装另一集，请稍后再试"
+            return self._json({"error": busy}, 503)
+
+        cmd = transcode.build_cmd(ffmpeg, video["path"], mode, start, encoder)
         try:
             proc = subprocess.Popen(  # noqa: S603 - 参数为内部路径，无 shell
                 cmd,
@@ -534,14 +614,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 bufsize=0,
-                creationflags=creationflags,
+                creationflags=_creationflags(),
             )
         except OSError as e:
-            _REMUX_SLOTS.release()
+            slots.release()
             return self._json({"error": f"启动 ffmpeg 失败: {e}"}, 500)
 
-        # 没有 Content-Length 的流式响应：告诉客户端「读到连接关闭为止」
-        self.close_connection = True
+        self.close_connection = True  # 没有 Content-Length：读到连接关闭为止
         try:
             self._send_headers(
                 200,
@@ -557,15 +636,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError):
+            # 手机上拖进度条会主动断开，不是错误
             pass
         finally:
-            if proc.poll() is None:
-                proc.kill()
             with suppress(OSError):
                 proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
             with suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
-            _REMUX_SLOTS.release()
+            slots.release()
         return None
 
 
@@ -780,6 +860,16 @@ def _int_param(query, name, default=0):
         return default
     try:
         return int(values[0])
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_param(query, name, default=0.0):
+    values = query.get(name) or []
+    if not values:
+        return default
+    try:
+        return max(0.0, float(values[0]))
     except (TypeError, ValueError):
         return default
 

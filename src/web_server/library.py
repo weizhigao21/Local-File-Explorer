@@ -26,7 +26,7 @@ from video_manager import database as video_db
 from video_manager import probe
 from video_manager import scanner as video_scanner
 from video_manager.progress import decide_progress
-from web_server import http_util
+from web_server import http_util, transcode
 
 # ==================== 初始化 ====================
 
@@ -785,7 +785,8 @@ def video_work_videos(work_id):
     items = []
     for index, video in enumerate(videos):
         ext = os.path.splitext(video["path"])[1].lower()
-        playable = http_util.browser_playable(ext, video.get("codec") or "")
+        codec = video.get("codec") or ""
+        mode = http_util.video_mode(ext, codec)
         items.append(
             {
                 "id": video["id"],
@@ -795,10 +796,12 @@ def video_work_videos(work_id):
                 "size": int(video.get("size") or 0),
                 "width": int(video.get("width") or 0),
                 "height": int(video.get("height") or 0),
-                "codec": video.get("codec") or "",
+                "codec": codec,
                 "ext": ext,
-                "playable": playable,
+                "mode": mode,
+                "playable": mode == http_util.MODE_DIRECT,
                 "url": f"/media/video/{video['id']}",
+                "stream_url": f"/media/video-stream/{video['id']}",
                 "remux_url": f"/media/video-remux/{video['id']}",
                 "progress_ms": int(progress.get(video["path"], 0)),
             }
@@ -825,21 +828,30 @@ def video_by_id(video_id):
 
 
 def video_play_info(video_id):
-    """播放前信息：真实路径只留在服务端，前端只拿到续播点与可播性"""
+    """播放前信息：真实路径只留在服务端，前端只拿到续播点与播放方式"""
     video = video_by_id(video_id)
     if not video:
         return None
     position, duration = video_db.get_progress(video["path"])
     ext = os.path.splitext(video["path"])[1].lower()
+    codec = video.get("codec") or ""
+    mode = http_util.video_mode(ext, codec)
+    # 已经转好并落盘的：服务端会当普通 mp4 发（Range 可用），前端可以按直连处理，
+    # 不用再走「?start= 重连」那套，进度条也就不需要凭数据库时长偏算
+    converted = transcode.cache_path(video)
+    cached = bool(converted and os.path.isfile(converted))
     return {
         "id": video["id"],
         "name": video["name"],
         "duration_ms": int(video.get("duration_ms") or duration or 0),
         "position_ms": int(position),
-        "codec": video.get("codec") or "",
+        "codec": codec,
         "ext": ext,
-        "playable": http_util.browser_playable(ext, video.get("codec") or ""),
+        "mode": mode,
+        "cached": cached,
+        "playable": mode == http_util.MODE_DIRECT,
         "url": f"/media/video/{video['id']}",
+        "stream_url": f"/media/video-stream/{video['id']}",
         "remux_url": f"/media/video-remux/{video['id']}",
     }
 

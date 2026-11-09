@@ -949,11 +949,28 @@ def test_video_controls_do_not_fade_while_paused():
     assert "v-idle" in show
 
 
-def test_video_seek_bar_is_disabled_for_remux_stream():
-    """转封装是 ffmpeg 管道流（Accept-Ranges: none），拖了也没用，必须置灰"""
+def test_video_seek_restarts_stream_instead_of_seeking():
+    """fMP4 流没有总时长，浏览器自己 seek 不了：拖动必须让服务端从目标点重新起转
+
+    早先的做法是「流模式下把进度条置灰」，但用户真正想要的是能拖——
+    `?start=` 重连比「完全不能拖」好用得多，代价只是重新缓冲几秒。
+    """
     js = _static_text("app.js")
-    remux = _js_block(js, "function useRemux(")
-    assert "setVideoSeekable(false)" in remux, "转封装模式下进度条没置灰"
+    commit = _js_block(js, "function commitVideoSeek(")
+    assert "state.video.streaming" in commit, "拖动没有区分直连与流模式"
+    assert "startStream(target)" in commit, "流模式拖动没有重新起流"
+    assert "videoEl.currentTime = target" in commit, "直连模式还得能本地 seek"
+
+    stream = _js_block(js, "function startStream(")
+    assert "setVideoSeekable(false)" not in stream, "流模式不该再把进度条置灰"
+
+
+def test_stream_url_encodes_start_offset():
+    """拖动重连靠 ?start=<秒>，拼错就退回从头转——白等一次"""
+    js = _static_text("app.js")
+    url = _js_block(js, "function streamUrl(")
+    assert "?start=" in url
+    assert "Math.round(start)" in url, "start 得取整，小数进了 query 会变 400"
 
 
 def test_video_controls_bar_is_self_positioned():
@@ -1404,11 +1421,18 @@ def test_media_supports_sendfile_with_fallback():
     assert "file_obj.read(min(http_util.CHUNK_SIZE, remaining))" in source
 
 
-def test_remux_is_single_flight():
-    """快速切集会同时起多个 ffmpeg，全都更慢——必须限成一次一路"""
+def test_ffmpeg_streams_are_single_flight():
+    """快速切集会同时起多个 ffmpeg，全都更慢——转码与转封装各限一路
+
+    两个信号量必须分开：共用一个的话「一边转码一边翻看另一集」会互相卡死。
+    """
     source = _app_source()
-    assert "_REMUX_SLOTS.acquire(" in source
-    assert source.count("_REMUX_SLOTS.release()") == 2, "启动失败与 finally 各要放一次"
+    assert "_REMUX_SLOTS = threading.Semaphore(1)" in source
+    assert "_TRANSCODE_SLOTS = threading.Semaphore(1)" in source
+    assert "slots = _TRANSCODE_SLOTS if transcoding else _REMUX_SLOTS" in source, \
+        "转码没有走自己的信号量"
+    assert "slots.acquire(timeout=REMUX_WAIT_SECONDS)" in source
+    assert "slots.release()" in source, "拿不到槽位时要放回去"
 
 
 # ==================== 前端守卫：分页 / 缩放 / 返回上级 ====================

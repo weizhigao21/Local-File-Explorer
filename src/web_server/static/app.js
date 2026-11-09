@@ -129,7 +129,15 @@
     repaint: null,
     autoLoad: null,
     audio: { queue: [], index: -1, playlist: null, cues: [], cuePos: -1 },
-    video: { workId: null, videos: [], index: 0, info: null, remux: false, resume: 0, savedAt: 0 },
+    video: {
+      workId: null, videos: [], index: 0, info: null, resume: 0, savedAt: 0,
+      // 播放方式：direct 原文件 / remux 换容器 / transcode 重编码
+      mode: 'direct',
+      // 走 ffmpeg 流时为 true：此时 currentTime 是「从起点算的秒数」，
+      // 展示与上报都要加 offset（流是从源片第 offset 秒开始转的）
+      streaming: false,
+      offset: 0,
+    },
     // source 可以是 pagedGrid（带 items/total/loadMore），也可以是普通数组
     lightbox: { source: null, index: 0, orig: '', swipe: null },
   };
@@ -1621,7 +1629,9 @@
         ? Math.min(1, video.progress_ms / video.duration_ms)
         : 0;
       const tags = [];
-      if (!video.playable) tags.push(el('span', { class: 'pill warn', text: '需转封装' }));
+      const mode = video.mode || (video.playable ? 'direct' : 'remux');
+      if (mode === 'transcode') tags.push(el('span', { class: 'pill warn', text: '需转码' }));
+      else if (mode === 'remux') tags.push(el('span', { class: 'pill warn', text: '需换封装' }));
       if (video.codec) tags.push(el('span', { class: 'pill', text: video.codec.toUpperCase() }));
       if (video.height) tags.push(el('span', { class: 'pill', text: `${video.height}p` }));
       if (video.size) tags.push(el('span', { text: fmtSize(video.size) }));
@@ -1704,7 +1714,9 @@
     const video = state.video.videos[index];
     if (!video) return;
     state.video.index = index;
-    state.video.remux = false;
+    state.video.streaming = false;
+    state.video.offset = 0;
+    state.video.resume = 0;
     setVideoSeekable(true);
     syncVideoPlay();
     $('video-overlay').querySelector('.v-title').textContent = video.name;
@@ -1718,35 +1730,71 @@
       return;
     }
     state.video.info = info;
-    state.video.resume = info.position_ms || 0;
+    state.video.mode = info.mode || (info.playable ? 'direct' : 'remux');
     state.video.savedAt = 0;
 
-    if (info.playable) {
-      videoEl.src = info.url;
+    if (state.video.mode === 'direct' || info.cached) {
+      // 原文件就认，或者这一集已经转好落盘了：都是完整的 mp4，直接播 + 本地 seek
+      state.video.resume = info.position_ms || 0;
+      videoEl.src = info.stream_url || info.url;
+      videoEl.play().catch(() => {
+        /* 自动播放被拦截时用户点一下即可 */
+      });
     } else {
-      useRemux();
+      // 浏览器不认这个容器/编码：直接从续播点开始转，服务端用 -ss 跳过去
+      const resumeMs = info.position_ms || 0;
+      const durMs = info.duration_ms || 0;
+      const keep = resumeMs > 3000 && (!durMs || resumeMs < durMs - 5000);
+      startStream(keep ? resumeMs / 1000 : 0);
+      if (keep) toast(`已从 ${fmtDuration(resumeMs)} 继续`);
     }
     ensureVideoFullscreen();
+  }
+
+  /** 流地址；start > 0 时让服务端从那一秒开始重新转（拖动/续播都靠它） */
+  function streamUrl(start) {
+    const info = state.video.info;
+    if (!info) return '';
+    const base = info.stream_url || info.remux_url;
+    return start > 0.5 ? `${base}?start=${Math.round(start)}` : base;
+  }
+
+  /** 展示用的绝对秒数（流模式要加 offset） */
+  function videoTime() {
+    const value = videoEl.currentTime || 0;
+    return state.video.streaming ? (state.video.offset || 0) + value : value;
+  }
+
+  /** 起 / 重起 ffmpeg 流。拖动进度条也是走这里，不是 seek */
+  function startStream(start) {
+    const info = state.video.info;
+    if (!info) return;
+    state.video.streaming = true;
+    state.video.offset = Math.max(0, start || 0);
+    videoEl.src = streamUrl(state.video.offset);
+    if (state.video.mode === 'transcode') {
+      showVideoNote('正在把画面转成 H.264（显卡加速）：开头等几秒，之后再拖会重新起转。', [
+        { label: '用原格式试播', onclick: playDirect },
+      ]);
+    } else {
+      showVideoNote('正在换封装播放：开头等几秒。', [
+        { label: '用原格式试播', onclick: playDirect },
+      ]);
+    }
     videoEl.play().catch(() => {
       /* 自动播放被拦截时用户点一下即可 */
     });
   }
 
-  function useRemux() {
+  /** 放弃流，直接用原文件试（Safari/iOS 能解 HEVC，省一次转码） */
+  function playDirect() {
     const info = state.video.info;
     if (!info) return;
-    state.video.remux = true;
-    setVideoSeekable(false);
-    videoEl.src = info.remux_url;
-    showVideoNote('正在转封装播放：需要几秒才开始，此模式不能拖动进度条。', [
-      { label: '用原格式试播', onclick: () => {
-        state.video.remux = false;
-        setVideoSeekable(true);
-        videoEl.src = info.url;
-        videoEl.play().catch(() => {});
-        $('v-note').hidden = true;
-      } },
-    ]);
+    state.video.streaming = false;
+    state.video.offset = 0;
+    videoEl.src = info.url;
+    videoEl.play().catch(() => {});
+    $('v-note').hidden = true;
   }
 
   function showVideoNote(text, buttons) {
@@ -1763,11 +1811,11 @@
   function saveVideoProgress(beacon) {
     const info = state.video.info;
     if (!info) return;
-    const position = Math.round((videoEl.currentTime || 0) * 1000);
+    const position = Math.round(videoTime() * 1000);
     if (!position) return;
     const body = JSON.stringify({
       position_ms: position,
-      duration_ms: Math.round((videoEl.duration || 0) * 1000),
+      duration_ms: Math.round(videoDuration() * 1000) || info.duration_ms || 0,
     });
     const url = `/api/video/videos/${info.id}/progress`;
     if (beacon && navigator.sendBeacon) {
@@ -1794,8 +1842,13 @@
   let vIdleTimer = 0;
 
   function videoDuration() {
+    const known = (state.video.info && state.video.info.duration_ms) || 0;
+    // fMP4 流的 mvhd 里没有总时长，Edge/Chrome 会把「当前已缓冲多久」当 duration
+    // 报上来（实测播了 11 秒就报 duration=11），必须换成 ffprobe 探到的真实时长
+    if (state.video.streaming) return known ? known / 1000 : 0;
     const value = videoEl.duration;
-    return Number.isFinite(value) && value > 0 ? value : 0;
+    if (Number.isFinite(value) && value > 0) return value;
+    return known ? known / 1000 : 0;
   }
 
   /** 滑块位置（0~1000 千分比）→ 目标秒数 */
@@ -1812,7 +1865,7 @@
     const duration = videoDuration();
     setText($('v-dur'), duration ? fmtClock(duration) : '--:--');
     if (!vSeek.dataset.dragging) {
-      const now = videoEl.currentTime || 0;
+      const now = videoTime();
       setText($('v-pos'), fmtClock(now));
       if (duration) {
         const value = String(Math.round((now / duration) * 1000));
@@ -1825,7 +1878,7 @@
     vOverlay.classList.remove('v-idle');
     if (vIdleTimer) { clearTimeout(vIdleTimer); vIdleTimer = 0; }
     // 播放中才淡出：暂停时控件必须留着，否则用户找不到播放按钮
-    if (!videoEl.paused && !state.video.remux) {
+    if (!videoEl.paused) {
       vIdleTimer = setTimeout(() => {
         vIdleTimer = 0;
         vOverlay.classList.add('v-idle');
@@ -1838,7 +1891,14 @@
     if (!vSeek.dataset.dragging) return;
     delete vSeek.dataset.dragging;
     const target = videoTarget();
-    if (target > 0) videoEl.currentTime = target;
+    if (target > 0) {
+      if (state.video.streaming) {
+        // 流没有总时长也 seek 不了：让服务端从目标点重新起转
+        startStream(target);
+      } else {
+        videoEl.currentTime = target;
+      }
+    }
     syncVideoTime();
     showVideoControls();
   }
@@ -1947,8 +2007,9 @@
   });
 
   videoEl.addEventListener('loadedmetadata', () => {
+    // 流模式的起点已经在 startStream 里带上了，不需要再 seek 一次
     const resume = state.video.resume;
-    if (state.video.remux || !resume) return;
+    if (state.video.streaming || !resume) return;
     const durationMs = (videoEl.duration || 0) * 1000;
     if (resume > 3000 && (!durationMs || resume < durationMs - 5000)) {
       videoEl.currentTime = resume / 1000;
@@ -1957,18 +2018,22 @@
     state.video.resume = 0;
   });
 
+  // 流开始出画面就把「正在转码」的提示条收掉，别一直挡着画面
+  videoEl.addEventListener('loadeddata', () => {
+    if (state.video.streaming) $('v-note').hidden = true;
+  });
+
   videoEl.addEventListener('timeupdate', () => {
     const now = Date.now();
-    if (state.video.remux) return;
     if (now - state.video.savedAt > 10000) {
       state.video.savedAt = now;
       saveVideoProgress(false);
     }
   });
 
-  videoEl.addEventListener('pause', () => { if (!state.video.remux) saveVideoProgress(false); });
+  videoEl.addEventListener('pause', () => { saveVideoProgress(false); });
   videoEl.addEventListener('ended', () => {
-    if (!state.video.remux) saveVideoProgress(false);
+    saveVideoProgress(false);
     // ended 时浏览器不发 pause 事件，图标和控件条得自己收尾（最后一集不会切集）
     syncVideoPlay();
     showVideoControls();
@@ -1978,12 +2043,14 @@
 
   videoEl.addEventListener('error', () => {
     if (!videoEl.src) return;
-    if (!state.video.remux) {
-      showVideoNote('浏览器打不开这个视频的原格式，可以试试转封装播放。', [
-        { label: '转封装播放', onclick: useRemux },
+    if (state.video.streaming) {
+      showVideoNote('转码也失败了，可能是源文件损坏或显卡编码器不可用。', [
+        { label: '用原格式试播', onclick: playDirect },
       ]);
     } else {
-      showVideoNote('转封装也失败了，这个编码可能手机不支持，回电脑上看吧。');
+      showVideoNote('浏览器打不开这个视频的原格式，可以试试转码播放。', [
+        { label: '转码播放', onclick: () => startStream(videoTime()) },
+      ]);
     }
   });
 
@@ -1992,17 +2059,17 @@
   });
 
   window.addEventListener('pagehide', () => {
-    if (!$('video-overlay').hidden && !state.video.remux) saveVideoProgress(true);
+    if (!$('video-overlay').hidden) saveVideoProgress(true);
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && !$('video-overlay').hidden && !state.video.remux) {
+    if (document.hidden && !$('video-overlay').hidden) {
       saveVideoProgress(false);
     }
   });
 
   function closeVideo() {
-    if (!state.video.remux) saveVideoProgress(false);
+    saveVideoProgress(false);
     videoEl.pause();
     videoEl.removeAttribute('src');
     videoEl.load();
