@@ -357,7 +357,7 @@ python src/main.py
     │   ├── system_dialog.py    # 系统集成对话框（注册为默认播放器）
     │   ├── hotkeys.py          # Windows 全局热键（Ctrl+Alt+Space / ← / →）
     │   └── audio_threads.py    # 音频后台线程（扫描、mtime 迁移、时长探测、DLsite 并行抓取）
-    └── tests/                  # 单元测试（714 条）
+    └── tests/                  # 单元测试（715 条）
         ├── conftest.py                # pytest 配置（固定 PyQt6 binding）
         ├── test_natural_key.py        # 自然排序
         ├── test_database.py           # 写真数据库
@@ -510,7 +510,7 @@ python -m pytest tests/ -q
 python -m ruff check .
 ```
 
-测试覆盖（共 714 条）：
+测试覆盖（共 715 条）：
 - `test_natural_key.py` - 自然排序逻辑（纯数字、混合、中文、多段、边界等 7 个场景）
 - `test_database.py` - 数据库 schema、CRUD、增量同步、级联删除、长连接、`INSERT OR IGNORE` 被忽略时的 id 复用（19 个场景）
 - `test_fingerprint_cache.py` - 目录指纹生成、缓存、变化检测、目录级指纹、v1→v2 迁移（27 个场景）
@@ -530,7 +530,7 @@ python -m ruff check .
 - `test_thread_lifecycle.py` - 关闭窗口时停止扫描线程、超时线程引用保留（7 个场景）
 - `test_ui_qss.py` - QSS 静态扫描 + Qt 实测不再产生 `Could not parse stylesheet`（3 个场景）
 - `test_ui_theme.py` - 设计令牌单一来源、各模块 re-export 一致性（4 个场景）
-- `test_video_transcode.py` - 网页播放方式判定（HEVC 必须重编码而不是换封装）、各编码器命令与质量参数、`-ss` 在 `-i` 之前、转码缓存命名/淘汰、后台任务落盘与失败清理（33 个场景）
+- `test_video_transcode.py` - 网页播放方式判定（HEVC 必须重编码而不是换封装）、各编码器命令与质量参数、`-ss` 在 `-i` 之前、转码缓存命名/淘汰、后台任务落盘、失败清理与异常退出后的孤儿 .part 自愈（34 个场景）
 
 ## 资源目录结构要求
 

@@ -137,6 +137,21 @@ def test_sweep_noop_when_under_limit(tmp_path):
     assert transcode.sweep(str(tmp_path), max_bytes=10**6) == 0
 
 
+def test_sweep_removes_orphan_part_files(tmp_path):
+    """程序被强杀时 shutdown 来不及跑，超一天的 .part 要能自愈清掉"""
+    stale = tmp_path / "old.mp4.part"
+    stale.write_bytes(b"x" * 100)
+    os.utime(stale, (1000, 1000))  # 很久以前
+
+    fresh = tmp_path / "now.mp4.part"
+    fresh.write_bytes(b"x" * 100)
+
+    transcode.sweep(str(tmp_path), max_bytes=10**9)
+
+    assert not stale.exists(), "过期的孤儿 .part 没清掉"
+    assert fresh.exists(), "刚写的 .part 不能动"
+
+
 # ==================== 后台整集转码任务 ====================
 #
 # 转码不能挂在某一次 HTTP 连接上：用户切集/退出会 kill ffmpeg，缓存永远建不起来；

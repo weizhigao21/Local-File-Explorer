@@ -154,6 +154,25 @@ def sweep(cache_dir=None, max_bytes=None):
         names = os.listdir(cache_dir)
     except OSError:
         return 0
+
+    # 先扫孤儿 .part：程序被强杀（断电/任务管理器）时 shutdown 来不及跑，
+    # 会留下几百 MB 的临时文件。超过一天且没有任务在写就删掉。
+    active_parts = set()
+    with _JOBS_LOCK:
+        active_parts = {job.part_path for job in _JOBS.values() if job.running}
+    now = time.time()
+    for name in names:
+        if not name.endswith(".part"):
+            continue
+        full = os.path.join(cache_dir, name)
+        if full in active_parts:
+            continue
+        try:
+            if now - os.stat(full).st_mtime > 24 * 3600:
+                os.remove(full)
+        except OSError:
+            continue
+
     for name in names:
         if not name.endswith(".mp4"):
             continue
