@@ -495,3 +495,46 @@ def set_subtitle_offset(path, offset_ms):
             "UPDATE tracks SET subtitle_offset = ? WHERE path = ?",
             (int(offset_ms), path),
         )
+
+
+def _escape_like(text):
+    """转义 LIKE 通配符，让用户输入的 % 和 _ 按字面匹配"""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search(keyword, limit=8):
+    """跨模块搜索用：歌单名 + 曲名各查一批
+
+    歌单和曲目分开返回：命中的是歌单就跳歌单，命中的是歌就直接进那个歌单，
+    比把两种东西混成一个列表更好判断「点下去会到哪」。
+    """
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return {"playlist_total": 0, "track_total": 0, "playlists": [], "tracks": []}
+    like = f"%{_escape_like(keyword)}%"
+    limit = max(1, int(limit or 8))
+    with get_conn() as conn:
+        playlist_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM playlists WHERE name LIKE ? ESCAPE '\\'", (like,)
+        ).fetchone()["c"]
+        playlists = conn.execute(
+            "SELECT id, name, cover, track_count FROM playlists"
+            " WHERE name LIKE ? ESCAPE '\\' ORDER BY name LIMIT ?",
+            (like, limit),
+        ).fetchall()
+        track_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM tracks WHERE title LIKE ? ESCAPE '\\'", (like,)
+        ).fetchone()["c"]
+        tracks = conn.execute(
+            "SELECT t.id, t.title, t.playlist_id, p.name AS playlist"
+            " FROM tracks t JOIN playlists p ON p.id = t.playlist_id"
+            " WHERE t.title LIKE ? ESCAPE '\\'"
+            " ORDER BY p.name, t.track_number, t.id LIMIT ?",
+            (like, limit),
+        ).fetchall()
+    return {
+        "playlist_total": int(playlist_total or 0),
+        "track_total": int(track_total or 0),
+        "playlists": [dict(row) for row in playlists],
+        "tracks": [dict(row) for row in tracks],
+    }

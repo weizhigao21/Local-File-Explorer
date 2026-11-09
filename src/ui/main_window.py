@@ -1,6 +1,9 @@
+import os
+
 from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -8,6 +11,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -18,6 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import file_ops
 from resource_manager import config, scanner
 from resource_manager import database as db
 from ui.flow_layout import FlowLayout
@@ -27,6 +32,11 @@ from ui.photo_theme import ACCENT, ACCENT_TINT, BTN_QSS, GLOBAL_SCROLLBAR_QSS
 from ui.photo_widgets import ScanThread, SettingsDialog
 from ui.thread_guard import stop_scan_thread
 from ui.work_images_view import WorkImagesView
+
+# 作品墙每页卡片数：一屏约 12~15 张（卡片 240×280），60 张约 4~5 屏。
+# 之前是一次性建全部卡片（371 张实测 336ms，FlowLayout 触发 39 次全量重排），
+# 库一大就整窗卡住；分页后建卡数量与库容量解耦。
+WORKS_PAGE_SIZE = 60
 
 
 class MainWindow(QMainWindow):
@@ -125,7 +135,7 @@ class MainWindow(QMainWindow):
         self.back_btn.clicked.connect(self.on_back_clicked)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("搜索作品名称...")
+        self.search_box.setPlaceholderText("搜索作品或作者名...")
         self.search_box.setStyleSheet(
             f"""
             QLineEdit {{
@@ -170,6 +180,12 @@ class MainWindow(QMainWindow):
         self.grid_layout = FlowLayout(self.grid_container, margin=16, h_spacing=16, v_spacing=16)
         self.works_scroll.setWidget(self.grid_container)
         works_page_layout.addWidget(self.works_scroll)
+
+        # 分页条：作品多时才有意义，条数装得下一页时整条隐藏
+        self._works_page = 1
+        self._works_total = 0
+        self.pager = self._build_pager()
+        works_page_layout.addWidget(self.pager)
 
         # 滚动条步进：按一行卡片高度滚动，避免一次跳太多
         self._work_card_h = 280 + 16  # WorkCard 高度 280 + v_spacing 16
@@ -287,6 +303,13 @@ class MainWindow(QMainWindow):
         return bar
 
     def load_authors(self):
+        # 重建后必须静默恢复选中项：clear() 会让列表没有当前项，视图在随后的
+        # 布局里会自动选中第 0 行并发出 currentItemChanged —— 那一下会走
+        # on_author_changed，把正在看图片墙的用户踢回作品列表（搜索跳转、
+        # 扫描完成刷新都会踩到）。这里全程 blockSignals，选中项自己恢复。
+        current = self.author_list.currentItem()
+        keep = current.data(Qt.ItemDataRole.UserRole) if current else None
+        self.author_list.blockSignals(True)
         self.author_list.clear()
 
         all_item = QListWidgetItem("全部作者")
@@ -297,6 +320,15 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{author['name']} ({author['work_count']})")
             item.setData(Qt.ItemDataRole.UserRole, author["id"])
             self.author_list.addItem(item)
+
+        row = 0
+        if keep is not None:
+            for index in range(self.author_list.count()):
+                if self.author_list.item(index).data(Qt.ItemDataRole.UserRole) == keep:
+                    row = index
+                    break
+        self.author_list.setCurrentRow(row)
+        self.author_list.blockSignals(False)
 
     def on_author_changed(self, current, previous):
         if current is None:
@@ -311,7 +343,71 @@ class MainWindow(QMainWindow):
                 old.deleteLater()
         self.load_works()
 
-    def load_works(self):
+    def _build_pager(self):
+        """作品墙底部分页条（上一页 / 页码 / 下一页）
+
+        按钮单独写样式而不是复用 BTN_QSS：BTN_QSS 没有 :disabled 分支，
+        禁用态会和可用态长得一样，用户点了没反应会以为坏了。
+        """
+        bar = QWidget()
+        bar.setStyleSheet("background-color: #F4EFE7;")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(16, 2, 16, 10)
+        row.setSpacing(12)
+
+        btn_qss = f"""
+        QPushButton {{
+            background-color: #EDE2CE; color: #3D3830;
+            padding: 5px 16px; border: 1px solid #E0D5C2; border-radius: 4px;
+        }}
+        QPushButton:hover {{ background-color: #F3EFE8; border: 1px solid {ACCENT}; }}
+        QPushButton:pressed {{ background-color: #9E4B30; border: 1px solid #9E4B30; color: #fff; }}
+        QPushButton:disabled {{ background-color: #F0EADE; color: #B5A992; border: 1px solid #E4DACB; }}
+        """
+
+        self.prev_page_btn = QPushButton("‹ 上一页")
+        self.next_page_btn = QPushButton("下一页 ›")
+        for btn in (self.prev_page_btn, self.next_page_btn):
+            btn.setStyleSheet(btn_qss)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prev_page_btn.clicked.connect(lambda: self._goto_works_page(self._works_page - 1))
+        self.next_page_btn.clicked.connect(lambda: self._goto_works_page(self._works_page + 1))
+
+        self.page_label = QLabel()
+        self.page_label.setStyleSheet("color: #6B6255; font-size: 12px; background: transparent;")
+
+        row.addStretch()
+        row.addWidget(self.prev_page_btn)
+        row.addWidget(self.page_label)
+        row.addWidget(self.next_page_btn)
+        row.addStretch()
+        bar.setVisible(False)
+        return bar
+
+    def _update_pager(self):
+        """按当前页码/总数刷新分页条：只有一页就整条隐藏"""
+        pages = max(1, -(-self._works_total // WORKS_PAGE_SIZE))
+        self.pager.setVisible(pages > 1)
+        if pages <= 1:
+            return
+        self.page_label.setText(f"第 {self._works_page} / {pages} 页 · 共 {self._works_total} 个")
+        self.prev_page_btn.setEnabled(self._works_page > 1)
+        self.next_page_btn.setEnabled(self._works_page < pages)
+
+    def _goto_works_page(self, page):
+        """翻页：页码越界直接忽略，翻完滚回顶部"""
+        pages = max(1, -(-self._works_total // WORKS_PAGE_SIZE))
+        page = min(max(int(page), 1), pages)
+        if page == self._works_page:
+            return
+        self._works_page = page
+        self.load_works(reset_page=False)
+        self.works_scroll.verticalScrollBar().setValue(0)
+
+    def load_works(self, reset_page=True):
+        if reset_page:
+            self._works_page = 1
+
         # 重建期间禁用布局更新，避免每添加一个 widget 就重排
         self.grid_container.setUpdatesEnabled(False)
         self.grid_container.setVisible(False)
@@ -325,12 +421,26 @@ class MainWindow(QMainWindow):
 
         current = self.author_list.currentItem()
         author_id = current.data(Qt.ItemDataRole.UserRole) if current else None
+        keyword = self.search_box.text().strip()
 
-        # 建立该作者的全部卡片，搜索只做显隐过滤（输入时无需重建）
-        works = db.list_works(author_id)
+        # 作者 + 关键词 + 分页全部下推到 SQL：只建当前页的卡片，
+        # 建卡数量与库容量解耦（搜索也不必"全建再显隐"）
+        self._works_total, works = db.list_works_page(
+            author_id, keyword, self._works_page, WORKS_PAGE_SIZE
+        )
+        # 页码越界（比如换作者后总页数变少）时回落到最后一页重查
+        if not works and self._works_total > 0 and self._works_page > 1:
+            self._works_page = max(1, -(-self._works_total // WORKS_PAGE_SIZE))
+            self._works_total, works = db.list_works_page(
+                author_id, keyword, self._works_page, WORKS_PAGE_SIZE
+            )
+
         for work in works:
             card = WorkCard(work)
             card.clicked.connect(self.open_work)
+            card.customContextMenuRequested.connect(
+                lambda pos, c=card: self._show_work_menu(c, pos)
+            )
             self.grid_layout.addWidget(card)
             self._work_cards.append(card)
 
@@ -344,22 +454,21 @@ class MainWindow(QMainWindow):
         self.grid_container.adjustSize()
         # 设置滚动条步进为单行卡片高度
         self.works_scroll.verticalScrollBar().setSingleStep(self._work_card_h)
-        self._apply_search_filter()
+        self._update_pager()
         # 延迟触发首次懒加载，确保布局已经计算完毕
         QTimer.singleShot(0, self._load_visible_work_cards)
 
     def _on_search_changed(self, _text):
-        """搜索框输入防抖：停顿后仅做显隐过滤，不查库、不重建卡片"""
+        """搜索框输入防抖：停顿后按关键词重查数据库（分页从第 1 页开始）"""
         self._search_timer.start()
 
     def _apply_search_filter(self):
-        """按搜索关键字显示/隐藏卡片（FlowLayout 会跳过隐藏卡片重排）"""
-        keyword = self.search_box.text().strip().lower()
-        for card in self._work_cards:
-            card.setVisible(not keyword or keyword in card.work["name"].lower())
-        # 显隐变化后重排并让滚动区域重新计算高度
-        self.grid_layout.invalidate()
-        self.grid_container.updateGeometry()
+        """执行搜索：关键词下推到 SQL 后重建当前页
+
+        旧实现是「建全部卡片再按文字 setVisible」——卡片总数不随结果变化，
+        库一大输入就卡。现在命中多少条由 SQL 决定，只建当页。
+        """
+        self.load_works(reset_page=True)
 
     def _on_works_scroll(self, _value):
         self._works_scroll_timer.start()
@@ -447,6 +556,33 @@ class MainWindow(QMainWindow):
         """刷新作品列表"""
         self.load_authors()
         self.load_works()
+
+    def _show_work_menu(self, card, pos):
+        """作品卡右键：一个「本地资源管理器」至少要能把人送到文件所在处"""
+        work = card.work
+        path = work.get("path") or ""
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #FBF7F0; border: 1px solid #E8DECB; padding: 4px; }"
+            f"QMenu::item {{ padding: 5px 22px; color: #3D3830; font-size: 12px;"
+            f" border-radius: 3px; }}"
+            f"QMenu::item:selected {{ background-color: {ACCENT_TINT}; }}"
+            "QMenu::item:disabled { color: #A89880; }"
+        )
+        act_open = menu.addAction("在资源管理器中打开")
+        menu.addSeparator()
+        act_copy_path = menu.addAction("复制作品路径")
+        act_copy_name = menu.addAction("复制作品名")
+        act_open.setEnabled(bool(path) and os.path.isdir(path))
+
+        chosen = menu.exec(card.mapToGlobal(pos))
+        if chosen is act_open:
+            if not file_ops.reveal(path):
+                QMessageBox.information(self, "打开失败", f"这个路径现在打不开：\n{path}")
+        elif chosen is act_copy_path:
+            QApplication.clipboard().setText(path)
+        elif chosen is act_copy_name:
+            QApplication.clipboard().setText(work.get("name") or "")
 
     def open_work(self, work):
         images = db.get_images_by_work(work["id"])

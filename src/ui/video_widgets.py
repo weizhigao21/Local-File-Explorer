@@ -178,6 +178,7 @@ class VideoCard(QFrame):
             f" background: transparent; border: none; }}"
         )
         layout.addWidget(meta)
+        self.meta = meta  # 子类（ResumeCard）要改这行文案
 
         self._apply_duration_badge(work.get("total_duration_ms", 0), work.get("video_count", 0))
 
@@ -267,6 +268,76 @@ class VideoCard(QFrame):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class ResumeCard(VideoCard):
+    """「继续观看」卡片：作品封面 + 底部进度条 + 还剩多久 + 集数角标
+
+    复用 VideoCard 的封面懒加载和样式，只换角标与 meta 文案——
+    另起一套卡片会和作品卡很快长出两套视觉，之后改配色要改两处。
+    """
+
+    def __init__(self, item, parent=None):
+        self.item = item
+        # 封面按作品取（同一作品的续播记录会显示同一张图，这是对的：
+        # 用户认的是「那部片子」，不是某一次播放）
+        work = {
+            "name": item.get("work_name") or item.get("video_name") or "",
+            "author": item.get("author") or "",
+            "thumbnail": item.get("thumbnail") or "",
+            "path": item.get("work_path") or "",
+            "video_count": 0,
+            "total_duration_ms": 0,
+        }
+        super().__init__(work, parent)
+        self.meta.setText(self._resume_text(item))
+        self.meta.setToolTip(
+            f"{item.get('video_name') or ''}\n看到 {format_duration(item.get('position_ms'))}"
+        )
+        self._apply_resume_badge(item)
+        self._add_progress_bar(item)
+
+    @staticmethod
+    def _resume_text(item):
+        position = int(item.get("position_ms") or 0)
+        duration = int(item.get("duration_ms") or 0)
+        author = item.get("author") or "未分类"
+        if duration > position:
+            return f"{author} · 还剩 {format_duration(duration - position)}"
+        return f"{author} · 已看 {format_duration(position)}"
+
+    def _apply_resume_badge(self, item):
+        """角标换成集数/文件名——续播页里「看到哪一集」比总时长重要"""
+        name = (item.get("video_name") or "").strip()
+        if not name:
+            return
+        if len(name) > 10:
+            name = name[:10] + "…"
+        self.badge.setText(name)
+        self.badge.adjustSize()
+        self.badge.setFixedHeight(18)
+        width = min(self.badge.width(), COVER_W - 12)
+        self.badge.setGeometry(COVER_W - width - 6, COVER_H - 24, width, 18)
+        self.badge.show()
+
+    def _add_progress_bar(self, item):
+        """封面底部 4px 进度条：先放浅色底槽，再放强调色实条（后创建的在上层）"""
+        position = int(item.get("position_ms") or 0)
+        duration = int(item.get("duration_ms") or 0)
+        ratio = 0.0 if duration <= 0 else max(0.0, min(1.0, position / duration))
+        width = max(2, int(COVER_W * ratio))
+
+        self.track = QFrame(self.cover)
+        self.track.setObjectName("resumeTrack")
+        self.track.setGeometry(0, COVER_H - 4, COVER_W, 4)
+        self.track.setStyleSheet("#resumeTrack { background-color: #D8CBB4; border: none; }")
+
+        self.progress = QFrame(self.cover)
+        self.progress.setObjectName("resumeProgress")
+        self.progress.setGeometry(0, COVER_H - 4, width, 4)
+        self.progress.setStyleSheet(
+            f"#resumeProgress {{ background-color: {ACCENT}; border: none; }}"
+        )
 
 
 # ==================== 扫描线程 ====================

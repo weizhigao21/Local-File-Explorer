@@ -242,14 +242,8 @@ def photo_authors():
 
 
 def photo_works(author_id=None, keyword=""):
-    works = photo_db.list_works(author_id)
-    keyword = (keyword or "").strip().lower()
-    if keyword:
-        works = [
-            w for w in works
-            if keyword in (w.get("name") or "").lower()
-            or keyword in (w.get("author") or "").lower()
-        ]
+    # 关键词下推到 SQL（作品名 + 作者名），不再把整库读进内存后 Python 过滤
+    works = photo_db.list_works(author_id, keyword)
     return [
         {
             "id": w["id"],
@@ -263,8 +257,24 @@ def photo_works(author_id=None, keyword=""):
 
 
 def photo_works_page(author_id=None, keyword="", page=1, page_size=0):
-    """分页版写真作品列表（网页端用）：切到写真页只拉一页，不再一次全量"""
-    return _paged(photo_works(author_id, keyword), page, page_size)
+    """分页版写真作品列表（网页端用）：切到写真页只拉一页，不再一次全量
+
+    总数与当页都在 SQL 里算（LIMIT/OFFSET），命中多少条由关键词决定，
+    不再「读全表 → Python 过滤 → 内存切片」。
+    """
+    page, page_size = _page_args(page, page_size)
+    total, rows = photo_db.list_works_page(author_id, keyword, page, page_size)
+    items = [
+        {
+            "id": w["id"],
+            "name": w["name"],
+            "author": w["author"],
+            "image_count": int(w.get("image_count") or 0),
+            "cover": f"/media/photo-cover/{w['id']}",
+        }
+        for w in rows
+    ]
+    return _page_result(items, total, page, page_size)
 
 
 def photo_work(work_id):
@@ -705,6 +715,38 @@ def video_works(author_id=None, keyword=""):
 def video_works_page(author_id=None, keyword="", page=1, page_size=0):
     """分页版视频作品列表（网页端用）"""
     return _paged(video_works(author_id, keyword), page, page_size)
+
+
+def video_resume(keyword="", page=1, page_size=0):
+    """「继续观看」：与桌面侧栏同一份数据（video_db.list_resume）
+
+    孤儿进度（视频被删）在 SQL 的 INNER JOIN 里已经滤掉，
+    这里只做字段改名和封面地址拼装——封面仍按 id 走 /media/video-cover/，
+    前端拿不到任何路径。
+    """
+    keyword = (keyword or "").strip().lower()
+    items = []
+    for row in video_db.list_resume():
+        work_id = int(row["work_id"])
+        item = {
+            "work_id": work_id,
+            "video_id": int(row["video_id"]),
+            "work_name": row["work_name"],
+            "video_name": row["video_name"],
+            "author": row["author"],
+            "position_ms": int(row["position_ms"] or 0),
+            "duration_ms": int(row["duration_ms"] or 0),
+            "updated_at": int(row["updated_at"] or 0),
+            "cover": f"/media/video-cover/{work_id}",
+        }
+        if keyword and not (
+            keyword in (item["work_name"] or "").lower()
+            or keyword in (item["author"] or "").lower()
+            or keyword in (item["video_name"] or "").lower()
+        ):
+            continue
+        items.append(item)
+    return _paged(items, page, page_size)
 
 
 def video_work(work_id):

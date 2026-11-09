@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+import applog
 import system_integration as si
 from app_instance import SingleInstance
 from audio_manager import database as audio_db
@@ -84,6 +85,10 @@ def _install_helpers(app):
 
 
 def main():
+    # 日志必须最先接上：打包成 exe 后没有控制台，之后所有 print / 第三方输出 /
+    # 未捕获异常都会同时写进 data/app.log，否则出问题完全没有线索
+    applog.setup()
+
     # 应用 UI 缩放（必须在 QApplication 创建之前设置）
     scale = getattr(config, "UI_SCALE", 100) / 100.0
     os.environ["QT_SCALE_FACTOR"] = str(scale)
@@ -173,6 +178,7 @@ def main():
         from web_server import get_server
 
         get_server().stop()
+        applog.get_logger().info("会话结束")
 
     app.aboutToQuit.connect(cleanup)
 

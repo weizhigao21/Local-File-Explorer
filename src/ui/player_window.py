@@ -48,8 +48,8 @@ from PyQt6.QtWidgets import (
 )
 
 from audio_manager import database as db
-from audio_manager import dlsite
 from audio_manager import subtitles as subs
+from audio_manager.rj_code import extract_rj_code
 from audio_manager.scanner import AUDIO_EXTENSIONS
 from resource_manager import config
 from resource_manager.utils import natural_key
@@ -161,7 +161,7 @@ def dlsite_cover(track):
     path = track.get("path") or ""
     folder = os.path.dirname(path)
     for text in (track.get("title") or "", os.path.basename(folder), path):
-        rj = dlsite.extract_rj_code(text)
+        rj = extract_rj_code(text)
         if rj:
             cover = os.path.join(config.DLSITE_COVER_DIR, f"{rj}.jpg")
             return cover if os.path.isfile(cover) else None

@@ -91,19 +91,10 @@ def page_locale(html: str) -> str:
     return ""
 
 
-# RJ 码（兼容新旧位数，如 RJ01196889 / RJ283610）
-# 注意：不能用 \b 词边界——Python 的 \w 把 CJK 汉字当单词字符，
-# "RJ01155419付" 中数字与汉字之间不构成 \b 会导致提取失败。
-# 这里只要求 RJ 后面不是紧跟更多数字即可。
-_RJ_RE = re.compile(r"(RJ\d{6,10})(?!\d)", re.IGNORECASE)
-
-
-def extract_rj_code(name: str) -> str | None:
-    """从歌单名/文件夹名中提取 RJ 码，无则返回 None（统一大写）"""
-    if not name:
-        return None
-    m = _RJ_RE.search(name)
-    return m.group(1).upper() if m else None
+# RJ 码识别已抽到零依赖的 audio_manager/rj_code.py（见该文件顶部说明）：
+# 本模块顶层 import 了 curl_cffi + bs4，纯正则不该被它连带。
+# 这里保留同名 re-export，`dlsite.extract_rj_code` 的既有调用方与测试不受影响。
+from audio_manager.rj_code import _RJ_RE, extract_rj_code  # noqa: E402,F401  (re-export)
 
 
 def _normalize_proxy(server, enabled=True):

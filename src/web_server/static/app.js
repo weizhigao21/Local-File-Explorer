@@ -131,7 +131,7 @@
     audio: { queue: [], index: -1, playlist: null, cues: [], cuePos: -1 },
     video: { workId: null, videos: [], index: 0, info: null, remux: false, resume: 0, savedAt: 0 },
     // source 可以是 pagedGrid（带 items/total/loadMore），也可以是普通数组
-    lightbox: { source: null, index: 0, orig: '' },
+    lightbox: { source: null, index: 0, orig: '', swipe: null },
   };
 
   // ---------------- 通用组件 ----------------
@@ -284,7 +284,7 @@
         await viewAudioRoot(token);
       } else if (parts[0] === 'video' && parts[1] === 'w') {
         setHeader({ tab: 'video', crumb: '作品', searchable: false, back: lastListHash.video });
-        await viewVideoWork(Number(parts[2]), token);
+        await viewVideoWork(Number(parts[2]), token, Number(parts[3]) || 0);
       } else if (parts[0] === 'video') {
         lastListHash.video = location.hash || '#/video';
         setHeader({ tab: 'video', crumb: '', searchable: true });
@@ -607,9 +607,22 @@
 
   // ---------------- 看图 ----------------
   const lb = $('lightbox');
-  const lbImg = $('lb-img');
   const lbOrig = $('lb-orig');
   const lbStage = $('lb-stage');
+  /* 两层轮换：一层显示当前图，另一层接下一张。翻页时「一张推走、一张推进来」，
+   * 只有单张 <img> 换 src 是做不出来的（没有第二张图可以移动）。
+   * 缩放写在 <img> 的 transform 上，翻页位移写在 .lb-layer 上，两套互不打架。 */
+  const lbLayers = [$('lb-layer-a'), $('lb-layer-b')];
+  const lbImgs = [$('lb-img'), $('lb-img-b')];
+  const FLIP_MS = 260;
+  let lbFront = 0;          // 当前显示的是哪一层
+  let lbFlipTimer = null;
+  // 系统开了「减弱动态效果」就只换图不做位移
+  const LB_REDUCED = Boolean(
+    window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+  );
+
+  function lbImgNow() { return lbImgs[lbFront]; }
 
   /** 当前可翻的图片列表：分页后是「已加载的那些」，翻到末尾会自动续页 */
   function lightboxItems() {
@@ -629,9 +642,11 @@
     const items = typeof source.items === 'function' ? source.items() : source;
     state.lightbox.source = source;
     state.lightbox.index = Math.max(0, Math.min(index, items.length - 1));
+    state.lightbox.swipe = null;
     lb.hidden = false;
     document.body.style.overflow = 'hidden';
-    showLightboxImage();
+    settleFlip();
+    showLightboxImage({ dir: 0 });
   }
 
   function resetOrigButton() {
@@ -640,37 +655,137 @@
     lbOrig.hidden = false;
   }
 
-  function showLightboxImage() {
-    const images = lightboxItems();
-    const index = state.lightbox.index;
-    const image = images[index];
-    if (!image) return;
-    state.lightbox.orig = '';
-    resetOrigButton();
-    // 换图要把缩放复位，否则上一张的放大倍数会带到下一张上
-    resetZoom(false);
-    lbImg.classList.add('loading');
-    // 先用 640 缩图顶上（网格里多半已经缓存，几乎瞬间出图），
-    // 1600 主图解码完再替换。原来直接给原图地址，一张 20MB 要等好几秒。
-    lbImg.src = image.thumb;
+  /** 把某张图挂到某一层：先上 640 缩图（网格里多半已缓存），1600 主图解码完再替换 */
+  function paintLayer(imgEl, image) {
+    imgEl.__image = image;          // 这层现在画的是哪张，回填主图时用它认人
+    delete imgEl.dataset.full;
+    imgEl.classList.add('loading');
+    imgEl.src = image.thumb;
+    loadFull(imgEl, image);
+  }
+
+  /* 主图能不能贴、贴到哪一层，只认「这一层自己的图」：
+   * 用全局 index 判断会漏——翻页动画还没提交索引时，主图就已经解码完了。 */
+  function loadFull(imgEl, image) {
     const big = new Image();
     big.onload = () => {
-      // 期间可能已经翻页，别把旧图贴回来
-      if (lightboxItems()[state.lightbox.index] !== image) return;
-      lbImg.src = image.full;
-      lbImg.classList.remove('loading');
+      if (imgEl.__image !== image) return;      // 这层换人了，别贴旧图
+      if (!imgEl.getAttribute('src')) return;   // 已被 settleFlip 清空，说明这层暂时不用
+      imgEl.src = image.full;
+      imgEl.dataset.full = image.full;
+      imgEl.classList.remove('loading');
     };
     big.src = image.full;
+  }
+
+  /** 当前层还停在缩图上就把主图补上（提交索引后调用；浏览器有缓存，重发不走网络） */
+  function ensureFull() {
+    const imgEl = lbImgNow();
+    const image = imgEl.__image;
+    if (!image || !imgEl.getAttribute('src')) return;
+    if (imgEl.dataset.full === image.full) return;
+    loadFull(imgEl, image);
+  }
+
+  /** 藏起非当前层：清位移、清旧图，否则它盖在当前图上面（DOM 里它在后面，天然在上） */
+  function hideBackLayer() {
+    const back = lbFront ^ 1;
+    lbLayers[back].classList.remove('flipping');
+    lbLayers[back].style.transition = '';
+    lbLayers[back].style.transform = '';
+    lbLayers[back].style.opacity = '0';
+    lbImgs[back].removeAttribute('src');
+  }
+
+  /** 收尾一段翻页动画，把两层恢复到「只有当前层可见」的静止状态 */
+  function settleFlip() {
+    if (lbFlipTimer) {
+      clearTimeout(lbFlipTimer);
+      lbFlipTimer = null;
+    }
+    state.lightbox.swipe = null;
+    hideBackLayer();
+    const front = lbLayers[lbFront];
+    front.classList.remove('flipping');
+    front.style.transition = '';
+    front.style.transform = '';
+    front.style.opacity = '1';
+    // 动画期间到货的主图可能因为索引还没提交被丢掉了，这里补一次
+    ensureFull();
+  }
+
+  /** 计数、左右箭头、相邻两张预热——翻页和跟手拖动都要走这里 */
+  function updateLightboxChrome() {
+    const images = lightboxItems();
+    const index = state.lightbox.index;
+    state.lightbox.orig = '';
+    resetOrigButton();
     setText($('lb-count'), `${index + 1} / ${lightboxTotal()}`);
     $('lb-prev').style.opacity = index > 0 ? '1' : '0.2';
     $('lb-next').style.opacity = index < images.length - 1 || hasMorePages() ? '1' : '0.2';
-    // 预热相邻两张的主图，滑动时不用等
+    // 预热相邻两张的主图，翻过去不用等
     [index - 1, index + 1].forEach((i) => {
       if (images[i]) {
         const preload = new Image();
         preload.src = images[i].full;
       }
     });
+  }
+
+  /**
+   * 换图。options.dir：0 = 直接显示（刚打开 / 减弱动画），
+   * 1 = 下一张（从右边推进来），-1 = 上一张（从左边推进来）。
+   */
+  function showLightboxImage(options) {
+    const images = lightboxItems();
+    const index = state.lightbox.index;
+    const image = images[index];
+    if (!image) return;
+    const dir = (options && options.dir) || 0;
+
+    if (dir && !LB_REDUCED) {
+      flipTo(image, dir);
+    } else {
+      settleFlip();
+      // 换图要把缩放复位，否则上一张的放大倍数会带到下一张上
+      resetZoom(false);
+      paintLayer(lbImgNow(), image);
+    }
+    updateLightboxChrome();
+  }
+
+  /** 翻页动画：当前层往 dir 的反方向推出去并淡出，另一层从 dir 方向推进来 */
+  function flipTo(image, dir) {
+    settleFlip();          // 上一段动画还在跑就先收尾，免得两层抢同一个位移
+    const outLayer = lbLayers[lbFront];
+    const inLayer = lbLayers[lbFront ^ 1];
+    const shift = flipShift();
+
+    resetZoom(false);
+    paintLayer(lbImgs[lbFront ^ 1], image);
+
+    // 先把来图摆到侧面（改初始位置时必须关掉 transition，否则会被合成一次瞬移），
+    // 强制重排之后再打开过渡
+    inLayer.classList.remove('flipping');
+    inLayer.style.transition = 'none';
+    inLayer.style.transform = `translate3d(${dir * shift}px, 0, 0)`;
+    inLayer.style.opacity = '0';
+    outLayer.style.transition = 'none';
+    void inLayer.offsetWidth;
+
+    inLayer.style.transition = '';
+    outLayer.style.transition = '';
+    inLayer.classList.add('flipping');
+    outLayer.classList.add('flipping');
+    inLayer.style.transform = 'translate3d(0, 0, 0)';
+    inLayer.style.opacity = '1';
+    outLayer.style.transform = `translate3d(${-dir * shift}px, 0, 0)`;
+    outLayer.style.opacity = '0';
+
+    // 立刻切到新层：动画期间再翻一次走的是另一层，两层不会互相踩
+    lbFront ^= 1;
+    clearTimeout(lbFlipTimer);
+    lbFlipTimer = setTimeout(settleFlip, FLIP_MS + 30);
   }
 
   function hasMorePages() {
@@ -688,7 +803,7 @@
     big.onload = () => {
       if (lightboxItems()[state.lightbox.index] !== image) return;
       state.lightbox.orig = image.orig;
-      lbImg.src = image.orig;
+      lbImgNow().src = image.orig;
       lbOrig.textContent = '已是原图';
     };
     big.onerror = () => {
@@ -698,7 +813,9 @@
     big.src = image.orig;
   });
 
-  lbImg.addEventListener('load', () => lbImg.classList.remove('loading'));
+  lbImgs.forEach((imgEl) => {
+    imgEl.addEventListener('load', () => imgEl.classList.remove('loading'));
+  });
 
   async function stepLightbox(delta) {
     const next = state.lightbox.index + delta;
@@ -711,12 +828,13 @@
       if (next >= lightboxItems().length) return;
     }
     state.lightbox.index = next;
-    showLightboxImage();
+    showLightboxImage({ dir: delta > 0 ? 1 : -1 });
   }
 
   function closeLightbox() {
     lb.hidden = true;
-    lbImg.removeAttribute('src');
+    settleFlip();
+    lbImgs.forEach((imgEl) => imgEl.removeAttribute('src'));
     resetZoom(false);
     document.body.style.overflow = '';
   }
@@ -730,15 +848,16 @@
   const ZOOM_STEP = 2.5;
 
   function applyZoom(animate) {
-    lbImg.style.transform =
+    const img = lbImgNow();
+    img.style.transform =
       `translate3d(${lbZoom.x}px, ${lbZoom.y}px, 0) scale(${lbZoom.scale})`;
+    lbImgs.forEach((el) => el.classList.remove('zooming'));
     if (animate) {
-      lbImg.classList.add('zooming');
+      img.classList.add('zooming');
       clearTimeout(applyZoom._timer);
-      applyZoom._timer = setTimeout(() => lbImg.classList.remove('zooming'), 220);
+      applyZoom._timer = setTimeout(() => img.classList.remove('zooming'), 220);
     } else {
       clearTimeout(applyZoom._timer);
-      lbImg.classList.remove('zooming');
     }
   }
 
@@ -751,8 +870,9 @@
 
   function clampZoom() {
     // 只允许在「放大出来的那块」里平移，否则图能被拖出屏幕再也找不回来
-    const maxX = Math.max(0, (lbImg.offsetWidth * (lbZoom.scale - 1)) / 2);
-    const maxY = Math.max(0, (lbImg.offsetHeight * (lbZoom.scale - 1)) / 2);
+    const img = lbImgNow();
+    const maxX = Math.max(0, (img.offsetWidth * (lbZoom.scale - 1)) / 2);
+    const maxY = Math.max(0, (img.offsetHeight * (lbZoom.scale - 1)) / 2);
     lbZoom.x = Math.max(-maxX, Math.min(maxX, lbZoom.x));
     lbZoom.y = Math.max(-maxY, Math.min(maxY, lbZoom.y));
   }
@@ -781,10 +901,90 @@
     return Math.sqrt(dx * dx + dy * dy) || 1;
   }
 
+  // ---------------- 翻页手势：手指拖到哪儿，图就走到哪儿 ----------------
+  /* 只有未放大（scale≈1）时才是翻页；放大后的单指一律是平移。
+   * 松手按拖动距离决定「翻过去」还是「弹回来」——纯按钮式翻页在手感上差很多。 */
+  function stageWidth() {
+    return lbStage.clientWidth || window.innerWidth;
+  }
+
+  /** 来图从多远开始滑：按「当前图的实际宽度 + 24px 缝」，不是整整一屏。
+   *  横屏看竖图时图比屏幕窄很多，按一屏算会拖出一大片空白（实测踩到）。 */
+  function flipShift() {
+    const width = stageWidth();
+    const imgWidth = lbImgNow().offsetWidth || 0;
+    return Math.min(width, Math.round(Math.max(imgWidth, width * 0.45) + 24));
+  }
+
+  /** 备好侧边那张（下一张/上一张）；没有可翻的图就返回 false */
+  function beginSwipe(dir) {
+    const image = lightboxItems()[state.lightbox.index + dir];
+    if (!image) return false;   // 到头了（或服务端还有但还没拉下来）→ 松手走续页逻辑
+    settleFlip();
+    const outLayer = lbLayers[lbFront];
+    const inLayer = lbLayers[lbFront ^ 1];
+    const shift = flipShift();
+    paintLayer(lbImgs[lbFront ^ 1], image);
+    inLayer.classList.remove('flipping');
+    outLayer.classList.remove('flipping');
+    // 跟手阶段不能有过渡，否则图会慢半拍
+    inLayer.style.transition = 'none';
+    outLayer.style.transition = 'none';
+    inLayer.style.opacity = '1';
+    outLayer.style.opacity = '1';
+    inLayer.style.transform = `translate3d(${dir * shift}px, 0, 0)`;
+    state.lightbox.swipe = { dir, image, shift };
+    return true;
+  }
+
+  function moveSwipe(dx) {
+    const swipe = state.lightbox.swipe;
+    if (!swipe) return;
+    lbLayers[lbFront].style.transform = `translate3d(${dx}px, 0, 0)`;
+    // 来图和当前图同速移动，看起来就是被推着走
+    lbLayers[lbFront ^ 1].style.transform =
+      `translate3d(${swipe.dir * swipe.shift + dx}px, 0, 0)`;
+  }
+
+  /** 松手：拖够 1/5 屏（最多 96px）就翻过去，否则弹回 */
+  function endSwipe(dx) {
+    const swipe = state.lightbox.swipe;
+    if (!swipe) return;
+    state.lightbox.swipe = null;
+    const width = stageWidth();
+    const outLayer = lbLayers[lbFront];
+    const inLayer = lbLayers[lbFront ^ 1];
+    const passed = Math.abs(dx) > Math.min(width * 0.2, 96);
+
+    inLayer.classList.add('flipping');
+    outLayer.classList.add('flipping');
+    inLayer.style.transition = '';
+    outLayer.style.transition = '';
+
+    if (!passed) {
+      // 没拖够：两张都回原位，索引不动
+      inLayer.style.transform = `translate3d(${swipe.dir * swipe.shift}px, 0, 0)`;
+      outLayer.style.transform = 'translate3d(0, 0, 0)';
+      lbFlipTimer = setTimeout(settleFlip, FLIP_MS + 30);
+      return;
+    }
+
+    inLayer.style.transform = 'translate3d(0, 0, 0)';
+    outLayer.style.transform = `translate3d(${-swipe.dir * width}px, 0, 0)`;
+    outLayer.style.opacity = '0';
+    // 提交：当前层和索引一起前进，计数/箭头/预热走同一条更新
+    lbFront ^= 1;
+    state.lightbox.index += swipe.dir;
+    updateLightboxChrome();
+    lbFlipTimer = setTimeout(settleFlip, FLIP_MS + 30);
+  }
+
   lbStage.addEventListener('touchstart', (event) => {
     lbTouchSeen = true;
     if (event.touches.length >= 2) {
       clearTimeout(lbTapTimer);
+      // 拖到一半又按上第二根手指：先让那张弹回去，别留在半路
+      endSwipe(0);
       lbGesture = {
         type: 'pinch',
         dist: touchDistance(event.touches),
@@ -800,6 +1000,7 @@
       baseX: lbZoom.x,
       baseY: lbZoom.y,
       at: Date.now(),
+      swiping: false,
     };
   }, { passive: true });
 
@@ -829,7 +1030,25 @@
       lbZoom.y = lbGesture.baseY + (touch.clientY - lbGesture.y);
       clampZoom();
       applyZoom(false);
+      return;
     }
+    if (lbGesture.type !== 'tap') return;
+
+    const dx = touch.clientX - lbGesture.x;
+    const dy = touch.clientY - lbGesture.y;
+    if (!lbGesture.swiping) {
+      if (Math.abs(dy) > 16 && Math.abs(dy) >= Math.abs(dx)) {
+        // 竖向移动：既不是翻页，也不该当轻点（否则松手会误翻一张）
+        lbGesture.type = 'idle';
+        return;
+      }
+      if (Math.abs(dx) < 10 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+      // 侧边还拿不到下一张（到末尾了）：先不跟手，松手后由 stepLightbox 续页再翻
+      if (!beginSwipe(dx < 0 ? 1 : -1)) return;
+      lbGesture.swiping = true;
+      lbGesture.dir = dx < 0 ? 1 : -1;
+    }
+    moveSwipe(dx);
   }, { passive: true });
 
   lbStage.addEventListener('touchend', (event) => {
@@ -849,6 +1068,13 @@
     const tapX = touch.clientX;
     const dx = tapX - gesture.x;
     const dy = touch.clientY - gesture.y;
+
+    // 跟手翻页松手：按拖动距离决定翻过去还是弹回
+    if (gesture.swiping) {
+      endSwipe(dx);
+      return;
+    }
+
     const moved = Math.abs(dx) > 12 || Math.abs(dy) > 12;
     const held = Date.now() - gesture.at > 700;
 
@@ -856,7 +1082,7 @@
       // 未放大时的明显横滑 → 翻页；放大状态下单指怎么划都是平移，不翻页
       if (gesture.type === 'tap' && Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.4) {
         stepLightbox(dx < 0 ? 1 : -1);
-      } else {
+      } else if (gesture.type !== 'idle') {
         clampZoom();
       }
       return;
@@ -895,6 +1121,20 @@
     if (lbTouchSeen) return;
     if (event.target.closest('.lb-nav')) return;
     stepLightbox(event.clientX < window.innerWidth / 2 ? -1 : 1);
+  });
+
+  // 桌面端键盘：← → 翻页，Esc 关闭（比去找箭头快）
+  document.addEventListener('keydown', (event) => {
+    if (lb.hidden) return;
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      stepLightbox(-1);
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      stepLightbox(1);
+    } else if (event.key === 'Escape') {
+      closeLightbox();
+    }
   });
 
   // ---------------- 音频 ----------------
@@ -1225,9 +1465,9 @@
   }
 
   // ---------------- 视频 ----------------
-  async function viewVideoWorks(query, token) {
-    const authorId = query.get('author') || '';
-    const wall = pagedGrid({
+  /** 视频作品墙 */
+  function videoWorksWall(authorId) {
+    return pagedGrid({
       endpoint: '/api/video/works',
       listKey: 'works',
       unit: (n) => `${n} 个作品`,
@@ -1260,9 +1500,65 @@
           ),
         ),
     });
+  }
+
+  /** 「继续观看」：按最后观看时间倒序，点卡片直接跳进那一集（带续播点） */
+  function videoResumeWall() {
+    return pagedGrid({
+      endpoint: '/api/video/resume',
+      listKey: 'items',
+      unit: (n) => `${n} 个未看完`,
+      emptyTitle: '还没有未看完的视频',
+      emptySearchTitle: '没有匹配的记录',
+      emptyHints: ['随便点开一集，看一半退出就会出现在这里'],
+      renderCard: (item) => {
+        const box = coverBox(item.cover, 'wide', '▶');
+        // 进度条：时长未知时只显示已看时间，不画条（画 0% 会像「刚开头」）
+        if (item.duration_ms > 0) {
+          const ratio = Math.max(0, Math.min(1, item.position_ms / item.duration_ms));
+          const fill = el('i');
+          fill.style.width = `${Math.round(ratio * 100)}%`;
+          box.append(el('span', { class: 'progress-line' }, fill));
+        }
+        box.append(el('span', { class: 'badge', text: item.video_name }));
+        const remain = item.duration_ms > 0
+          ? `还剩 ${fmtDuration(Math.max(0, item.duration_ms - item.position_ms))}`
+          : `已看 ${fmtDuration(item.position_ms)}`;
+        return el(
+          'button',
+          {
+            class: 'card',
+            type: 'button',
+            onclick: () => {
+              location.hash = `#/video/w/${item.work_id}/${item.video_id}`;
+            },
+          },
+          box,
+          el(
+            'div',
+            { class: 'meta' },
+            el('div', { class: 'title', text: item.work_name }),
+            el('div', {
+              class: 'sub',
+              text: [item.author, remain].filter(Boolean).join(' · '),
+            }),
+          ),
+        );
+      },
+    });
+  }
+
+  async function viewVideoWorks(query, token) {
+    const authorId = query.get('author') || '';
+    const resumeMode = query.get('resume') === '1';
+    const wall = resumeMode ? videoResumeWall() : videoWorksWall(authorId);
 
     view.replaceChildren(loadingState());
-    const authors = await api('/api/video/authors');
+    // 续播计数与作者列表并发取，两条都是小 JSON
+    const [authors, resume] = await Promise.all([
+      api('/api/video/authors'),
+      api('/api/video/resume?page_size=1'),
+    ]);
     if (token !== state.token) return;
 
     const chips = el(
@@ -1271,7 +1567,17 @@
       el(
         'button',
         {
-          class: `chip ${authorId ? '' : 'active'}`.trim(),
+          class: `chip ${resumeMode ? 'active' : ''}`.trim(),
+          type: 'button',
+          onclick: () => { location.hash = '#/video?resume=1'; },
+        },
+        '继续观看',
+        el('span', { class: 'count', text: String(resume.total || 0) }),
+      ),
+      el(
+        'button',
+        {
+          class: `chip ${!authorId && !resumeMode ? 'active' : ''}`.trim(),
           type: 'button',
           onclick: () => { location.hash = '#/video'; },
         },
@@ -1282,7 +1588,7 @@
         el(
           'button',
           {
-            class: `chip ${String(author.id) === authorId ? 'active' : ''}`.trim(),
+            class: `chip ${String(author.id) === authorId && !resumeMode ? 'active' : ''}`.trim(),
             type: 'button',
             onclick: () => { location.hash = `#/video?author=${author.id}`; },
           },
@@ -1298,7 +1604,7 @@
     await wall.reload();
   }
 
-  async function viewVideoWork(workId, token) {
+  async function viewVideoWork(workId, token, playVideoId) {
     view.replaceChildren(loadingState());
     const data = await api(`/api/video/works/${workId}/videos`);
     if (token !== state.token) return;
@@ -1345,6 +1651,12 @@
       sectionTitle(`${data.videos.length} 个视频`, '点任意一集开始播放'),
       el('div', { class: 'list' }, ...rows),
     );
+
+    // 从「继续观看」点进来：直接开那一集，续播点由播放器按路径读库
+    if (playVideoId) {
+      const target = data.videos.filter((v) => v.id === playVideoId)[0];
+      if (target) await openVideo(workId, data.videos, target.index);
+    }
   }
 
   /** 把 <video> 硬拉回全屏

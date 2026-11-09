@@ -956,13 +956,31 @@ body.video-open #toast { display: none !important; }
 
 .lb-stage {
   flex: 1;
-  display: grid;
-  place-items: center;
+  position: relative;
   overflow: hidden;
   min-height: 0;
-  /* 缩放/拖动全由自己处理：交给浏览器就会变成「整页放大」，顶栏也跟着变大，
+  /* 缩放/拖动/翻页全由自己处理：交给浏览器就会变成「整页放大」，顶栏也跟着变大，
      而且手势冲突时翻页会失灵。none 之后捏合与单指拖动都归 JS。 */
   touch-action: none;
+}
+
+/* 翻页的两层：都铺满舞台，靠 transform 横向错开。位移写在层上、缩放写在图上，
+   两套 transform 各管一层，翻页动画不会把放大倍数带跑。 */
+.lb-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  will-change: transform, opacity;
+}
+
+/* 只有松手后的那一段才加 transition：跟手拖动必须零延迟，否则手指走了图还落后半拍 */
+.lb-layer.flipping {
+  transition: transform 0.26s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.26s ease;
 }
 
 .lb-stage img {

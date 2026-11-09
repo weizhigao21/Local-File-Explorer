@@ -271,6 +271,21 @@ class AudioMainWindow(QMainWindow):
                 return cover
         return None
 
+    def open_playlist(self, playlist_id):
+        """外部入口（启动器全局搜索）：直接进某个歌单
+
+        不能直接调 `_open_playlist` 的默认行为——它依赖当前页面栈状态决定
+        导航历史，从别的窗口跳进来时栈还停在第 0 页，必须显式给一个干净的历史。
+        """
+        try:
+            pl_id = int(playlist_id)
+        except (TypeError, ValueError):
+            return
+        if not db.get_playlist(pl_id):
+            return
+        self.page_stack.setCurrentIndex(0)
+        self._open_playlist(pl_id, history=[pl_id])
+
     def _open_playlist(self, pl_id, history=None):
         # 主列表进入时先打开歌单分组；在其详情页点子歌单时只追加该子目录。
         if history is not None:

@@ -363,6 +363,58 @@ def list_all_thumbnail_paths():
 
 # ==================== 续播点 ====================
 
+def list_resume(limit=200):
+    """「继续观看」列表：所有没看完的视频，按最后观看时间倒序
+
+    progress 只按文件路径记位置，作品名/作者名/封面都要回到 videos →
+    works → authors 里取。这里用 INNER JOIN：已被删除的视频留下的孤儿进度
+    记录自然被过滤掉（进度表不随视频删除同步，扫描清理封面时才会顺手清）。
+
+    duration_ms 优先用播放时实际读到的（probe 没装时 videos 表是 0），
+    两者都没有就返回 0，UI 显示成「已看 mm:ss」而不是「还剩 --:--」。
+    """
+    sql = """
+        SELECT p.path AS path,
+               p.position_ms AS position_ms,
+               p.updated_at AS updated_at,
+               COALESCE(NULLIF(p.duration_ms, 0), v.duration_ms, 0) AS duration_ms,
+               v.id AS video_id,
+               v.name AS video_name,
+               w.id AS work_id,
+               w.name AS work_name,
+               w.path AS work_path,
+               w.thumbnail AS thumbnail,
+               a.name AS author
+        FROM progress p
+        JOIN videos v ON v.path = p.path
+        JOIN works w ON w.id = v.work_id
+        JOIN authors a ON a.id = w.author_id
+        WHERE p.position_ms > 0
+        ORDER BY p.updated_at DESC
+        LIMIT ?
+    """
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(sql, (int(limit),)).fetchall()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as e:
+        print(f"[视频续播] 读取「继续观看」失败: {e}")
+        return []
+
+
+def count_resume():
+    """侧栏入口上的计数；表未建/库被锁时返回 0，不让主界面崩"""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM progress p JOIN videos v ON v.path = p.path"
+                " WHERE p.position_ms > 0"
+            ).fetchone()
+            return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
 def get_progress(path):
     """返回 (position_ms, duration_ms)，没有记录返回 (0, 0)
 
@@ -427,3 +479,46 @@ def clear_all():
         conn.executescript(
             "DELETE FROM progress; DELETE FROM videos; DELETE FROM works; DELETE FROM authors;"
         )
+
+
+def _escape_like(text):
+    """转义 LIKE 通配符，让用户输入的 % 和 _ 按字面匹配"""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search(keyword, limit=8):
+    """跨模块搜索用：作品名/作者名 + 视频文件名各查一批"""
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return {"work_total": 0, "video_total": 0, "works": [], "videos": []}
+    like = f"%{_escape_like(keyword)}%"
+    limit = max(1, int(limit or 8))
+    with get_conn() as conn:
+        work_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM works w JOIN authors a ON a.id = w.author_id"
+            " WHERE w.name LIKE ? ESCAPE '\\' OR a.name LIKE ? ESCAPE '\\'",
+            (like, like),
+        ).fetchone()["c"]
+        works = conn.execute(
+            "SELECT w.id, w.name, w.path, w.thumbnail, a.name AS author"
+            " FROM works w JOIN authors a ON a.id = w.author_id"
+            " WHERE w.name LIKE ? ESCAPE '\\' OR a.name LIKE ? ESCAPE '\\'"
+            " ORDER BY a.name, w.name LIMIT ?",
+            (like, like, limit),
+        ).fetchall()
+        video_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM videos WHERE name LIKE ? ESCAPE '\\'", (like,)
+        ).fetchone()["c"]
+        videos = conn.execute(
+            "SELECT v.id, v.name, v.work_id, w.name AS work_name, a.name AS author"
+            " FROM videos v JOIN works w ON w.id = v.work_id"
+            " JOIN authors a ON a.id = w.author_id"
+            " WHERE v.name LIKE ? ESCAPE '\\' ORDER BY a.name, w.name, v.name LIMIT ?",
+            (like, limit),
+        ).fetchall()
+    return {
+        "work_total": int(work_total or 0),
+        "video_total": int(video_total or 0),
+        "works": [dict(row) for row in works],
+        "videos": [dict(row) for row in videos],
+    }

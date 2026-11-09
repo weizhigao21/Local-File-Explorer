@@ -20,6 +20,9 @@ class WorkCard(QFrame):
         self.setFixedSize(220, 280)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 右键菜单交给上层组装（卡片只管把自己的 work 和屏幕坐标抛出去，
+        # 不在这里 import file_ops / QMenu，免得组件层被业务逻辑污染）
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.setStyleSheet(
             f"""
             WorkCard {{

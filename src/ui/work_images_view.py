@@ -5,21 +5,35 @@
 - 自定义 ItemDelegate 直接绘制，避免 widget 树开销
 - 视口检测通过 visualItemRect 高效获取
 """
+import os
+
 from PyQt6.QtCore import QModelIndex, QRect, QSize, Qt, QTimer
 from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QListView,
     QListWidget,
     QListWidgetItem,
+    QMenu,
+    QMessageBox,
     QStyle,
     QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
 
+import file_ops
+from resource_manager import database as db
 from ui.image_loader import get_cached, loader
+
+# 右键菜单样式：和主界面米色系一致（QMenu 默认是浅灰，和卡片墙放一起很突兀）
+MENU_QSS = (
+    "QMenu { background-color: #FBF7F0; border: 1px solid #E8DECB; padding: 4px; }"
+    "QMenu::item { padding: 5px 22px; color: #3D3830; font-size: 12px; border-radius: 3px; }"
+    "QMenu::item:selected { background-color: #EBD9CE; }"
+)
 
 # 卡片尺寸（含外边距）
 ITEM_W = 165          # 卡片宽度
@@ -148,6 +162,9 @@ class WorkImagesView(QWidget):
         self.list_widget.verticalScrollBar().setSingleStep(ITEM_H + 12)
         # 单击即打开
         self.list_widget.itemClicked.connect(self._on_item_clicked)
+        # 右键：定位文件 / 复制路径 / 移入回收站
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_item_menu)
         # 滚动防抖
         self.list_widget.verticalScrollBar().valueChanged.connect(self._on_scroll)
         # resize 防抖
@@ -167,11 +184,11 @@ class WorkImagesView(QWidget):
         bottom_widget.setStyleSheet("background-color: #FBF7F0; border-top: 1px solid #E8DECB;")
         bottom = QHBoxLayout(bottom_widget)
         bottom.setContentsMargins(16, 6, 16, 6)
-        info = QLabel(f"{work['author']} / {work['name']} · 共 {len(images)} 张")
-        info.setStyleSheet("color: #3D3830; font-size: 13px;")
-        bottom.addWidget(info)
+        self.info_label = QLabel(self._info_text())
+        self.info_label.setStyleSheet("color: #3D3830; font-size: 13px;")
+        bottom.addWidget(self.info_label)
         bottom.addStretch()
-        hint = QLabel("点击图片查看 · 返回请按 Esc 或顶栏 ← 返回")
+        hint = QLabel("点击图片查看 · 右键可定位文件 · 返回请按 Esc 或顶栏 ← 返回")
         hint.setStyleSheet("color: #A89880; font-size: 11px;")
         bottom.addWidget(hint)
         bottom_widget.setFixedHeight(40)
@@ -197,6 +214,96 @@ class WorkImagesView(QWidget):
     def _on_item_clicked(self, item):
         idx = item.data(ROLE_INDEX)
         self._on_image_clicked(idx)
+
+    # ---------- 右键文件操作 ----------
+
+    def _info_text(self):
+        return f"{self.work['author']} / {self.work['name']} · 共 {len(self.images)} 张"
+
+    def _show_item_menu(self, pos):
+        item = self.list_widget.itemAt(pos)
+        if item is None:
+            return
+        path = item.data(ROLE_PATH)
+        menu = QMenu(self)
+        menu.setStyleSheet(MENU_QSS)
+        act_view = menu.addAction("查看大图")
+        act_reveal = menu.addAction("在资源管理器中显示")
+        act_default = menu.addAction("用默认程序打开")
+        menu.addSeparator()
+        act_copy_path = menu.addAction("复制文件路径")
+        act_copy_name = menu.addAction("复制文件名")
+        menu.addSeparator()
+        act_delete = menu.addAction("移入回收站…")
+
+        chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_view:
+            self._on_image_clicked(item.data(ROLE_INDEX))
+        elif chosen is act_reveal:
+            if not file_ops.reveal(path):
+                QMessageBox.information(self, "打开失败", f"找不到这个文件：\n{path}")
+        elif chosen is act_default:
+            if not file_ops.open_with_default(path):
+                QMessageBox.information(self, "打开失败", f"找不到这个文件：\n{path}")
+        elif chosen is act_copy_path:
+            QApplication.clipboard().setText(path)
+        elif chosen is act_copy_name:
+            QApplication.clipboard().setText(os.path.basename(path))
+        elif chosen is act_delete:
+            self._delete_image(path)
+
+    def _confirm_delete(self, name):
+        """删除前确认：按钮写「移入回收站」而不是「确定」，
+        让用户清楚这不是永久删除，但也别指望人人都读提示"""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("移入回收站")
+        box.setText(f"把这张图片移入回收站？\n\n{name}")
+        box.setInformativeText("文件会进入系统回收站，需要时可以还原。")
+        confirm = box.addButton("移入回收站", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is confirm
+
+    def _delete_image(self, path):
+        """移入回收站（不提供永久删除：原图删错了找不回来）
+
+        删完要同步三处，否则界面和磁盘会不一致：
+        1. 磁盘：SHFileOperationW 走回收站；
+        2. 数据库：images 表删掉这条，下次扫描不会以为它丢了又重新加；
+        3. 界面：从 self.images 原地移除并重建索引（ROLE_INDEX 是下标，
+           不重建会让后面每张图的「第几张」全部错位）。
+        """
+        name = os.path.basename(path)
+        if not self._confirm_delete(name):
+            return
+
+        ok_count, _failed = file_ops.move_to_recycle_bin([path])
+        if not ok_count:
+            QMessageBox.warning(
+                self, "删除失败",
+                f"没能移入回收站（文件可能正被别的程序占用）：\n{name}",
+            )
+            return
+
+        db.delete_images_by_paths([path])
+        # 原地删除：open_image_at 的闭包持有的是同一个 list 对象，
+        # 换成新列表会让看图器还按旧下标翻到已删除的图
+        for i, img in enumerate(self.images):
+            if img.get("path") == path:
+                del self.images[i]
+                break
+        self._rebuild_items()
+
+    def _rebuild_items(self):
+        """重建列表项：删除后下标全部前移，必须重新编号"""
+        self.list_widget.clear()
+        for i, img in enumerate(self.images):
+            self.list_widget.addItem(_make_item(img["path"], i))
+        self.info_label.setText(self._info_text())
+        QTimer.singleShot(0, self._load_visible)
 
     def _load_visible(self):
         """加载可见区域内的缩略图"""

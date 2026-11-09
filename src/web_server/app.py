@@ -83,6 +83,7 @@ _ROUTE_DEFS = [
     ("GET", r"^/api/audio/tracks/(\d+)/subtitles$", "api_audio_subtitles"),
     # 视频
     ("GET", r"^/api/video/authors$", "api_video_authors"),
+    ("GET", r"^/api/video/resume$", "api_video_resume"),
     ("GET", r"^/api/video/works$", "api_video_works"),
     ("GET", r"^/api/video/works/(\d+)/videos$", "api_video_work_videos"),
     ("GET", r"^/api/video/videos/(\d+)$", "api_video_info"),
@@ -385,6 +386,22 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def api_video_authors(self, match, query):
         return self._json({"authors": library.video_authors()}, max_age=30)
+
+    def api_video_resume(self, match, query):
+        data = library.video_resume(
+            _text_param(query, "q"),
+            _int_param(query, "page", 1),
+            _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
+        )
+        return self._json(
+            {
+                "items": data["items"],
+                "total": data["total"],
+                "page": data["page"],
+                "pages": data["pages"],
+            },
+            max_age=0,  # 看完一集就变，不能缓存
+        )
 
     def api_video_works(self, match, query):
         author_id = _int_param(query, "author_id") or None

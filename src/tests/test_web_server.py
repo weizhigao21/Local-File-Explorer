@@ -398,6 +398,52 @@ def test_video_progress_ignored_without_duration(seeded):
     assert library.video_play_info(video_id)["position_ms"] == 0
 
 
+def test_video_resume_lists_unfinished_by_recency(seeded):
+    """网页「继续观看」与桌面侧栏共用 list_resume：倒序、封面按 id、不带路径"""
+    work_id = library.video_works()[0]["id"]
+    videos = library.video_work_videos(work_id)["videos"]
+    library.save_video_progress(videos[0]["id"], 120000, 600000)
+    library.save_video_progress(videos[1]["id"], 300000, 600000)
+
+    # 同一秒内写入 updated_at 会打平，手工拉开顺序才能验倒序
+    rows = {v["name"]: v["path"] for v in video_db.get_work_videos(work_id)}
+    with video_db.get_conn() as conn:
+        conn.execute("UPDATE progress SET updated_at = 1000 WHERE path = ?", (rows["01.mp4"],))
+        conn.execute("UPDATE progress SET updated_at = 2000 WHERE path = ?", (rows["02.mkv"],))
+
+    data = library.video_resume()
+    assert data["total"] == 2
+    top = data["items"][0]
+    assert top["video_name"] == "02.mkv"
+    assert top["work_id"] == work_id and top["work_name"] == "作品V"
+    assert top["position_ms"] == 300000 and top["duration_ms"] == 600000
+    assert top["cover"] == f"/media/video-cover/{work_id}"
+    assert top["author"] == "作者V"
+
+
+def test_video_resume_keyword_and_paging(seeded):
+    work_id = library.video_works()[0]["id"]
+    videos = library.video_work_videos(work_id)["videos"]
+    for video in videos:
+        library.save_video_progress(video["id"], 60000, 600000)
+
+    assert library.video_resume("作品V")["total"] == 2
+    assert library.video_resume("02.mkv")["total"] == 1
+    assert library.video_resume("不存在的关键词")["total"] == 0
+
+    first = library.video_resume("", 1, 1)
+    assert first["total"] == 2 and first["pages"] == 2 and len(first["items"]) == 1
+
+
+def test_video_resume_skips_finished_and_orphans(seeded):
+    work_id = library.video_works()[0]["id"]
+    video = library.video_work_videos(work_id)["videos"][0]
+    library.save_video_progress(video["id"], 120000, 600000)
+    # 进度表里存在、videos 表里没有（视频被删/改名）→ INNER JOIN 自然滤掉
+    video_db.set_progress(str(seeded["video_root"] / "没了.mp4"), 50000, 600000)
+    assert library.video_resume()["total"] == 1
+
+
 # ==================== 端到端 HTTP ====================
 
 def test_root_requires_token(server):
@@ -1043,10 +1089,23 @@ def test_view_widths_stay_inside_thumbnail_whitelist(seeded):
 def test_lightbox_prefers_scaled_image_and_loads_original_on_demand():
     """看图默认 1600 宽主图，原图只在点「原图」时拉——直接给原图就是卡顿的来源"""
     js = _static_text("app.js")
-    assert "lbImg.src = image.full" in js
-    assert "image.orig" in js
+    assert "imgEl.src = image.full" in js
+    assert "lbImgNow().src = image.orig" in js
     assert "lb-img" in _static_text("index.html")
     assert 'id="lb-orig"' in _static_text("index.html"), "看图浮层缺少「原图」按钮"
+
+
+def test_full_image_goes_back_to_its_own_layer():
+    """1600 主图必须回填到「画它的那一层」：写到 lbImgNow() 会贴到正在推走的那层；
+    而且不能拿全局 index 认人——动画还没提交索引时主图就已经解码完了，会被丢掉，
+    新的一张就永远停在 640 缩图"""
+    js = _static_text("app.js")
+    assert "function paintLayer(imgEl, image)" in js
+    assert "imgEl.__image = image" in js
+    assert "if (imgEl.__image !== image) return;" in js
+    assert "function ensureFull(" in js
+    assert "ensureFull();" in js, "翻页落定后要补一次主图"
+    assert "target.src = image.full" not in js
 
 
 # ==================== 列表分页（v1.10.1） ====================
@@ -1101,6 +1160,34 @@ def test_api_video_works_reports_pagination(server):
     _instance, port = server
     data = json.loads(_get(port, "/api/video/works?page=1&page_size=60", cookie=TOKEN)[2])
     assert data["total"] == 1 and data["pages"] == 1 and len(data["works"]) == 1
+
+
+def test_api_video_resume_serves_items_and_is_not_cached(server):
+    _instance, port = server
+    work_id = library.video_works()[0]["id"]
+    video_id = library.video_work_videos(work_id)["videos"][0]["id"]
+    library.save_video_progress(video_id, 120000, 600000)
+
+    status, headers, body = _get(port, "/api/video/resume?page=1&page_size=60", cookie=TOKEN)
+    assert status == 200
+    assert "no-store" in headers.get("Cache-Control", ""), "看完一集必须立刻从列表消失"
+    data = json.loads(body)
+    assert data["total"] == 1
+    item = data["items"][0]
+    assert item["video_id"] == video_id and item["work_id"] == work_id
+    assert item["position_ms"] == 120000 and item["duration_ms"] == 600000
+    assert item["cover"] == f"/media/video-cover/{work_id}"
+
+
+def test_web_video_resume_entry_and_deep_link():
+    """续播入口：分页网格 + 深链到具体某一集（否则点进去还得自己找第几集）"""
+    js = _static_text("app.js")
+    assert "'/api/video/resume'" in js
+    assert "继续观看" in js
+    assert "`#/video/w/${item.work_id}/${item.video_id}`" in js
+    assert "'#/video?resume=1'" in js
+    assert "playVideoId" in js and "if (playVideoId)" in js, "深链要真的自动开那一集"
+    assert "'progress-line'" in js, "续播卡必须有进度条"
 
 
 def test_api_audio_playlists_reports_pagination(server):
@@ -1381,3 +1468,49 @@ def test_audio_cover_inherits_through_multiple_levels(seeded):
     leaf_brief = library.audio_playlist(mid)["children"][0]
     assert leaf_brief["id"] == leaf
     assert leaf_brief["has_cover"] is True, "封面只继承了一层，说明父链断了"
+
+
+# ==================== 看图翻页（v1.11.1） ====================
+
+def test_lightbox_has_two_layers_for_transition():
+    """一张推走、一张推进来：单张 <img> 换 src 做不出位移，必须是两层轮换"""
+    html = _static_text("index.html")
+    js = _static_text("app.js")
+    assert 'id="lb-layer-a"' in html and 'id="lb-layer-b"' in html
+    assert 'id="lb-img"' in html and 'id="lb-img-b"' in html
+    assert "lbLayers = [$('lb-layer-a'), $('lb-layer-b')]" in js
+    assert "function flipTo(" in js and "lbFront ^= 1" in js
+
+
+def test_flip_translates_layer_while_zoom_translates_image():
+    """翻页位移写在层上、缩放写在图上：两套 transform 挤在同一个元素上会互相覆盖"""
+    js = _static_text("app.js")
+    assert "lbLayers[lbFront].style.transform" in js
+    assert "lbImgNow();\n    img.style.transform" in js
+    assert "translate3d(${dir * shift}px, 0, 0)" in js
+
+
+def test_swipe_follows_finger_then_snaps_or_commits():
+    """跟手拖动：手指停在哪图就停在哪，松手按距离决定翻过去还是弹回"""
+    js = _static_text("app.js")
+    assert "function beginSwipe(" in js
+    assert "function moveSwipe(" in js
+    assert "function endSwipe(" in js
+    assert "Math.min(width * 0.2, 96)" in js, "翻过去的阈值改了要同步手感预期"
+    # 跟手阶段必须关掉 transition，否则图会落后手指半拍
+    assert "inLayer.style.transition = 'none'" in js
+
+
+def test_flip_respects_reduced_motion():
+    """系统开了「减弱动态效果」就只换图、不做位移动画"""
+    js = _static_text("app.js")
+    assert "prefers-reduced-motion: reduce" in js
+    assert "if (dir && !LB_REDUCED)" in js
+
+
+def test_lightbox_supports_keyboard_paging():
+    """桌面端 ← → 翻页、Esc 关闭"""
+    js = _static_text("app.js")
+    assert "event.key === 'ArrowLeft'" in js
+    assert "event.key === 'ArrowRight'" in js
+    assert "event.key === 'Escape'" in js

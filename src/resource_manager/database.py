@@ -151,22 +151,84 @@ def list_authors():
         return [dict(row) for row in rows]
 
 
-def list_works(author_id=None):
-    sql = """
-        SELECT w.id, w.name, w.path, w.thumbnail, a.name AS author,
-               (SELECT COUNT(*) FROM images WHERE work_id = w.id) AS image_count
-        FROM works w
-        JOIN authors a ON a.id = w.author_id
+def _escape_like(text):
+    """转义 LIKE 通配符，让用户输入的 % 和 _ 按字面匹配"""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _works_filter(author_id=None, keyword=""):
+    """作品列表的 WHERE 子句与参数（作者 + 关键词，关键词同时匹配作品名与作者名）
+
+    关键词下推到 SQL 而不是取全量后在 Python 里过滤：作品上千时
+    「先读全表再筛」每次输入都要搬几千行，而 SQL 走索引后只返回命中的那几行。
     """
-    params = ()
+    clauses = []
+    params = []
     if author_id is not None:
-        sql += " WHERE w.author_id = ?"
-        params = (author_id,)
-    sql += " ORDER BY a.name, w.name"
+        clauses.append("w.author_id = ?")
+        params.append(author_id)
+    keyword = (keyword or "").strip()
+    if keyword:
+        like = f"%{_escape_like(keyword)}%"
+        clauses.append("(w.name LIKE ? ESCAPE '\\' OR a.name LIKE ? ESCAPE '\\')")
+        params.extend([like, like])
+    where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where_sql, tuple(params)
+
+
+_WORKS_SELECT = """
+    SELECT w.id, w.name, w.path, w.thumbnail, a.name AS author,
+           (SELECT COUNT(*) FROM images WHERE work_id = w.id) AS image_count
+    FROM works w
+    JOIN authors a ON a.id = w.author_id
+"""
+
+
+def list_works(author_id=None, keyword="", limit=None, offset=0):
+    """作品列表（可按作者/关键词过滤，可选分页）
+
+    keyword 同时匹配作品名和作者名；limit=None 表示不分页（网页端总览等用）。
+    """
+    where_sql, params = _works_filter(author_id, keyword)
+    sql = f"{_WORKS_SELECT} {where_sql} ORDER BY a.name, w.name"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = params + (int(limit), int(offset or 0))
 
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+
+
+def list_works_page(author_id=None, keyword="", page=1, page_size=60):
+    """分页作品列表：返回 (总数, 当前页作品)
+
+    总数与当前页走同一个连接：作品墙每次翻页/搜索要发两条 SQL，
+    而 connect+close 本身就比查询贵（实测 4.6ms 里大半是建连接）。
+    """
+    page = max(1, int(page or 1))
+    page_size = max(1, int(page_size or 60))
+    where_sql, params = _works_filter(author_id, keyword)
+
+    with get_conn() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM works w JOIN authors a ON a.id = w.author_id {where_sql}",
+            params,
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"{_WORKS_SELECT} {where_sql} ORDER BY a.name, w.name LIMIT ? OFFSET ?",
+            params + (page_size, (page - 1) * page_size),
+        ).fetchall()
+    return int(total or 0), [dict(row) for row in rows]
+
+
+def search_works(keyword, limit=8):
+    """跨模块搜索用：作品名/作者名关键词，返回 {total, items}
+
+    直接复用作品墙的分页查询：字段、排序、通配符转义都只有一份。
+    """
+    total, items = list_works_page(None, keyword, 1, max(1, int(limit or 8)))
+    return {"total": int(total or 0), "items": items}
 
 
 def add_author_with_works(author_name, works, progress_callback=None):

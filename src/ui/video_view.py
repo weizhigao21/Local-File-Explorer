@@ -41,9 +41,20 @@ from ui.video_theme import (
     TEXT_MUTED,
     TEXT_PRIMARY,
 )
-from ui.video_widgets import VideoCard, VideoScanThread, VideoSettingsDialog
+from ui.video_widgets import ResumeCard, VideoCard, VideoScanThread, VideoSettingsDialog
 from video_manager import database as db
 from video_manager import scanner
+
+# stack 的三页：卡片墙 / 作品详情 / 继续观看
+WORKS_PAGE = 0
+DETAIL_PAGE = 1
+RESUME_PAGE = 2
+
+# 侧栏「继续观看」项的标记（作者 id 是 int，None 表示全部作者，用字符串区分）
+RESUME_MARKER = "__resume__"
+
+# 最多列出多少条续播记录：几百条已经滚不完，再多只是浪费建卡时间
+RESUME_LIMIT = 200
 
 
 class VideoMainWindow(QMainWindow):
@@ -57,6 +68,7 @@ class VideoMainWindow(QMainWindow):
         db.init_db()
 
         self._cards = []
+        self._resume_cards = []
         self._player = None
         self._detail = None
         self._auto_scanning = True
@@ -80,6 +92,14 @@ class VideoMainWindow(QMainWindow):
 
         self.load_authors()
         self.load_works()
+        # 启动落点：有续播记录就落在「继续观看」；没有就停在作品墙，
+        # 别让人一进视频模块看到一张空页
+        if db.count_resume():
+            self.show_resume_page()
+        else:
+            self.author_list.blockSignals(True)
+            self.author_list.setCurrentRow(1)  # 第 1 行固定是「全部作者」
+            self.author_list.blockSignals(False)
         self._setup_shortcuts()
 
         QTimer.singleShot(400, self.start_scan)
@@ -215,9 +235,13 @@ class VideoMainWindow(QMainWindow):
         detail_layout = QVBoxLayout(self.detail_page)
         detail_layout.setContentsMargins(0, 0, 0, 0)
 
+        # ---- 继续观看页 ----
+        self.resume_page = self._build_resume_page()
+
         self.stack = QStackedWidget()
         self.stack.addWidget(self.works_page)
         self.stack.addWidget(self.detail_page)
+        self.stack.addWidget(self.resume_page)
         layout.addWidget(self.stack, 1)
 
         self.scan_status = self._build_scan_status()
@@ -263,6 +287,45 @@ class VideoMainWindow(QMainWindow):
         layout.addWidget(self.scan_cancel_btn)
         return bar
 
+    def _build_resume_page(self):
+        page = QWidget()
+        page.setObjectName("videoResumePage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.resume_hint = QLabel("")
+        self.resume_hint.setWordWrap(True)
+        self.resume_hint.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 13px; padding: 24px 24px;"
+            " background: transparent; border: none;"
+        )
+        layout.addWidget(self.resume_hint)
+
+        self.resume_scroll = QScrollArea()
+        self.resume_scroll.setObjectName("videoResumeScroll")
+        self.resume_scroll.setWidgetResizable(True)
+        self.resume_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.resume_scroll.setStyleSheet(
+            "#videoResumeScroll { border: none; background-color: " + BG_PAGE + "; }"
+        )
+        self.resume_scroll.viewport().setStyleSheet(f"background-color: {BG_PAGE};")
+        self.resume_scroll.verticalScrollBar().valueChanged.connect(self._on_works_scroll)
+        self.resume_scroll.verticalScrollBar().setSingleStep(210)
+        self.resume_scroll.viewport().installEventFilter(self)
+
+        self.resume_container = QWidget()
+        self.resume_container.setObjectName("videoResumeGrid")
+        self.resume_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self.resume_layout = FlowLayout(
+            self.resume_container, margin=16, h_spacing=16, v_spacing=16
+        )
+        self.resume_scroll.setWidget(self.resume_container)
+        layout.addWidget(self.resume_scroll, 1)
+        return page
+
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+F"), self, self.search_box.setFocus)
         QShortcut(QKeySequence("F5"), self, self.refresh)
@@ -272,7 +335,24 @@ class VideoMainWindow(QMainWindow):
     # ==================== 作者 / 作品 ====================
 
     def load_authors(self):
+        # 重建后静默恢复选中：clear() 后列表没有当前项，视图会在布局时
+        # 自动选中第 0 行（「继续观看」）并发出 currentItemChanged —— 用户
+        # 正看着某一集的列表，扫描同步完成时会被整页踢回续播页。
+        current = self.author_list.currentItem()
+        keep = current.data(Qt.ItemDataRole.UserRole) if current else None
+        has_selection = current is not None
+
+        self.author_list.blockSignals(True)
         self.author_list.clear()
+
+        # 置顶的「继续观看」：续播点数据一直都有，之前只有翻回作品再看列表里
+        # 那一条细进度条一条路，等于没有入口
+        count = db.count_resume()
+        resume_item = QListWidgetItem(f"⏳ 继续观看 ({count})" if count else "⏳ 继续观看")
+        resume_item.setData(Qt.ItemDataRole.UserRole, RESUME_MARKER)
+        resume_item.setToolTip("按最后观看时间排序，点一下就从上次的位置接着放")
+        self.author_list.addItem(resume_item)
+
         all_item = QListWidgetItem("全部作者")
         all_item.setData(Qt.ItemDataRole.UserRole, None)
         self.author_list.addItem(all_item)
@@ -282,11 +362,24 @@ class VideoMainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, author["id"])
             self.author_list.addItem(item)
 
+        row = 0
+        if has_selection:
+            for index in range(self.author_list.count()):
+                if self.author_list.item(index).data(Qt.ItemDataRole.UserRole) == keep:
+                    row = index
+                    break
+        self.author_list.setCurrentRow(row)
+        self.author_list.blockSignals(False)
+
     def on_author_changed(self, current, _previous):
         if current is None:
             return
-        if self.stack.currentIndex() == 1:
+        if current.data(Qt.ItemDataRole.UserRole) == RESUME_MARKER:
+            self.show_resume_page()
+            return
+        if self.stack.currentIndex() != WORKS_PAGE:
             self._close_detail()
+            self.stack.setCurrentIndex(WORKS_PAGE)
         self.load_works()
 
     def load_works(self):
@@ -301,6 +394,9 @@ class VideoMainWindow(QMainWindow):
 
         current = self.author_list.currentItem()
         author_id = current.data(Qt.ItemDataRole.UserRole) if current else None
+        # 选中「继续观看」时 UserRole 是标记字符串，不能当 author_id 塞进 SQL
+        if not isinstance(author_id, int):
+            author_id = None
 
         works = db.list_works(author_id)
         for work in works:
@@ -349,24 +445,44 @@ class VideoMainWindow(QMainWindow):
             name = (card.work.get("name") or "").lower()
             author = (card.work.get("author") or "").lower()
             card.setVisible(not keyword or keyword in name or keyword in author)
+        for card in self._resume_cards:
+            work_name = (card.work.get("name") or "").lower()
+            video_name = (card.item.get("video_name") or "").lower()
+            author = (card.work.get("author") or "").lower()
+            card.setVisible(
+                not keyword
+                or keyword in work_name
+                or keyword in video_name
+                or keyword in author
+            )
         self.grid_layout.invalidate()
         self.grid_container.updateGeometry()
+        self.resume_layout.invalidate()
+        self.resume_container.updateGeometry()
 
     def _on_works_scroll(self, _value):
         self._scroll_timer.start()
 
     def eventFilter(self, obj, event):
-        if (obj is self.works_scroll.viewport()
-                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show) and (
+            obj is self.works_scroll.viewport() or obj is self.resume_scroll.viewport()
+        ):
             self._resize_timer.start()
         return super().eventFilter(obj, event)
 
     def _load_visible_cards(self):
-        viewport = self.works_scroll.viewport()
+        """统一入口：按当前页决定给哪一组卡片加载封面"""
+        if self.stack.currentIndex() == RESUME_PAGE:
+            self._load_cards_in(self._resume_cards, self.resume_scroll)
+        else:
+            self._load_cards_in(self._cards, self.works_scroll)
+
+    def _load_cards_in(self, cards, scroll):
+        viewport = scroll.viewport()
         vrect = viewport.rect()
         viewport_valid = vrect.width() > 0 and vrect.height() > 0
         loaded = 0
-        for card in self._cards:
+        for card in cards:
             if loaded >= 24:
                 break
             if card._thumb_loaded or card.isHidden():  # noqa: SLF001 - 卡片自带幂等标记
@@ -383,8 +499,79 @@ class VideoMainWindow(QMainWindow):
         QTimer.singleShot(0, self._load_visible_cards)
 
     def refresh(self):
+        resume = self.stack.currentIndex() == RESUME_PAGE
         self.load_authors()
         self.load_works()
+        if resume:
+            self._rebuild_resume()
+
+    # ==================== 继续观看 ====================
+
+    def show_resume_page(self):
+        self._close_detail()
+        self._rebuild_resume()
+        self.stack.setCurrentIndex(RESUME_PAGE)
+
+    def _rebuild_resume(self):
+        self.resume_container.setUpdatesEnabled(False)
+        self.resume_container.setVisible(False)
+        while self.resume_layout.count():
+            item = self.resume_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._resume_cards = []
+
+        items = db.list_resume(RESUME_LIMIT)
+        for item in items:
+            card = ResumeCard(item)
+            card.clicked.connect(self._play_resume)
+            self.resume_layout.addWidget(card)
+            self._resume_cards.append(card)
+
+        self.resume_container.setVisible(True)
+        self.resume_container.setUpdatesEnabled(True)
+        self.resume_layout.invalidate()
+        self.resume_container.updateGeometry()
+        self.resume_container.adjustSize()
+        self.resume_hint.setText(
+            ""
+            if items
+            else "还没有看到一半的视频。\n看视频时进度会自动记下来，下次在这里点一下就能接着看。"
+        )
+        self.resume_hint.setVisible(not items)
+        self._apply_search_filter()
+        QTimer.singleShot(0, self._load_visible_cards)
+
+    def _play_resume(self, item):
+        """从续播点开始：取出所在作品的全部视频，定位到这一集再交给播放器
+
+        续播位置本身不在这里算——播放器会按路径从 progress 表读，
+        入口只管把「该播哪一集」备好，避免两处各算一遍。
+        """
+        work_id = item.get("work_id")
+        videos = db.get_work_videos(work_id) if work_id is not None else []
+        if not videos:
+            QMessageBox.information(self, "提示", "这个视频已经不在库里了，可能被移动或删除。")
+            self._rebuild_resume()
+            self._refresh_resume_count()
+            return
+        target = item.get("path")
+        index = 0
+        for i, video in enumerate(videos):
+            if video["path"] == target:
+                index = i
+                break
+        self._play(videos, index)
+
+    def _refresh_resume_count(self):
+        """只改侧栏那一行的计数：重建整个作者列表会丢掉当前选中项"""
+        if self.author_list.count() == 0:
+            return
+        entry = self.author_list.item(0)
+        if entry.data(Qt.ItemDataRole.UserRole) != RESUME_MARKER:
+            return
+        count = db.count_resume()
+        entry.setText(f"⏳ 继续观看 ({count})" if count else "⏳ 继续观看")
 
     # ==================== 详情页 ====================
 
@@ -413,8 +600,11 @@ class VideoMainWindow(QMainWindow):
         self._close_detail()
 
     def _handle_escape(self):
-        if self.stack.currentIndex() == 1:
+        if self.stack.currentIndex() == DETAIL_PAGE:
             self.on_back_from_work()
+        elif self.stack.currentIndex() == RESUME_PAGE:
+            # 回到作品墙（第 1 行固定是「全部作者」）
+            self.author_list.setCurrentRow(1)
         elif self.search_box.text():
             self.search_box.clear()
 
@@ -435,6 +625,10 @@ class VideoMainWindow(QMainWindow):
         # 回来时刷新「已看 xx:xx」列，不重建整页
         if self._detail is not None:
             self._detail.refresh_progress()
+        self._refresh_resume_count()
+        # 停在续播页时，刚看完的那条可能已被清掉/位置变了，重排一次
+        if self.stack.currentIndex() == RESUME_PAGE:
+            self._rebuild_resume()
 
     # ==================== 扫描 ====================
 
@@ -505,6 +699,10 @@ class VideoMainWindow(QMainWindow):
             return
         self.load_authors()
         self.load_works()
+        # 停在续播页时 load_authors 不会再顺带刷新它（信号被静默了），
+        # 得自己重建一次，否则刚看完的那条还挂在「继续观看」里
+        if self.stack.currentIndex() == RESUME_PAGE:
+            self._rebuild_resume()
         if auto:
             return
         QMessageBox.information(

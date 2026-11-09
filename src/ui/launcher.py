@@ -2,21 +2,28 @@
 主入口启动器：作为各功能模块的入口界面
 包含模块卡片网格，点击卡片打开对应模块窗口
 """
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+import os
+import subprocess
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
+import search_index
 from resource_manager import config
+from ui.search_panel import SearchPanel
 from ui.theme_base import (
     ACCENT,
     ACCENT_HOVER,
@@ -27,6 +34,7 @@ from ui.theme_base import (
     CARD_BORDER,
     CARD_BORDER_HOVER,
     CARD_HOVER,
+    INPUT_BG,
     TEXT_DIM,
     TEXT_MUTED,
     TEXT_PRIMARY,
@@ -271,6 +279,15 @@ class LauncherWindow(QMainWindow):
         web_btn.setStyleSheet(player_btn.styleSheet())
         web_btn.clicked.connect(self.webRequested.emit)
         sub_row.addWidget(web_btn)
+        sub_row.addSpacing(8)
+
+        # 日志：打包成 exe 后没有控制台，出问题只能靠这个文件
+        log_btn = QPushButton("日志")
+        log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        log_btn.setToolTip("在资源管理器中定位 data/app.log（排障时看这里）")
+        log_btn.setStyleSheet(player_btn.styleSheet())
+        log_btn.clicked.connect(self._open_log)
+        sub_row.addWidget(log_btn)
         sub_row.addSpacing(12)
 
         scale_label = QLabel("UI缩放:")
@@ -308,13 +325,44 @@ class LauncherWindow(QMainWindow):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(40, 30, 40, 30)
 
-        section_label = QLabel("功能模块")
-        section_label.setStyleSheet(
+        # 全局搜索：不先选模块，直接找「那个温泉的视频」
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText(
+            "搜索作品 / 作者 / 歌单 / 歌曲 / 视频…    (Ctrl+K)"
+        )
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setFixedHeight(34)
+        self.search_box.setMaximumWidth(560)
+        self.search_box.setStyleSheet(
+            f"""
+            QLineEdit {{
+                background-color: {INPUT_BG}; color: {TEXT_PRIMARY};
+                border: 1px solid {CARD_BORDER}; border-radius: 6px;
+                padding: 2px 10px; font-size: 13px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+            """
+        )
+        self.search_box.textChanged.connect(self._on_search_text)
+        self.search_box.returnPressed.connect(self._open_first_result)
+        content_layout.addWidget(self.search_box)
+        content_layout.addSpacing(14)
+
+        self.section_label = QLabel("功能模块")
+        self.section_label.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 14px; font-weight: bold; "
             f"background: transparent; border: none;"
         )
-        content_layout.addWidget(section_label)
+        content_layout.addWidget(self.section_label)
         content_layout.addSpacing(16)
+
+        # 卡片页 / 搜索结果页共用同一块空间：输入即切，清空即回
+        self.content_stack = QStackedWidget()
+
+        cards_page = QWidget()
+        cards_page.setStyleSheet(f"background-color: {BG_MAIN}; border: none;")
+        cards_layout = QVBoxLayout(cards_page)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
 
         # 卡片网格（水平居中，自动换行）
         card_grid = QHBoxLayout()
@@ -326,10 +374,89 @@ class LauncherWindow(QMainWindow):
             card.clicked.connect(self._on_card_clicked)
             card_grid.addWidget(card)
 
-        content_layout.addLayout(card_grid)
-        content_layout.addStretch()
+        cards_layout.addLayout(card_grid)
+        cards_layout.addStretch()
+
+        self.search_panel = SearchPanel()
+        self.search_panel.resultActivated.connect(self._on_search_result)
+
+        self.content_stack.addWidget(cards_page)
+        self.content_stack.addWidget(self.search_panel)
+        content_layout.addWidget(self.content_stack, 1)
 
         main_layout.addWidget(content, 1)
+
+        # 输入防抖：每敲一个字就查三个库，快打时会连发十几条 SQL
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(220)
+        self._search_timer.timeout.connect(self._run_search)
+
+        for keys in ("Ctrl+K", "Ctrl+F"):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.activated.connect(self._focus_search)
+        # Esc 清空搜索，回到模块卡片
+        escape = QShortcut(QKeySequence("Escape"), self)
+        escape.activated.connect(self._clear_search)
+
+    def _open_first_result(self):
+        first = self.search_panel.first_result()
+        if first is not None:
+            self._on_search_result(*first)
+
+    def _clear_search(self):
+        if self.search_box.text():
+            self.search_box.clear()
+
+    def _focus_search(self):
+        self.search_box.setFocus()
+        self.search_box.selectAll()
+
+    def _on_search_text(self, text):
+        if not text.strip():
+            self._search_timer.stop()
+            self.section_label.setText("功能模块")
+            self.content_stack.setCurrentIndex(0)
+            return
+        self._search_timer.start()
+
+    def _run_search(self):
+        keyword = self.search_box.text().strip()
+        if not keyword:
+            return
+        result = search_index.search(keyword)
+        self.search_panel.set_results(result, keyword)
+        total = result.get("total", 0)
+        # 空结果时别在这里重复一遍「没有找到」——面板里已经写了
+        self.section_label.setText(f"搜索结果 · {total} 个" if total else "搜索结果")
+        self.content_stack.setCurrentIndex(1)
+
+    def _on_search_result(self, module, item):
+        """点搜索结果：开对应模块并直接跳到那一项"""
+        kind = item.get("kind")
+        payload = item.get("payload") or {}
+        self.search_box.clear()
+
+        win = self._open_module({"id": module, "title": "", "status": "ready"})
+        if win is None:
+            return
+
+        try:
+            if kind in ("photo_work", "video_work"):
+                win.open_work(payload)
+            elif kind == "audio_playlist":
+                win.open_playlist(payload["id"])
+            elif kind == "audio_track":
+                win.open_playlist(payload["playlist_id"])
+            elif kind == "video_file":
+                work = {
+                    "id": payload["work_id"],
+                    "name": payload["work_name"],
+                    "author": payload["author"],
+                }
+                win.open_work(work)
+        except (AttributeError, KeyError, TypeError) as e:
+            print(f"[全局搜索] 打开失败 {kind}: {e}")
 
     def _on_card_clicked(self, module_id):
         """处理卡片点击事件"""
@@ -352,18 +479,43 @@ class LauncherWindow(QMainWindow):
             return
         self._on_card_clicked(module_id)
 
+    def _hide_other_modules(self, keep_mid):
+        """同时只留一个模块窗口可见
+
+        三个模块都是整屏大窗口，之前只 hide 启动器：写真、音频、视频能并排摆着，
+        想回启动器还得挨个关。这里把其余模块收起来——只 hide 不 close，
+        窗口状态、播放队列、滚动位置都留着，再进来还是原样。
+        """
+        for mid, win in list(self._module_windows.items()):
+            if mid == keep_mid:
+                continue
+            try:
+                if win.isVisible():
+                    win.hide()
+            except RuntimeError:
+                # 底层 C++ 对象已销毁，引用留着只会在下次 raise_() 时炸
+                del self._module_windows[mid]
+
     def _open_module(self, module):
-        """打开指定模块"""
+        """打开指定模块（返回窗口实例，供搜索结果直接定位）"""
         mid = module["id"]
+
+        self._hide_other_modules(mid)
 
         # 如果窗口已打开且未被销毁，激活它
         if mid in self._module_windows:
             win = self._module_windows[mid]
             try:
+                # 必须 show()：切换模块时其余窗口被 hide 过，单靠 raise_()
+                # 不会让隐藏的窗口重新出现（表现为「点了卡片什么都没发生」）
+                if win.isMinimized():
+                    win.showNormal()
+                else:
+                    win.show()
                 win.raise_()
                 win.activateWindow()
                 self.hide()
-                return
+                return win
             except RuntimeError:
                 del self._module_windows[mid]
 
@@ -378,7 +530,8 @@ class LauncherWindow(QMainWindow):
             self._module_windows[mid] = win
             self.hide()
             win.show()
-        elif mid == "audio":
+            return win
+        if mid == "audio":
             from ui.audio_view import AudioMainWindow
 
             def _on_audio_closed():
@@ -390,7 +543,8 @@ class LauncherWindow(QMainWindow):
             self._module_windows[mid] = win
             self.hide()
             win.show()
-        elif mid == "video":
+            return win
+        if mid == "video":
             from ui.video_view import VideoMainWindow
 
             def _on_video_closed():
@@ -401,7 +555,8 @@ class LauncherWindow(QMainWindow):
             self._module_windows[mid] = win
             self.hide()
             win.show()
-        elif mid == "web":
+            return win
+        if mid == "web":
             from ui.server_window import ServerWindow
 
             def _on_web_closed():
@@ -412,15 +567,29 @@ class LauncherWindow(QMainWindow):
             self._module_windows[mid] = win
             self.hide()
             win.show()
-        else:
-            QMessageBox.information(
-                self, "提示", f"「{module['title']}」模块暂未实现"
-            )
+            return win
+        QMessageBox.information(
+            self, "提示", f"「{module['title']}」模块暂未实现"
+        )
+        return None
 
     def _on_module_closed(self, module_id):
         """模块窗口关闭后清理引用"""
         if module_id in self._module_windows:
             del self._module_windows[module_id]
+
+    def _open_log(self):
+        """在资源管理器中定位 data/app.log（打包后没有控制台，排障唯一入口）"""
+        from applog import log_path
+
+        path = log_path()
+        if not os.path.isfile(path):
+            QMessageBox.information(self, "日志", f"还没有日志文件：\n{path}")
+            return
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])  # noqa: S603,S607
+        except OSError as e:
+            QMessageBox.warning(self, "打不开日志", f"{path}\n\n{e}")
 
     def _on_scale_changed(self, text):
         """UI 缩放变更，保存配置并提示重启"""

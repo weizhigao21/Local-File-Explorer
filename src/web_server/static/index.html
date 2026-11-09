@@ -12,9 +12,9 @@
 <!-- 静态资源的 ?v= 必须跟着 APP_VERSION 走（tests/test_web_server.py 会校验）。
      服务端给静态资源 1 天缓存，平板升级后不清缓存就会继续跑旧 app.js，
      看起来像「明明修了还是坏的」。 -->
-<link rel="icon" href="/static/icon.svg?v=1.11.0" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/static/icon.svg?v=1.11.0">
-<link rel="stylesheet" href="/static/style.css?v=1.11.0">
+<link rel="icon" href="/static/icon.svg?v=1.14.0" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon.svg?v=1.14.0">
+<link rel="stylesheet" href="/static/style.css?v=1.14.0">
 <title>本地资源</title>
 </head>
 <body>
@@ -92,7 +92,11 @@
       <button type="button" class="v-close" id="lb-close" aria-label="关闭"></button>
     </span>
   </div>
-  <div class="lb-stage" id="lb-stage"><img id="lb-img" alt="" decoding="async"></div>
+  <!-- 两层轮换：翻页时一层推走、另一层推进来。单张 <img> 换 src 是做不出动画的 -->
+  <div class="lb-stage" id="lb-stage">
+    <div class="lb-layer" id="lb-layer-a"><img id="lb-img" alt="" decoding="async"></div>
+    <div class="lb-layer" id="lb-layer-b"><img id="lb-img-b" alt="" decoding="async"></div>
+  </div>
   <button type="button" class="lb-nav prev" id="lb-prev" aria-label="上一张"></button>
   <button type="button" class="lb-nav next" id="lb-next" aria-label="下一张"></button>
 </div>
@@ -100,7 +104,7 @@
 <div id="toast"></div>
 <audio id="audio" preload="metadata"></audio>
 
-<script src="/static/compat.js?v=1.11.0"></script>
-<script src="/static/app.js?v=1.11.0"></script>
+<script src="/static/compat.js?v=1.14.0"></script>
+<script src="/static/app.js?v=1.14.0"></script>
 </body>
 </html>

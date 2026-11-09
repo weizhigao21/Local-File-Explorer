@@ -29,6 +29,11 @@ _SIZE_STEP = 64
 # 超过此尺寸的请求不写磁盘缓存（如全屏查看器，每次尺寸都不同，缓存收益低）
 _DISK_CACHE_MAX_DIM = 512
 
+# 单边解码上限：看图器放大要真像素，1024 在 2K 屏上放大一倍就糊了。
+# 2560 覆盖 2K 屏 2 倍显示；单张 2560×1472 RGBX ≈ 15MB，配合下面 256MB 的
+# 内存上限能同时放十几张，不会失控。缩略图请求的尺寸远小于此，不受影响。
+_MAX_DECODE_DIM = 2560
+
 # 内存缓存字节上限（解码产物 QImage，全屏大图单张数 MB，按条数限不住总量）
 _CACHE_MAX_BYTES = 256 * 1024 * 1024
 
@@ -44,8 +49,8 @@ def _normalize_size(size: QSize) -> tuple[int, int]:
     w = ((size.width() + _SIZE_STEP - 1) // _SIZE_STEP) * _SIZE_STEP
     h = ((size.height() + _SIZE_STEP - 1) // _SIZE_STEP) * _SIZE_STEP
     # 限制最大值，避免超大图导致 OOM
-    w = min(w, 1024)
-    h = min(h, 1024)
+    w = min(w, _MAX_DECODE_DIM)
+    h = min(h, _MAX_DECODE_DIM)
     return (w, h)
 
 
@@ -244,20 +249,29 @@ class ImageLoadTask(QRunnable):
         # QRunnable 里未捕获的 Python 异常在 PyQt6 下不会只打印，而是 qFatal → abort 整个进程。
         # 因此这里必须兜住所有异常：解码失败时发射空 image，调用方的 _on_loaded
         # 已经统一判 isNull() 并保持占位图（grid_view / image_viewer / work_images_view）。
+        image = QImage()
         try:
             # 命中缓存直接返回
             cached = get_cached(self.path, self.target)
             if cached is not None:
-                self.signals.loaded.emit(self.path, self.target, cached, self.token)
+                self._emit(cached)
                 return
             image = _decode(self.path, self.target)
             put_cache(self.path, self.target, image)
-            self.signals.loaded.emit(self.path, self.target, image, self.token)
         except Exception:
             traceback.print_exc()
-            # 连发射都失败（如 QObject 已析构）则彻底放弃该任务
-            with suppress(Exception):
-                self.signals.loaded.emit(self.path, self.target, QImage(), self.token)
+        self._emit(image)
+
+    def _emit(self, image: QImage):
+        """发射解码结果
+
+        窗口关闭后本任务可能还在跑，而 `_Signals` 是随任务销毁的 QObject：
+        此时 emit 抛 RuntimeError("wrapped C/C++ object has been deleted")。
+        这不是错误——用户已经关窗了，结果本来也没人要。放大看图后解码更慢、
+        撞上的概率更高，所以在这里静默，别让控制台刷一屏假警报。
+        """
+        with suppress(RuntimeError):
+            self.signals.loaded.emit(self.path, self.target, image, self.token)
 
 
 class ImageLoader:
