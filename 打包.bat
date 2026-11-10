@@ -68,7 +68,15 @@ set "CODEBUDDY_SAFE_DELETE_SANDBOX=0"
 
 rem ---- 5. 打包 ----
 echo [4/5] 打包中，预计 1-3 分钟...
-if exist "dist\本地资源管理器" move "dist\本地资源管理器" "dist\old_%RANDOM%%RANDOM%" >nul
+rem 不保留旧产物：直接删除上一次的 dist，避免 old_* 备份目录越积越多
+if exist "dist\本地资源管理器" (
+    rmdir /s /q "dist\本地资源管理器"
+    if exist "dist\本地资源管理器" (
+        echo [错误] 无法删除旧产物 dist\本地资源管理器
+        echo        通常是程序还在运行，请先关闭「本地资源管理器」再重新打包。
+        goto :fail
+    )
+)
 set "PYINSTALLER_CONFIG_DIR=%CD%\build\pyinstaller-cache"
 %PYCMD% -m PyInstaller build.spec --noconfirm
 if errorlevel 1 goto :fail
@@ -85,6 +93,7 @@ del /q "dist\本地资源管理器\_internal\PyQt6\Qt6\bin\opengl32sw.dll" 2>nul
 for %%f in ("dist\本地资源管理器\_internal\PyQt6\Qt6\translations\*.qm") do (
     echo %%~nxf | findstr /i "zh_CN" >nul || del /q "%%f" 2>nul
 )
+rem 顺手清掉老版本脚本遗留的 old_* 备份（自愈，不影响本次产物）
 for /d %%d in (dist\old_*) do rmdir /s /q "%%d" 2>nul
 
 echo.
