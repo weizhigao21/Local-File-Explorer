@@ -1040,19 +1040,19 @@ def test_flex_rows_do_not_rely_on_gap():
     assert "margin-left: 6px" in _css_rule(css, ".chip .count")
 
 
-def test_video_fullscreen_falls_back_to_native_player():
-    """Android 7 的 WebView（UA 带 wv）里元素级全屏常常静默失败
+def test_video_fullscreen_supports_native_player_for_old_browsers():
+    """完全没有 requestFullscreen 的老内核（Android 4.x）只剩 <video> 自己的全屏通道
 
-    宿主 App 不实现 onShowCustomView，requestFullscreen() 会「成功返回但什么都不发生」，
-    所以 800ms 后要量一次，没进全屏就退到 <video> 自己的全屏通道，别让按钮看着像坏的。
+    注意：这条退路只给「连元素全屏 API 都没有」的浏览器用；有 API 但静默失败的
+    WebView 不许走它，否则页面会被留在全屏媒体态（见
+    test_silent_fullscreen_failure_never_enters_native_player）。
     """
     js = _static_text("app.js")
     assert "function enterNativeVideoFullscreen(" in js
     assert "webkitEnterFullscreen" in js, "没走原生视频全屏这条退路"
 
     handler = _js_block(js, "$('v-full').addEventListener(")
-    assert "enterNativeVideoFullscreen()" in handler
-    assert "800" in handler, "静默失败后没有延时探测"
+    assert "if (!asked)" in handler, "只有拿不到元素全屏 API 时才该退原生"
 
 
 # ==================== 多根目录配置（v1.10.0） ====================
@@ -1752,9 +1752,62 @@ def test_next_button_is_dimmed_not_removed_on_last_episode():
 
 def test_close_video_exits_fullscreen_before_hiding():
     body = _js_function("closeVideo")
-    assert "exitPlayerFullscreen()" in body
+    assert "exitPlayerFullscreenWithRetry()" in body
     # 顺序不能反：先 hidden 的话，exitFullscreen 面对的是已经不可见的全屏元素
-    assert body.index("exitPlayerFullscreen") < body.index("$('video-overlay').hidden = true")
+    assert body.index("exitPlayerFullscreenWithRetry") < body.index("$('video-overlay').hidden = true")
+
+
+def test_exit_fullscreen_retries_until_it_sticks():
+    """退出全屏在 WebView 上是异步的，一次调用可能被 reject 或静默失败
+
+    真机现象：点返回回列表了，页面却仍是全屏态 → 上下滑被系统当「全屏媒体手势」
+    （右侧音量、左侧亮度），列表滑不动。所以退完要复查，还在就再补两刀。
+    """
+    body = _js_function("exitPlayerFullscreenWithRetry")
+    assert "exitPlayerFullscreen()" in body
+    assert "stillInFullscreen()" in body, "退出后没有复查，失败了也不知道"
+    assert "setTimeout" in body, "没有重试"
+    still = _js_function("stillInFullscreen")
+    assert "fullscreenElement" in still and "webkitDisplayingFullscreen" in still
+
+
+def test_silent_fullscreen_failure_never_enters_native_player():
+    """元素全屏静默失败时不能退到 <video> 原生全屏
+
+    原生全屏进去容易出来难：退出由原生播放器控制，宿主壳不一定回调
+    onHideCustomView，页面就卡在「全屏媒体」状态。播放器本身铺满视口，
+    少一条状态栏不值得冒这个险。
+    """
+    handler = _js_block(_static_text("app.js"), "$('v-full').addEventListener(")
+    assert "enterNativeVideoFullscreen()" in handler, "不支持 requestFullscreen 的老浏览器仍要能全屏"
+    # 800ms 那条兜底分支只许提示，不许进原生全屏
+    tail = handler[handler.index("800"):]
+    assert "enterNativeVideoFullscreen()" not in tail, "静默失败又退到原生视频全屏了"
+
+
+def test_webview_never_asks_for_system_fullscreen():
+    """UA 带 wv 的 WebView 一律不开系统全屏
+
+    播放器本身就是铺满视口的固定层，系统全屏只多藏一条状态栏；可宿主壳对
+    onShowCustomView/onHideCustomView 的实现参差不齐，进去容易退不出来——
+    退不出来时整个页面都被系统当「全屏媒体」，列表再也滑不动。
+    """
+    js = _static_text("app.js")
+    assert "IS_WEBVIEW" in js
+    assert "wv[);]" in js, "UA 判定不见了"
+    handler = _js_block(js, "$('v-full').addEventListener(")
+    assert "systemFullscreenBroken" in handler
+    # 短路必须排在真正 requestFullscreen 之前
+    assert handler.index("systemFullscreenBroken") < handler.index("requestFullscreen")
+
+
+def test_hash_change_closes_player_cleanly():
+    """系统返回键直接改 hash，不经过关闭按钮，也得退全屏+解锁滚动"""
+    js = _static_text("app.js")
+    block = _js_block(js, "window.addEventListener('hashchange'")
+    assert "closeVideo()" in block
+    # 切集不改 hash，所以这里只看「hash 指向的视频」是否就是当前这集
+    assert "sameVideo" in block
 
 
 def test_exit_fullscreen_handles_native_video_fullscreen():

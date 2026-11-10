@@ -267,6 +267,19 @@
   }
 
   window.addEventListener('hashchange', () => {
+    // 系统返回键 / 浏览器返回直接改 hash，绕过了播放器的关闭按钮：
+    // 播放器还开着就先按正规流程收尾（退全屏、解锁滚动、摘掉 <video>），
+    // 否则页面回到列表了却仍是全屏态，上下滑被系统拿去调音量/亮度。
+    if (!$('video-overlay').hidden) {
+      const { parts } = parseHash();
+      const current = state.video.videos[state.video.index];
+      const sameVideo =
+        parts[0] === 'video' &&
+        parts[1] === 'w' &&
+        Number(parts[2]) === state.video.workId &&
+        Number(parts[3]) === (current && current.id ? current.id : 0);
+      if (!sameVideo) closeVideo();
+    }
     render();
   });
 
@@ -2159,6 +2172,10 @@
   const vSeek = $('v-seek');
   const vOverlay = $('video-overlay');
   let vIdleTimer = 0;
+  // 这台设备进不去/退不出系统全屏（WebView 宿主没实现或实现有缺陷）——
+  // 试过一次就别再试，免得反复请求把页面留在「半全屏」状态
+  const IS_WEBVIEW = /;\s*wv[);]/i.test(navigator.userAgent || '');
+  let systemFullscreenBroken = IS_WEBVIEW;
 
   function videoDuration() {
     const known = (state.video.info && state.video.info.duration_ms) || 0;
@@ -2314,11 +2331,13 @@
   $('v-full').addEventListener('click', () => {
     const doc = document;
     if (doc.fullscreenElement || doc.webkitFullscreenElement) {
-      try {
-        (doc.exitFullscreen || doc.webkitExitFullscreen).call(doc);
-      } catch (error) {
-        /* 退出失败也只能算了 */
-      }
+      // 和关闭播放器走同一条退出路径：WebView 上可能一次退不掉，要复查补刀
+      exitPlayerFullscreenWithRetry();
+      showVideoControls();
+      return;
+    }
+    if (systemFullscreenBroken) {
+      showVideoHint('播放器已经铺满屏幕，这台设备不用再开系统全屏', 2600);
       showVideoControls();
       return;
     }
@@ -2340,9 +2359,14 @@
     if (!asked) {
       enterNativeVideoFullscreen();
     } else {
-      // 静默失败（WebView 常见）就退到原生视频全屏，别让按钮看着像坏了
+      // 静默失败（WebView 常见）**别再**退到 <video> 的原生全屏：那条路进去
+      // 容易出来难——退出全屏由原生播放器控制，宿主壳不一定回调 onHideCustomView，
+      // 页面被留在「全屏媒体」状态，之后上下滑全被系统拿去调音量/亮度。
+      // 播放器本来就是铺满视口的固定层，缺的只是一条状态栏，提示一下就好。
       setTimeout(() => {
-        if (!doc.fullscreenElement && !doc.webkitFullscreenElement) enterNativeVideoFullscreen();
+        if (doc.fullscreenElement || doc.webkitFullscreenElement) return;
+        systemFullscreenBroken = true;
+        showVideoHint('播放器已经铺满屏幕，这台设备不用再开系统全屏', 2600);
       }, 800);
     }
     showVideoControls();
@@ -2470,6 +2494,33 @@
     }
   }
 
+  /** 还剩没剩下全屏态（两种通道都算） */
+  function stillInFullscreen() {
+    const doc = document;
+    return Boolean(
+      doc.fullscreenElement ||
+        doc.webkitFullscreenElement ||
+        videoEl.webkitDisplayingFullscreen
+    );
+  }
+
+  /** 退出全屏，并盯着结果补刀
+   *
+   * WebView 的退出是异步的（要么走宿主 IPC，要么下一帧才生效），一次调用
+   * 不保证成功——真机上见过 `exitFullscreen()` 返回的 promise 被 reject、
+   * 或者干脆静默失败，页面留在全屏态。之后列表的上下滑全被系统当成
+   * 「全屏媒体手势」（右侧音量、左侧亮度），这就是「点返回回列表却滑不动」。
+   * 所以这里隔一段时间复查两次，还在全屏就再来一遍。
+   */
+  function exitPlayerFullscreenWithRetry() {
+    exitPlayerFullscreen();
+    for (const delay of [200, 600]) {
+      setTimeout(() => {
+        if (stillInFullscreen()) exitPlayerFullscreen();
+      }, delay);
+    }
+  }
+
   /** 清掉 ensureVideoFullscreen() 写下的内联几何，逼 WebView 按当前视口重建图层 */
   function resetVideoGeometry() {
     for (const key of ['position', 'top', 'left', 'right', 'bottom', 'width', 'height']) {
@@ -2480,7 +2531,7 @@
   function closeVideo() {
     saveVideoProgress(false);
     // 先退全屏再藏：反过来（先 hidden）会让 exitFullscreen 找不到还活着的全屏元素
-    exitPlayerFullscreen();
+    exitPlayerFullscreenWithRetry();
     clearTimeout(state.video.refreshTimer);
     state.video.refreshTimer = 0;
     markOpStartMs = 0;
