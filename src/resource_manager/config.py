@@ -70,7 +70,7 @@ TRANSCODE_DIR = os.path.join(_DATA_DIR, "transcode")
 TRANSCODE_MAX_BYTES = 20 * 1024 ** 3
 
 # 应用版本号
-APP_VERSION = "1.18.1"
+APP_VERSION = "1.18.2"
 
 # ==================== 用户可变配置（config.json） ====================
 

@@ -186,6 +186,9 @@
     // 当前列表的排序（空 = 默认「名称 A-Z」）。放 URL 里，
     // 从详情页退回来、下拉刷新都还是同一份顺序
     sort: '',
+    // 当前列表的标签筛选（多选，同一维度内取交集）。同样跟着 URL 走，
+    // 从歌单详情退回来还是筛过的样子
+    tags: [],
     summary: null,
     token: 0,
     // 当前列表页的「重绘」（搜索用）与「滚到底续页」
@@ -289,8 +292,7 @@
   }
 
   /** 只改 hash 里的某个查询参数，不触发路由重跑 */
-  function replaceHashQuery(key, value) {
-    const { parts, query } = parseHash();
+  function replaceHashQuery(key, value) {    const { parts, query } = parseHash();
     if (value) query.set(key, value);
     else query.delete(key);
     const qs = query.toString();
@@ -300,6 +302,147 @@
     } catch (error) {
       /* 极老的 WebView 在 file:// 下会拒绝，排序功能本身不受影响 */
     }
+  }
+
+  // ---------------- 标签筛选抽屉 ----------------
+  //
+  // 音频库顶层就有 298 个标签（「双声道立体声/人头麦」这种还特别长），摊在列表
+  // 顶部会把歌单全挤下去，所以做成底部抽屉：先用搜索框找，再勾选。
+  // 勾选是**暂存**的——点确定才真正筛选；勾错了直接关掉不会白发一次请求。
+  let tagSheet = null;
+
+  function ensureTagSheet() {
+    if (tagSheet) return tagSheet;
+
+    const closeBtn = el('button', { class: 'sheet-close', type: 'button', text: '×', 'aria-label': '关闭' });
+    const head = el('div', { class: 'sheet-head' }, el('strong', { text: '按标签筛选' }), closeBtn);
+    const search = el('input', {
+      class: 'sheet-search',
+      type: 'search',
+      placeholder: '搜索标签',
+      autocomplete: 'off',
+    });
+    const list = el('div', { class: 'sheet-list' });
+    const clearBtn = el('button', { class: 'sheet-clear', type: 'button', text: '清空' });
+    const okBtn = el('button', { class: 'sheet-ok', type: 'button', text: '确定' });
+    const mask = el(
+      'div',
+      { class: 'sheet-mask', hidden: true },
+      el(
+        'div',
+        { class: 'sheet' },
+        head,
+        search,
+        list,
+        el('div', { class: 'sheet-foot' }, clearBtn, okBtn),
+      ),
+    );
+
+    const sheet = { mask, list, search, okBtn, all: [], selected: [], nodes: {}, onApply: null };
+
+    function syncFoot() {
+      okBtn.textContent = sheet.selected.length ? `确定（${sheet.selected.length}）` : '确定';
+    }
+
+    function renderList() {
+      const keyword = search.value.trim().toLowerCase();
+      const rows = sheet.all.filter(
+        (tag) => !keyword || tag.name.toLowerCase().indexOf(keyword) >= 0,
+      );
+      sheet.nodes = {};
+      if (!rows.length) {
+        list.replaceChildren(
+          el('div', {
+            class: 'sheet-empty',
+            text: keyword ? '没有匹配的标签' : '这一层还没有标签',
+          }),
+        );
+        return;
+      }
+      list.replaceChildren(
+        ...rows.map((tag) => {
+          const on = sheet.selected.indexOf(tag.name) >= 0;
+          const item = el(
+            'button',
+            { class: on ? 'tag-item on' : 'tag-item', type: 'button' },
+            el('span', { class: 'tag-name', text: tag.name }),
+            el('span', { class: 'tag-count', text: String(tag.count) }),
+          );
+          item.addEventListener('click', () => toggle(tag.name));
+          sheet.nodes[tag.name] = item;
+          return item;
+        }),
+      );
+    }
+
+    function toggle(name) {
+      const index = sheet.selected.indexOf(name);
+      if (index >= 0) sheet.selected.splice(index, 1);
+      else sheet.selected.push(name);
+      // 只改这一个按钮，不重画整张列表：298 个按钮重建会明显卡一下
+      if (sheet.nodes[name]) sheet.nodes[name].classList.toggle('on', index < 0);
+      syncFoot();
+    }
+
+    function close() {
+      mask.hidden = true;
+      document.body.classList.remove('sheet-open');
+    }
+
+    function open({ endpoint, params, selected, onApply }) {
+      sheet.onApply = onApply;
+      sheet.selected = (selected || []).slice();
+      sheet.all = [];
+      sheet.nodes = {};
+      search.value = '';
+      syncFoot();
+      list.replaceChildren(el('div', { class: 'sheet-empty', text: '加载中…' }));
+      mask.hidden = false;
+      document.body.classList.add('sheet-open');
+
+      const query = new URLSearchParams();
+      Object.keys(params || {}).forEach((key) => {
+        if (params[key]) query.set(key, String(params[key]));
+      });
+      const qs = query.toString();
+      api(`${endpoint}${qs ? `?${qs}` : ''}`)
+        .then((data) => {
+          if (mask.hidden) return; // 拉取期间已经关掉了
+          sheet.all = data.tags || [];
+          renderList();
+        })
+        .catch((error) => {
+          list.replaceChildren(
+            el('div', { class: 'sheet-empty', text: `加载失败：${error.message}` }),
+          );
+        });
+    }
+
+    closeBtn.addEventListener('click', close);
+    clearBtn.addEventListener('click', () => {
+      sheet.selected = [];
+      Object.keys(sheet.nodes).forEach((name) => sheet.nodes[name].classList.remove('on'));
+      syncFoot();
+    });
+    okBtn.addEventListener('click', () => {
+      const picked = sheet.all
+        .filter((tag) => sheet.selected.indexOf(tag.name) >= 0)
+        .map((tag) => tag.name);
+      // 标签还没拉回来就点了确定：把没在 all 里的选择补在后面，别默默丢掉
+      sheet.selected.forEach((name) => {
+        if (picked.indexOf(name) < 0) picked.push(name);
+      });
+      close();
+      if (sheet.onApply) sheet.onApply(picked);
+    });
+    search.addEventListener('input', renderList);
+    mask.addEventListener('click', (event) => {
+      if (event.target === mask) close();
+    });
+
+    tagSheet = { open, close, mask };
+    document.body.append(mask);
+    return tagSheet;
   }
 
   // ---------------- 顶栏 / 标签 ----------------
@@ -391,6 +534,38 @@
     return { parts, query: new URLSearchParams(queryPart || '') };
   }
 
+  /** `?tags=a,b` → ['a','b']（去空去重；与服务端 parse_tags_query 同一套规则） */
+  function parseTagsParam(text) {
+    const result = [];
+    String(text || '').split(',').forEach((part) => {
+      const tag = part.trim();
+      if (tag && result.indexOf(tag) < 0) result.push(tag);
+    });
+    return result;
+  }
+
+  /** 歌单的 tags 字段（逗号/中文逗号/空白混排）→ 标签数组
+   *
+   * 分隔符必须跟桌面端 `audio_manager.database.parse_tags` 一致，
+   * 否则同一个标签在网页上点出来的结果和电脑上对不上。
+   */
+  function splitTagText(text) {
+    return parseTagsParam(String(text || '').replace(/[,，\n\r\s]+/g, ','));
+  }
+
+  /** 详情页里的标签胶囊：点一下回列表并只按这个标签筛 */
+  function tagLinkChip(tag) {
+    return el(
+      'button',
+      {
+        class: 'tag-chip link',
+        type: 'button',
+        onclick: () => { location.hash = `#/audio?tags=${encodeURIComponent(tag)}`; },
+      },
+      el('span', { class: 'tag-chip-name', text: tag }),
+    );
+  }
+
   window.addEventListener('hashchange', () => {
     // 系统返回键 / 浏览器返回直接改 hash，绕过了播放器的关闭按钮：
     // 播放器还开着就先按正规流程收尾（退全屏、解锁滚动、摘掉 <video>），
@@ -405,6 +580,8 @@
         Number(parts[3]) === (current && current.id ? current.id : 0);
       if (!sameVideo) closeVideo();
     }
+    // 标签抽屉开着时返回键改的是 hash：先把抽屉收掉，否则下面整页重建了它还挂着
+    if (tagSheet && !tagSheet.mask.hidden) tagSheet.close();
     render();
   });
 
@@ -415,6 +592,8 @@
     state.autoLoad = null;
     // 排序跟着地址走：从作品详情退回来、下拉刷新，顺序都还是用户挑的那个
     state.sort = query.get('sort') || '';
+    // 标签筛选同理（`?tags=舔耳,ASMR`）。列表页以外的路由即使带着也不认
+    state.tags = parseTagsParam(query.get('tags'));
 
     try {
       if (parts.length === 0) {
@@ -525,9 +704,20 @@
     const titleText = el('strong', { text: '加载中…' });
     const titleEl = el('div', { class: 'section-title' }, titleText);
     if (options.sortable) titleEl.append(buildSortSelect());
+    // 「标签」入口：右上角。已选几个直接写在按钮上，「现在筛着呢」一眼可见
+    const tagBtn = options.taggable
+      ? el(
+          'button',
+          { class: 'tag-btn', type: 'button', onclick: () => openTagPicker() },
+          el('span', { class: 'tag-btn-text', text: '标签' }),
+        )
+      : null;
+    if (tagBtn) titleEl.append(tagBtn);
+    // 已选标签单独一行（横向滚动，不占高度）
+    const tagBar = options.taggable ? el('div', { class: 'tag-chips', hidden: true }) : null;
     const grid = el('div', { class: 'grid' });
     const more = el('button', { class: 'more', type: 'button', text: '加载更多', hidden: true });
-    const node = el('div', null, titleEl, grid, more);
+    const node = el('div', null, titleEl, tagBar, grid, more);
     let page = 0;
     let pages = 1;
     let total = 0;
@@ -537,6 +727,62 @@
 
     more.addEventListener('click', () => { loadMore(); });
 
+    function openTagPicker() {
+      ensureTagSheet().open({
+        endpoint: options.tagsEndpoint,
+        params: options.params,
+        selected: state.tags,
+        onApply: (tags) => applyTags(tags),
+      });
+    }
+
+    /** 应用标签筛选：改状态 → 同步地址 → 刷新列表（不整页重建）
+     *
+     * 地址里带上 tags 是为了两件事：从歌单详情退回来还是筛过的样子，
+     * 以及把链接发给别人时对方看到的是同一批歌单。
+     */
+    function applyTags(tags) {
+      state.tags = tags.slice();
+      replaceHashQuery('tags', state.tags.join(','));
+      const { parts } = parseHash();
+      if (parts.length === 1 && lastListHash[parts[0]] !== undefined) {
+        lastListHash[parts[0]] = location.hash || `#/${parts[0]}`;
+      }
+      syncTagBar();
+      reload();
+    }
+
+    function syncTagBar() {
+      if (!tagBar) return;
+      const tags = state.tags;
+      tagBtn.querySelector('.tag-btn-text').textContent = tags.length
+        ? `标签 · ${tags.length}`
+        : '标签';
+      tagBtn.classList.toggle('on', tags.length > 0);
+      if (!tags.length) {
+        tagBar.hidden = true;
+        tagBar.replaceChildren();
+        return;
+      }
+      tagBar.hidden = false;
+      tagBar.replaceChildren(
+        ...tags.map((tag) =>
+          el(
+            'button',
+            {
+              class: 'tag-chip',
+              type: 'button',
+              // 点芯片即取消这个标签，跟桌面端标签芯片上的 × 一个意思
+              onclick: () => applyTags(state.tags.filter((item) => item !== tag)),
+            },
+            el('span', { class: 'tag-chip-name', text: tag }),
+            el('span', { class: 'tag-chip-x', text: '×' }),
+          ),
+        ),
+        el('button', { class: 'tag-chip clear', type: 'button', text: '清空', onclick: () => applyTags([]) }),
+      );
+    }
+
     function fetchPage(next) {
       const params = new URLSearchParams();
       Object.keys(options.params || {}).forEach((key) => {
@@ -544,22 +790,33 @@
       });
       if (state.search) params.set('q', state.search);
       if (state.sort) params.set('sort', state.sort);
+      if (options.taggable && state.tags.length) params.set('tags', state.tags.join(','));
       params.set('page', String(next));
       if (options.pageSize) params.set('page_size', String(options.pageSize));
       return api(`${options.endpoint}?${params.toString()}`);
     }
 
     function showEmpty() {
+      // 搜索或标签筛空都是「换个条件试试」，别提示「库还是空的」误导人
+      const filtered = Boolean(state.search) || (options.taggable && state.tags.length > 0);
       grid.replaceChildren(
         emptyState(
-          state.search && options.emptySearchTitle ? options.emptySearchTitle : options.emptyTitle,
-          state.search && options.emptySearchTitle ? ['换个关键词试试'] : options.emptyHints,
+          filtered && options.emptySearchTitle ? options.emptySearchTitle : options.emptyTitle,
+          filtered && options.emptySearchTitle ? ['换个关键词试试'] : options.emptyHints,
         ),
       );
     }
 
     function applyTitle() {
-      titleText.textContent = total ? `${options.unit(total)}，已显示 ${items.length}` : '';
+      if (!total) {
+        titleText.textContent = '';
+        return;
+      }
+      // 一页就装得下时不必再说「已显示 N」——两个数一样，白占半行；
+      // 窄屏（320）上正是这半行把排序下拉和标签按钮挤到第二行去的
+      titleText.textContent = items.length >= total
+        ? options.unit(total)
+        : `${options.unit(total)}，已显示 ${items.length}`;
     }
 
     function updateMore() {
@@ -643,6 +900,9 @@
       if (rect.top > window.innerHeight + 600) return;
       loadMore();
     }
+
+    // 从详情返回时 state.tags 已经恢复好了，先把芯片画出来再拉数据
+    syncTagBar();
 
     return {
       node,
@@ -1301,6 +1561,9 @@
       unit: (n) => `${n} 个歌单`,
       params: {},
       sortable: true,
+      // 标签筛选只在列表层：桌面端也是这个分工（进歌单里就是曲目列表，不再筛）
+      taggable: true,
+      tagsEndpoint: '/api/audio/tags',
       emptyTitle: '音频库还是空的',
       emptySearchTitle: '没有匹配的歌单',
       emptyHints: ['在电脑上打开「音频」模块并扫描一次', '歌单按目录层级自动生成'],
@@ -1346,7 +1609,8 @@
       : lastListHash.audio;
 
     const nodes = [];
-    if (data.playlist.has_cover || data.playlist.tags) {
+    const playlistTags = splitTagText(data.playlist.tags);
+    if (data.playlist.has_cover || playlistTags.length) {
       nodes.push(
         el(
           'div',
@@ -1360,9 +1624,12 @@
             : null,
           el(
             'span',
-            { style: { minWidth: '0' } },
+            { style: { minWidth: '0', flex: '1' } },
             el('strong', { text: data.playlist.name, style: { display: 'block', fontSize: '15px' } }),
-            el('span', { text: data.playlist.tags || '' }),
+            // 标签做成可点的胶囊（桌面版详情页也是这么用的）：点一下回列表按它筛
+            playlistTags.length
+              ? el('span', { class: 'tag-chips wrap' }, ...playlistTags.map((tag) => tagLinkChip(tag)))
+              : null,
           ),
         ),
       );

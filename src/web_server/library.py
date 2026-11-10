@@ -581,11 +581,54 @@ def _escape_like(text):
     return str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def audio_playlists_page(parent="", keyword="", page=1, page_size=0, sort=""):
+def audio_tag_counts(parent=""):
+    """当前层级歌单的标签，以及每个标签各命中多少个歌单
+
+    只统计**这一层**：标签是按目录向上继承来的，子歌单身上那些标签在这张列表里
+    根本不会出现，列出来点了也只会得到「没有匹配」。
+    顺序按命中数从多到少（同数按名字）——手机上 298 个标签按拼音排等于没排，
+    常搜的几个先露出来才用得下去。
+    """
+    rows = _rows(
+        audio_db,
+        "SELECT tags FROM playlists WHERE parent_path = ?",
+        (parent or "",),
+    )
+    counter = {}
+    for row in rows:
+        for tag in audio_db.parse_tags(row.get("tags") or ""):
+            counter[tag] = counter.get(tag, 0) + 1
+    ordered = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+    return [{"name": name, "count": count} for name, count in ordered]
+
+
+def _audio_ids_with_tags(parent, tags):
+    """当前层里「同时带齐这些标签」的歌单 id 列表；没给标签时返回 None
+
+    在 Python 里算而不是在 SQL 里 LIKE：标签是空格/逗号/换行混排的一段文本，
+    `LIKE '%治愈%'` 会把「治愈系」也算命中，跟桌面端（拆成集合后取交集）不一致。
+    """
+    wanted = {str(tag).strip() for tag in (tags or []) if str(tag).strip()}
+    if not wanted:
+        return None
+    rows = _rows(
+        audio_db, "SELECT id, tags FROM playlists WHERE parent_path = ?", (parent or "",)
+    )
+    return [
+        int(row["id"])
+        for row in rows
+        if wanted.issubset(audio_db.parse_tags(row.get("tags") or ""))
+    ]
+
+
+def audio_playlists_page(parent="", keyword="", page=1, page_size=0, sort="", tags=None):
     """分页版歌单列表（网页端用）：SQL 里就切好页，不再把整库读进内存
 
     搜索范围与桌面端一致：只在**当前这一层**的歌单名里找，不跨层级递归——
     否则搜出来的结果连自己在哪一层都说不清，点进去还得先找路。
+
+    `tags` 与搜索、排序**叠加生效**（桌面端是标签一开就藏搜索框，那是屏幕不够
+    的取舍；网页端顶栏的搜索框本来就常驻，让两者一起收窄结果更顺手）。
     """
     parent = parent or ""
     page, page_size = _page_args(page, page_size)
@@ -595,6 +638,12 @@ def audio_playlists_page(parent="", keyword="", page=1, page_size=0, sort=""):
     if keyword:
         where += " AND name LIKE ? ESCAPE '\\'"
         params.append(f"%{_escape_like(keyword)}%")
+    matched = _audio_ids_with_tags(parent, tags)
+    if matched is not None:
+        if not matched:
+            return _page_result([], 0, page, page_size)
+        where += f" AND id IN ({_in_list(matched)})"
+        params.extend(matched)
     order_sql = _PLAYLIST_ORDER.get(http_util.resolve_sort(sort), _PLAYLIST_ORDER["name_asc"])
 
     total = _scalar(audio_db, f"SELECT COUNT(*) AS c FROM playlists WHERE {where}", tuple(params))

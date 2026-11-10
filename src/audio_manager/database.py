@@ -458,6 +458,27 @@ def clear_all():
         conn.executescript("DELETE FROM tracks; DELETE FROM playlists;")
 
 
+# 标签分隔符：中英文逗号、换行、空白（含全角空格）。
+# 桌面端的 `ui/tag_widgets.parse_tags` 用的是**同一套**规则，那边只是把结果排了序；
+# 网页端要按标签过滤就得跟桌面端认同一批标签，所以解析放在这一层共用。
+_TAG_SPLIT = re.compile(r"[,，\n\r\s]+")
+
+
+def parse_tags(tags_str):
+    """把 tags 字段拆成标签列表（去空、去重，保持出现顺序）
+
+    不做排序：调用方要排序自己排（桌面端按字母，网页端按名字排展示）。
+    """
+    if not tags_str or not str(tags_str).strip():
+        return []
+    seen = []
+    for part in _TAG_SPLIT.split(str(tags_str)):
+        tag = part.strip()
+        if tag and tag not in seen:
+            seen.append(tag)
+    return seen
+
+
 def get_all_tags():
     """获取所有不重复的标签（从所有歌单的 tags 字段解析）"""
     with _active_conn() as conn:
@@ -467,10 +488,7 @@ def get_all_tags():
         tag_set = set()
         for row in rows:
             if row["tags"]:
-                for t in re.split(r"[,，\n\r\s]+", row["tags"]):
-                    t = t.strip()
-                    if t:
-                        tag_set.add(t)
+                tag_set.update(parse_tags(row["tags"]))
         return sorted(tag_set, key=lambda x: x.lower())
 
 

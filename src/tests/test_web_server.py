@@ -15,6 +15,7 @@ import re
 import urllib.error
 import urllib.request
 import wave
+from urllib.parse import quote
 
 import pytest
 
@@ -2097,3 +2098,148 @@ def test_all_three_lists_are_searchable():
         assert marker in render_block, f"{tab} 列表没开搜索"
     assert "searchPlaceholder" in render_block
     assert "搜索歌单" in render_block
+
+
+# ==================== 音频标签筛选（v1.18.2） ====================
+#
+# 标签是 `tags` 字段里一段「空格/逗号/换行」混排的文本。桌面端把它拆成集合再比，
+# 网页端必须用同一套拆分规则 + 同一种「都要有」的语义，否则同一个标签在手机和
+# 电脑上点出来的歌单对不上。
+
+def test_parse_tags_matches_desktop_rule():
+    """分隔符：中英文逗号、换行、空白（桌面端 tag_widgets.parse_tags 同款）"""
+    assert audio_db.parse_tags("舔耳,ASMR") == ["舔耳", "ASMR"]
+    assert audio_db.parse_tags("舔耳，ASMR\n巨乳/爆乳") == ["舔耳", "ASMR", "巨乳/爆乳"]
+    assert audio_db.parse_tags("  舔耳   舔耳  ") == ["舔耳"]
+    assert audio_db.parse_tags("") == []
+    assert audio_db.parse_tags(None) == []
+    # 标签内部带斜杠/括号是常态，不能被拆开
+    assert audio_db.parse_tags("双声道立体声/人头麦") == ["双声道立体声/人头麦"]
+
+
+def test_audio_tag_counts_only_covers_current_level(seeded):
+    """候选标签只统计这一层：子歌单的标签在列表里根本不出现，列出来只会点出空结果"""
+    tmp = seeded["root"]
+    audio_db.add_playlist("甲", str(tmp / "甲"), tags="舔耳 ASMR")
+    audio_db.add_playlist("乙", str(tmp / "乙"), tags="舔耳")
+    audio_db.add_playlist("甲子集", str(tmp / "甲" / "子"), tags="只属于子集", parent_path=str(tmp / "甲"))
+
+    top = {tag["name"]: tag["count"] for tag in library.audio_tag_counts("")}
+    assert top["舔耳"] == 2
+    assert top["ASMR"] == 1
+    assert "只属于子集" not in top
+
+    child = {tag["name"]: tag["count"] for tag in library.audio_tag_counts(str(tmp / "甲"))}
+    assert child["只属于子集"] == 1
+
+    # 命中多的排前面：298 个标签按码点排等于没排，常用的得先露出来
+    counts = [tag["count"] for tag in library.audio_tag_counts("")]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_audio_tags_filter_is_and(seeded):
+    """多选标签 = 都要有（AND），与桌面端 `_playlist_matches_tags` 一致"""
+    tmp = seeded["root"]
+    audio_db.add_playlist("甲", str(tmp / "甲"), tags="舔耳 ASMR")
+    audio_db.add_playlist("乙", str(tmp / "乙"), tags="舔耳")
+    audio_db.add_playlist("丙", str(tmp / "丙"), tags="ASMR")
+
+    def names(tags):
+        page = library.audio_playlists_page("", "", 1, 60, "", tags)
+        return [item["name"] for item in page["items"]]
+
+    assert names(["舔耳"]) == ["乙", "甲"]
+    assert names(["舔耳", "ASMR"]) == ["甲"]
+    assert names(["ASMR", "舔耳"]) == ["甲"], "标签顺序不该影响结果"
+    assert names(["舔耳", "不存在的标签"]) == []
+
+
+def test_tag_match_is_exact_not_substring(seeded):
+    """「治愈」不能把「治愈系」也捞出来——LIKE '%治愈%' 就会
+
+    这就是为什么标签过滤不走 SQL LIKE，而是在 Python 里拆成集合取交集。
+    """
+    tmp = seeded["root"]
+    audio_db.add_playlist("治愈系作品", str(tmp / "x1"), tags="治愈系")
+    audio_db.add_playlist("治愈作品", str(tmp / "x2"), tags="治愈")
+
+    page = library.audio_playlists_page("", "", 1, 60, "", ["治愈"])
+    assert [item["name"] for item in page["items"]] == ["治愈作品"]
+
+
+def test_tags_combine_with_search_and_sort(seeded):
+    """标签与搜索、排序是叠加关系，不是互相顶掉"""
+    tmp = seeded["root"]
+    audio_db.add_playlist("甲作品", str(tmp / "甲"), tags="舔耳", mtime=100)
+    audio_db.add_playlist("乙作品", str(tmp / "乙"), tags="舔耳", mtime=900)
+    audio_db.add_playlist("丙作品", str(tmp / "丙"), tags="巨乳/爆乳", mtime=500)
+
+    hit = library.audio_playlists_page("", "甲", 1, 60, "", ["舔耳"])
+    assert [item["name"] for item in hit["items"]] == ["甲作品"]
+
+    newest = library.audio_playlists_page("", "", 1, 60, "time_desc", ["舔耳"])
+    assert [item["name"] for item in newest["items"]] == ["乙作品", "甲作品"]
+
+    # 筛出来的总数要跟着变，否则「加载更多」会一直翻空页
+    assert newest["total"] == 2
+
+
+def test_api_audio_tags_and_filter(server, seeded):
+    """接口层：/api/audio/tags 给候选，/api/audio/playlists?tags= 真的筛"""
+    port = server[1]
+    audio_db.add_playlist("舔耳合集", str(seeded["root"] / "舔耳合集"), tags="舔耳 ASMR")
+    audio_db.add_playlist("只有巨乳", str(seeded["root"] / "只有巨乳"), tags="巨乳/爆乳")
+
+    status, _, body = _get(port, "/api/audio/tags", cookie=TOKEN)
+    assert status == 200
+    payload = json.loads(body)
+    names = {item["name"]: item["count"] for item in payload["tags"]}
+    assert names == {"舔耳": 1, "ASMR": 1, "巨乳/爆乳": 1}
+
+    def query(tags):
+        status_, _, raw = _get(port, f"/api/audio/playlists?tags={quote(tags)}", cookie=TOKEN)
+        assert status_ == 200
+        return json.loads(raw)
+
+    assert [item["name"] for item in query("舔耳")["playlists"]] == ["舔耳合集"]
+    assert [item["name"] for item in query("舔耳,ASMR")["playlists"]] == ["舔耳合集"]
+    assert [item["name"] for item in query("舔耳,巨乳/爆乳")["playlists"]] == []
+    # 非法/超长输入不该 500：多传几个逗号而已
+    assert query(",,,,,,")["total"] >= 1
+
+
+def test_tag_picker_is_a_staged_sheet():
+    """标签选择做成底部抽屉 + 暂存：点一下就发一次请求会让列表反复闪
+
+    结构守卫而不是行为测试——老 WebView 上没有可跑的无头环境。
+    """
+    js = _static_text("app.js")
+    sheet = _js_block(js, "function ensureTagSheet(")
+    assert "sheet-mask" in sheet and "sheet-list" in sheet
+    assert "open(" in sheet and "close(" in sheet
+    # 勾选只改本地集合，确定才回调
+    toggle = _js_block(sheet, "function toggle(")
+    assert "onApply" not in toggle, "点一下标签就直接筛了，确定按钮就没意义了"
+    assert "sheet.selected" in toggle
+
+    ok = sheet[sheet.index("okBtn.addEventListener"):]
+    assert "sheet.onApply(picked)" in ok
+
+    # 列表项只改自己那一个 class，不重画 298 个按钮
+    assert "sheet.nodes[name].classList.toggle" in toggle
+
+
+def test_audio_list_wires_tags_into_request_and_hash():
+    js = _static_text("app.js")
+    grid = _js_block(js, "function pagedGrid(")
+    assert "params.set('tags'" in grid, "列表请求没带标签"
+    assert "replaceHashQuery('tags'" in grid, "标签没写进地址栏，从详情退回来就没了"
+    assert "sort-wrap + .tag-btn" in _static_text("style.css"), "标签按钮得跟排序下拉并排"
+
+    view = _js_block(js, "async function viewAudioRoot(")
+    assert "taggable: true" in view and "/api/audio/tags" in view
+
+    # 详情页的标签是能点的：点一下回列表按它筛（桌面端详情页也是这么用的）
+    assert "function tagLinkChip(" in js
+    assert "tagLinkChip" in _js_function("viewAudioPlaylist")
+    assert "[,，\\n\\r\\s]+" in _js_function("splitTagText")

@@ -95,6 +95,7 @@ _ROUTE_DEFS = [
     ("GET", r"^/api/photos/works$", "api_photo_works"),
     ("GET", r"^/api/photos/works/(\d+)/images$", "api_photo_images"),
     # 音频
+    ("GET", r"^/api/audio/tags$", "api_audio_tags"),
     ("GET", r"^/api/audio/playlists$", "api_audio_playlists"),
     ("GET", r"^/api/audio/playlists/(\d+)$", "api_audio_playlist"),
     ("GET", r"^/api/audio/tracks/(\d+)/subtitles$", "api_audio_subtitles"),
@@ -390,6 +391,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self._json({"error": "作品不存在"}, 404)
         return self._json(data, max_age=30)
 
+    def api_audio_tags(self, match, query):
+        """当前层歌单的标签（带命中数），前端「标签」抽屉的候选清单
+
+        不带缓存：扫描/抓取标签后就该立刻反映出来。
+        """
+        return self._json({"tags": library.audio_tag_counts(_text_param(query, "parent"))})
+
     def api_audio_playlists(self, match, query):
         parent = _text_param(query, "parent")
         data = library.audio_playlists_page(
@@ -398,6 +406,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             _int_param(query, "page", 1),
             _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
             _text_param(query, "sort"),
+            http_util.parse_tags_query(_text_param(query, "tags")),
         )
         return self._json(
             {

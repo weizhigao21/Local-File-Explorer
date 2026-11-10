@@ -301,3 +301,24 @@ def resolve_sort(value, allowed=SORT_ORDERS):
     """
     value = (value or "").strip().lower()
     return value if value in allowed else (allowed[0] if allowed else DEFAULT_SORT)
+
+
+# 一次最多带这么多个标签。桌面端的选择器全选也就几十个，
+# 放开不限的话，一个手写 URL 就能把 SQL 参数撑到上万。
+TAGS_MAX = 20
+
+
+def parse_tags_query(text):
+    """把 `?tags=舔耳,ASMR` 拆成标签列表
+
+    标签是**数据**不是语法，原样往下传（交给 SQL 参数绑定），不做白名单——
+    但要去空、去重、限个数，避免 `?tags=` 后面跟一屏幕逗号或重复项。
+    """
+    result = []
+    for part in str(text or "").split(","):
+        tag = part.strip()
+        if tag and tag not in result:
+            result.append(tag)
+        if len(result) >= TAGS_MAX:
+            break
+    return result
