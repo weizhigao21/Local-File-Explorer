@@ -971,8 +971,10 @@ def test_stream_url_encodes_start_offset():
     """拖动重连靠 ?start=<秒>，拼错就退回从头转——白等一次"""
     js = _static_text("app.js")
     url = _js_block(js, "function streamUrl(")
-    assert "?start=" in url
+    assert "start=" in url
     assert "Math.round(start)" in url, "start 得取整，小数进了 query 会变 400"
+    # 地址上已经挂着 `?caps=` 了，第二个参数必须用 & 接
+    assert "indexOf('?') >= 0 ? '&' : '?'" in url
 
 
 def test_video_controls_bar_is_self_positioned():
@@ -1891,3 +1893,86 @@ def test_cached_transcode_is_streamed_not_played_as_file():
         "缓存命中不能走直连分支（fMP4 seek 不了）"
     # info.cached 只留着决定要不要弹「开头等几秒」
     assert "Boolean(info.cached)" in body
+
+
+# ==================== 客户端解码能力（v1.18.0） ====================
+#
+# 服务端的编码白名单只能是「所有浏览器都认」的保守集合（不含 HEVC），可手机、
+# 平板大多带 HEVC 硬解。不在前端探一次、把结果带上去，一集 HEVC 的 mkv 就得
+# 重编码十几分钟；带上之后只需要换封装（`-c:v copy`，几秒）。
+
+def test_caps_are_probed_once_and_cached():
+    js = _static_text("app.js")
+    body = _js_block(js, "function detectVideoCaps(")
+    assert "canPlayType" in body, "没有探测就是瞎猜"
+    assert "localStorage" in body, "每次开播放器都重新探测，太浪费"
+    assert "hevc" in body and "av1" in body
+    # 探测结果按版本号缓存：以后探测逻辑改了，旧结果要能作废
+    assert "lrm.videoCaps.v" in js
+
+
+def test_caps_ride_along_on_every_video_request():
+    js = _static_text("app.js")
+    assert "function withCaps(" in js
+    body = _js_function("loadVideo")
+    assert "withCaps(" in body, "取播放信息时没带 caps，服务端只能按保守白名单判"
+    url = _js_block(js, "function streamUrl(")
+    assert "withCaps(" in url, "媒体流没带 caps，前面白探测了"
+
+
+def test_forced_transcode_survives_seek_and_reconnect():
+    """设备自称能解 HEVC、实际放不出来时，「转码播放」得真的转
+
+    不带 `mode=transcode` 的话服务端仍按 caps 判成换封装，点了还是同一份
+    放不出的流；而且拖动、跳片头重连也要沿用——否则拖一下又退回换封装。
+    """
+    js = _static_text("app.js")
+    assert "state.video.forceMode = forceMode" in js
+    url = _js_block(js, "function streamUrl(")
+    assert "mode=" in url
+    error_block = js[js.index("videoEl.addEventListener('error'"):]
+    assert "startStream(videoTime(), false, 'transcode')" in error_block
+
+
+def test_landscape_phones_get_compact_layout():
+    """手机横过来只有 300~420px 高，顶栏 56px 就占了六分之一
+
+    收一档之后卡片从 148px 缩到 104px、顶栏 56→46，一屏能多看一行。
+    平板横屏高度够（≥560），不该被这条命中，否则大屏上内容反而变小。
+    """
+    css = _static_text("style.css")
+    assert "orientation: landscape" in css
+    assert "max-height: 560px" in css
+    block = css[css.index("@media (orientation: landscape)"):]
+    assert "--top-h: 46px" in block
+    assert "minmax(104px, 1fr)" in block
+    # 按钮缩小后圆角是 50%，不写死 px，所以不会退化成直角
+    assert ".v-btn { width: 32px; height: 32px; }" in block
+
+
+def test_wide_video_on_portrait_screen_hints_landscape():
+    """竖屏拿手机看 16:9，上下黑边能占掉将近一半，值得提示一句"""
+    js = _static_text("app.js")
+    body = _js_block(js, "function hintLandscapeForWideVideo(")
+    assert "videoWidth" in body, "要按视频真实宽高比判断，不能看容器尺寸"
+    assert "1.4" in body, "方形/竖屏片子不该提示"
+    assert "innerHeight" in body or "innerWidth > window.innerHeight" in body
+    assert "landscapeHinted" in body, "每切一集都弹一次会很烦"
+
+
+def test_api_video_info_uses_caps_query(server):
+    """接口层：同一个 HEVC 文件，报不报 caps 拿到的播放方式不一样"""
+    from video_manager import database as video_db
+
+    port = server[1]
+    work_id = library.video_works()[0]["id"]
+    mkv = next(v for v in video_db.get_work_videos(work_id) if v["path"].endswith(".mkv"))
+    video_db.update_video_meta(mkv["path"], codec="hevc")
+
+    plain = json.loads(_get(port, f"/api/video/videos/{mkv['id']}", cookie=TOKEN)[2])
+    assert plain["mode"] == http_util.MODE_TRANSCODE
+
+    smart = json.loads(
+        _get(port, f"/api/video/videos/{mkv['id']}?caps=h264,hevc", cookie=TOKEN)[2]
+    )
+    assert smart["mode"] == http_util.MODE_REMUX

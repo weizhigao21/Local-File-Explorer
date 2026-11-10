@@ -33,6 +33,66 @@
   const audioEl = $('audio');
   const videoEl = $('video');
 
+  // ---------------- 客户端解码能力 ----------------
+  //
+  // 服务端的编码白名单只能是「所有浏览器都认」的保守集合（不含 HEVC），可现在的
+  // 手机、平板大多带 HEVC 硬解。不探测的话，一集 HEVC 的 mkv 会被拖去重编码
+  // （GPU 也要十几分钟）；探测到了就只需要换封装（`-c:v copy`，几秒）。
+  //
+  // 用 `canPlayType` 而不是 `mediaCapabilities`：后者要 Chrome 63+，
+  // 而 Android 7 那代 WebView 只有 51~59。代价是分不出硬解/软解——
+  // 对我们够用，能播就行；真播不了还有播放器自己的 error 兜底（给「转码播放」按钮）。
+  const CAPS_KEY = 'lrm.videoCaps.v1';
+  let videoCaps = null;
+
+  function detectVideoCaps() {
+    if (videoCaps !== null) return videoCaps;
+    try {
+      const saved = localStorage.getItem(CAPS_KEY);
+      if (saved !== null) {
+        videoCaps = saved;
+        return videoCaps;
+      }
+    } catch (error) {
+      /* 隐私模式 / WebView 禁用存储时会抛，每次都现测即可 */
+    }
+    const probe = document.createElement('video');
+    const cases = [
+      ['h264', 'video/mp4; codecs="avc1.42E01E"'],
+      ['hevc', 'video/mp4; codecs="hvc1.1.6.L93.B0"'],
+      ['hevc', 'video/mp4; codecs="hev1.1.6.L93.B0"'],
+      ['vp9', 'video/webm; codecs="vp9"'],
+      ['vp8', 'video/webm; codecs="vp8"'],
+      ['av1', 'video/mp4; codecs="av01.0.05M.08"'],
+    ];
+    const found = [];
+    for (let i = 0; i < cases.length; i += 1) {
+      const name = cases[i][0];
+      if (found.indexOf(name) >= 0) continue;
+      let answer = '';
+      try {
+        answer = probe.canPlayType(cases[i][1]) || '';
+      } catch (error) {
+        answer = '';
+      }
+      if (answer) found.push(name);
+    }
+    videoCaps = found.join(',');
+    try {
+      localStorage.setItem(CAPS_KEY, videoCaps);
+    } catch (error) {
+      /* 存不下就算了，本次会话内还有内存缓存 */
+    }
+    return videoCaps;
+  }
+
+  /** 给接口/媒体地址挂上 `caps=`（原本已有 query 就用 & 接） */
+  function withCaps(url) {
+    const caps = detectVideoCaps();
+    if (!caps) return url;
+    return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'caps=' + encodeURIComponent(caps);
+  }
+
   // ---------------- DOM 工具 ----------------
   function el(tag, attrs, ...children) {
     const node = document.createElement(tag);
@@ -137,6 +197,8 @@
       // 展示与上报都要加 offset（流是从源片第 offset 秒开始转的）
       streaming: false,
       offset: 0,
+      // 用户点过「转码播放」就记住：拖动/重连都得继续强制重编码
+      forceMode: '',
       // 片头/片尾：plan 是本集真正要跳的区间（服务端算好，单位毫秒），
       // segments 是这部作品已标记的模板，skipped 记录本集已处理过的种类
       plan: [], skipSegments: [], skipEnabled: { op: true, ed: true },
@@ -2030,6 +2092,7 @@
     state.video.streaming = false;
     state.video.offset = 0;
     state.video.resume = 0;
+    state.video.forceMode = '';
     setVideoSeekable(true);
     syncVideoPlay();
     $('video-overlay').querySelector('.v-title').textContent = video.name;
@@ -2037,7 +2100,7 @@
 
     let info;
     try {
-      info = await api(`/api/video/videos/${video.id}`);
+      info = await api(withCaps(`/api/video/videos/${video.id}`));
     } catch (error) {
       showVideoNote(error.message);
       return;
@@ -2070,12 +2133,19 @@
     ensureVideoFullscreen();
   }
 
-  /** 流地址；start > 0 时让服务端从那一秒开始重新转（拖动/续播都靠它） */
-  function streamUrl(start) {
+  /** 流地址；start > 0 时让服务端从那一秒开始重新转（拖动/续播都靠它）
+   *
+   * 一定要带 `caps`：服务端要靠它判断「设备自己能解 HEVC 的话，换封装就行」。
+   * 漏了就会退回保守白名单，又是十几分钟的重编码。
+   */
+  function streamUrl(start, forceMode) {
     const info = state.video.info;
     if (!info) return '';
-    const base = info.stream_url || info.remux_url;
-    return start > 0.5 ? `${base}?start=${Math.round(start)}` : base;
+    let url = withCaps(info.stream_url || info.remux_url);
+    const join = (part) => `${url}${url.indexOf('?') >= 0 ? '&' : '?'}${part}`;
+    if (forceMode) url = join(`mode=${forceMode}`);
+    if (!(start > 0.5)) return url;
+    return join(`start=${Math.round(start)}`);
   }
 
   /** 展示用的绝对秒数（流模式要加 offset） */
@@ -2088,16 +2158,22 @@
    *
    * silent：自动跳片头触发的重连不弹提示——用户没点任何东西，
    * 突然冒出「正在换封装」只会让人以为播放出问题了。
+   *
+   * forceMode：设备自称能解 HEVC、实际放不出来时，用 `'transcode'` 强制重编码。
+   * 不带的话服务端仍按 caps 判成换封装，点了「转码播放」还是同一份放不出的流。
    */
-  function startStream(start, silent) {
+  function startStream(start, silent, forceMode) {
     const info = state.video.info;
     if (!info) return;
     state.video.streaming = true;
     state.video.offset = Math.max(0, start || 0);
-    videoEl.src = streamUrl(state.video.offset);
+    // 记住强制模式：之后拖动、跳片头重连都要沿用，否则又退回放不出的那条流
+    if (forceMode) state.video.forceMode = forceMode;
+    videoEl.src = streamUrl(state.video.offset, state.video.forceMode);
+    const effective = state.video.forceMode || state.video.mode;
     if (silent) {
       $('v-note').hidden = true;
-    } else if (state.video.mode === 'transcode') {
+    } else if (effective === 'transcode') {
       showVideoNote('正在把画面转成 H.264（显卡加速）：开头等几秒，之后再拖会重新起转。', [
         { label: '用原格式试播', onclick: playDirect },
       ]);
@@ -2410,7 +2486,25 @@
     }
     // 续播点可能正落在片头/片尾里：立刻判一次，别让人先愣在那儿
     applyAutoSkip();
+    hintLandscapeForWideVideo();
   });
+
+  /** 竖屏拿手机看横屏片：上下黑边能占掉将近一半，提示一句「横过来」
+   *
+   * 一次会话只提示一次（`landscapeHinted`），否则每切一集都弹一遍很烦。
+   * 判据用视频真实宽高比（`videoWidth`），不是 CSS 尺寸——后者受容器影响。
+   */
+  let landscapeHinted = false;
+  function hintLandscapeForWideVideo() {
+    if (landscapeHinted) return;
+    const w = videoEl.videoWidth || 0;
+    const h = videoEl.videoHeight || 0;
+    if (!w || !h) return;
+    if (w / h < 1.4) return; // 方形、竖屏片子不用转
+    if (window.innerWidth > window.innerHeight) return; // 已经横着了
+    landscapeHinted = true;
+    showVideoHint('横过来看画面更大', 2600);
+  }
 
   // 流开始出画面就把「正在转码」的提示条收掉，别一直挡着画面
   videoEl.addEventListener('loadeddata', () => {
@@ -2447,7 +2541,7 @@
       ]);
     } else {
       showVideoNote('浏览器打不开这个视频的原格式，可以试试转码播放。', [
-        { label: '转码播放', onclick: () => startStream(videoTime()) },
+        { label: '转码播放', onclick: () => startStream(videoTime(), false, 'transcode') },
       ]);
     }
   });

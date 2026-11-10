@@ -463,7 +463,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def api_video_info(self, match, query):
         video_id = int(match.group(1))
-        data = library.video_play_info(video_id)
+        # `?caps=h264,hevc`：客户端自报解码能力（前端开机探测一次后带上）
+        data = library.video_play_info(video_id, _caps_param(query))
         if data is None:
             return self._json({"error": "视频不存在"}, 404)
         # 打开一集就顺手在后台把它对齐一次（约 1 秒，不挡播放）：
@@ -603,7 +604,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self._json({"error": "视频不存在"}, 404)
 
         ext = os.path.splitext(video["path"])[1].lower()
-        mode = http_util.video_mode(ext, video.get("codec") or "")
+        # 设备自报的解码能力：能硬解 HEVC 的话，mkv 里的 HEVC 换封装就够，
+        # 不必重编码（一集要占 GPU 十几分钟）
+        caps = _caps_param(query)
+        mode = http_util.video_mode(ext, video.get("codec") or "", caps)
+        # `?mode=transcode` 允许前端强制指定：设备自称能解 HEVC、实际却放不出来时，
+        # 播放器里的「转码播放」按钮就靠它翻盘，不然会一直卡在换封装上
+        forced = _text_param(query, "mode").strip().lower()
+        if forced in (http_util.MODE_REMUX, http_util.MODE_TRANSCODE):
+            mode = forced
         start = _float_param(query, "start")
 
         if mode == http_util.MODE_DIRECT:
@@ -705,7 +714,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             busy = "正在转码另一集，请稍后再试" if transcoding else "正在转封装另一集，请稍后再试"
             return self._json({"error": busy}, 503)
 
-        cmd = transcode.build_cmd(ffmpeg, source or video["path"], mode, start, encoder)
+        cmd = transcode.build_cmd(
+            ffmpeg,
+            source or video["path"],
+            mode,
+            start,
+            encoder,
+            # 换封装时要知道源编码：HEVC 塞进 mp4 得标 hvc1，否则安卓侧黑屏
+            codec="h264" if source else (video.get("codec") or ""),
+        )
         try:
             proc = subprocess.Popen(  # noqa: S603 - 参数为内部路径，无 shell
                 cmd,
@@ -1035,6 +1052,15 @@ def _float_param(query, name, default=0.0):
 def _text_param(query, name):
     values = query.get(name) or []
     return values[0] if values else ""
+
+
+def _caps_param(query):
+    """`?caps=h264,hevc` → frozenset
+
+    注意 `parse_qs` 给的是 list，不能直接丢给 `parse_client_caps`——它会拿到
+    `"['h264,hevc']"` 这种带引号的字符串，一个编码也认不出来。
+    """
+    return http_util.parse_client_caps(_text_param(query, "caps"))
 
 
 CSP_CONTENT = CSP_HTML

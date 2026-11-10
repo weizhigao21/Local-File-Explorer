@@ -829,15 +829,19 @@ def video_by_id(video_id):
     )
 
 
-def video_play_info(video_id):
-    """播放前信息：真实路径只留在服务端，前端只拿到续播点与播放方式"""
+def video_play_info(video_id, caps=None):
+    """播放前信息：真实路径只留在服务端，前端只拿到续播点与播放方式
+
+    `caps` 是客户端自报的解码能力（见 `http_util.parse_client_caps`）：
+    设备能硬解 HEVC 时，mkv 里的 HEVC 只需要换封装，不必重编码。
+    """
     video = video_by_id(video_id)
     if not video:
         return None
     position, duration = video_db.get_progress(video["path"])
     ext = os.path.splitext(video["path"])[1].lower()
     codec = video.get("codec") or ""
-    mode = http_util.video_mode(ext, codec)
+    mode = http_util.video_mode(ext, codec, caps)
     # 已经转好并落盘的：服务端会当普通 mp4 发（Range 可用），前端可以按直连处理，
     # 不用再走「?start= 重连」那套，进度条也就不需要凭数据库时长偏算
     converted = transcode.cache_path(video)

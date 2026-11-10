@@ -31,6 +31,9 @@ from resource_manager import config
 # 按优先级排列：先硬件，后 CPU
 ENCODERS = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
 
+# ffprobe 报 HEVC 时 `codec_name` 是 "hevc"；老数据里也见过 "h265"/"h.265"
+HEVC_CODECS = {"hevc", "h265", "h.265"}
+
 # 进程内缓存探测结果（探测一次要起 ffmpeg，别每播一集都测）
 _ENCODER_CACHE: dict[str, str] = {}
 
@@ -121,12 +124,16 @@ def _video_args(encoder):
             "-keyint_min", "48", "-sc_threshold", "0"] + gop
 
 
-def build_cmd(ffmpeg, src, mode, start=0.0, encoder=None):
+def build_cmd(ffmpeg, src, mode, start=0.0, encoder=None, codec=""):
     """拼 ffmpeg 命令：输出 fMP4 到 stdout
 
     `start > 0` 时 `-ss` 放在 `-i` **之前**（快速 seek，靠关键帧对齐）——
     放在后面会先解码再丢弃，转码大文件时慢得离谱。输出时间戳默认从 0 开始，
     所以前端只需要把展示时间加上 start 就行。
+
+    `codec` 只在换封装时用得上：mp4 里 HEVC 的 sample entry 要标成 `hvc1`。
+    ffmpeg 默认写 `hev1`，而 Android / 微信这类走系统 MediaCodec 的播放器只认
+    `hvc1`——不标就是「转封装完还是黑屏」的另一半原因。
     """
     cmd = [ffmpeg, "-nostdin", "-loglevel", "error"]
     if start and start > 0:
@@ -135,6 +142,8 @@ def build_cmd(ffmpeg, src, mode, start=0.0, encoder=None):
 
     if mode == "remux":
         cmd += ["-c:v", "copy"]
+        if (codec or "").lower() in HEVC_CODECS:
+            cmd += ["-tag:v", "hvc1"]
     else:
         cmd += ["-c:v", encoder or "libx264"] + _video_args(encoder or "libx264")
 

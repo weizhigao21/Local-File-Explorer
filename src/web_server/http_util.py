@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import re
 
 # 媒体分块读取大小：256KB 在千兆局域网 + 手机解码之间比较平衡
 CHUNK_SIZE = 256 * 1024
@@ -70,6 +71,9 @@ MODE_DIRECT = "direct"
 MODE_REMUX = "remux"
 MODE_TRANSCODE = "transcode"
 VIDEO_MODES = (MODE_DIRECT, MODE_REMUX, MODE_TRANSCODE)
+
+# 客户端能报几个编码：真实设备最多三五个，给 24 是防止有人往 URL 里灌长串
+CLIENT_CAPS_MAX = 24
 
 RANGE_INVALID = "invalid"
 
@@ -216,7 +220,7 @@ def cues_to_vtt(cues):
     return "\n".join(lines)
 
 
-def video_mode(ext, codec=""):
+def video_mode(ext, codec="", caps=None):
     """浏览器该怎么拿到这个视频：`direct` 直连 / `remux` 换容器 / `transcode` 重编码
 
     两条互不相干的门槛，必须分开判断，否则会出现「转封装完还是黑屏」：
@@ -226,15 +230,41 @@ def video_mode(ext, codec=""):
 
     编码未知（ffprobe 没装/没探到）时按容器判断，让浏览器自己试——
     宁可试一次失败，也不要因为探测不到就直接把可播的文件拦下来。
+
+    `caps` 是**客户端报上来的额外解码能力**（见 `parse_client_caps`），比如
+    `{"hevc"}`。它只能扩不能缩：H.264 是所有浏览器必备，万一前端探测没报上来，
+    也不能把 h264 判成要转码——那会把本来能直连的片子全拖进重编码。
     """
     ext = (ext or "").lower()
     codec = (codec or "").lower()
     container_ok = ext in BROWSER_VIDEO_EXTENSIONS
     if not codec:
         return MODE_DIRECT if container_ok else MODE_REMUX
-    if codec not in BROWSER_VIDEO_CODECS:
+    supported = BROWSER_VIDEO_CODECS | (caps or frozenset())
+    if codec not in supported:
         return MODE_TRANSCODE
     return MODE_DIRECT if container_ok else MODE_REMUX
+
+
+def parse_client_caps(text):
+    """解析客户端上报的解码能力 `h264,hevc,av1`
+
+    **为什么要有这一层**：`BROWSER_VIDEO_CODECS` 是「所有浏览器都认」的保守集合，
+    故意不含 HEVC。可现在的手机、平板大多带 HEVC 硬解（系统 MediaCodec 支持），
+    平白重编码一集要占 GPU 十几分钟，而设备本来就能播。
+    前端开机探测一次（`mediaCapabilities` / `canPlayType`），随请求带上来即可。
+
+    只认 2~12 位字母数字：这串东西会被拼进 URL、再进日志，别给它留任何余地。
+    返回 None 表示「没报 / 报的全不合法」→ 调用方按保守白名单处理。
+    """
+    if not text:
+        return None
+    found = set()
+    for raw in str(text).split(",")[:CLIENT_CAPS_MAX]:
+        name = raw.strip().lower()
+        if re.fullmatch(r"[a-z0-9]{2,12}", name):
+            found.add(name)
+    return frozenset(found) if found else None
 
 
 def browser_playable(ext, codec=""):

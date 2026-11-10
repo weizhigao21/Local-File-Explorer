@@ -96,6 +96,82 @@ def test_subtitle_and_data_streams_are_dropped():
     assert "-sn" in cmd and "-dn" in cmd
 
 
+def test_remux_tags_hevc_as_hvc1():
+    """HEVC 进 mp4 必须标 hvc1
+
+    ffmpeg 默认写 `hev1`，而 Android / 微信这类走系统 MediaCodec 的播放器
+    只认 `hvc1`——不标就是「换封装完还是黑屏」的另一半原因。
+    """
+    cmd = transcode.build_cmd("ffmpeg", "in.mkv", http_util.MODE_REMUX, codec="hevc")
+    assert "-tag:v" in cmd and cmd[cmd.index("-tag:v") + 1] == "hvc1"
+    # h264 不能加这个标签，ffmpeg 会直接报错
+    plain = transcode.build_cmd("ffmpeg", "in.mkv", http_util.MODE_REMUX, codec="h264")
+    assert "-tag:v" not in plain
+
+
+# ==================== 客户端解码能力（v1.18.0） ====================
+#
+# 服务端白名单只能是「所有浏览器都认」的保守集合，故意不含 HEVC。可手机、平板
+# 大多带 HEVC 硬解：不探测就得把整集重编码（GPU 也要十几分钟），探测到了只要
+# 换封装（`-c:v copy`）。能力由前端 `canPlayType` 探一次，随 URL 带上来。
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("h264,hevc", {"h264", "hevc"}),
+        (" H264 , HEVC ", {"h264", "hevc"}),
+        ("h264", {"h264"}),
+        ("", None),
+        (None, None),
+        ("!!!,???", None),  # 全是垃圾 → 当作没报
+        ("a" * 40, None),   # 太长，挡在门外
+        ("hevc,hevc", {"hevc"}),
+    ],
+)
+def test_parse_client_caps(text, expected):
+    got = http_util.parse_client_caps(text)
+    assert (set(got) if got else None) == expected
+
+
+def test_caps_can_only_widen_the_codec_list():
+    """caps 只能加不能减
+
+    前端探测失败（连 h264 都没报上来）时如果直接拿 caps 当白名单，
+    所有 h264 的片子都会被拖去重编码——那是灾难，不是优化。
+    """
+    assert http_util.video_mode(".mp4", "h264", frozenset()) == http_util.MODE_DIRECT
+    assert http_util.video_mode(".mp4", "h264", frozenset({"hevc"})) == http_util.MODE_DIRECT
+    assert http_util.video_mode(".mkv", "h264", frozenset({"hevc"})) == http_util.MODE_REMUX
+
+
+def test_hevc_device_skips_transcode():
+    caps = http_util.parse_client_caps("h264,hevc")
+    # 设备能解 HEVC：mp4 直接发原文件，mkv 换封装就够，都不用重编码
+    assert http_util.video_mode(".mp4", "hevc", caps) == http_util.MODE_DIRECT
+    assert http_util.video_mode(".mkv", "hevc", caps) == http_util.MODE_REMUX
+    # 没报能力的设备仍然老老实实转码
+    assert http_util.video_mode(".mp4", "hevc") == http_util.MODE_TRANSCODE
+    assert http_util.video_mode(".mkv", "hevc") == http_util.MODE_TRANSCODE
+
+
+def test_video_play_info_honours_caps(seeded):
+    """接口层：同一个 HEVC 文件，报不报 caps 得到的播放方式不一样"""
+    from video_manager import database as video_db
+
+    work_id = library.video_works()[0]["id"]
+    videos = video_db.get_work_videos(work_id)
+    target = next(v for v in videos if v["path"].endswith(".mkv"))
+    video_db.update_video_meta(target["path"], codec="hevc")
+
+    plain = library.video_play_info(target["id"])
+    assert plain["mode"] == http_util.MODE_TRANSCODE
+
+    caps = http_util.parse_client_caps("h264,hevc")
+    smart = library.video_play_info(target["id"], caps)
+    assert smart["mode"] == http_util.MODE_REMUX
+    assert smart["codec"] == "hevc"
+
+
 # ==================== 缓存 ====================
 
 def test_cache_path_changes_when_source_changes(tmp_path):

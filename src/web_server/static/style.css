@@ -1174,3 +1174,36 @@ body.video-open #toast { display: none !important; }
   .home-card { margin-bottom: 12px; }
   .skeleton-row > * { margin-bottom: 12px; }
 }
+
+/* ---------------- 横屏 / 竖屏适配 ----------------
+ *
+ * 手机横过来只剩 320~420px 高：顶栏 56px 就啃掉六分之一，卡片还按竖屏尺寸
+ * 排，一屏只露出一行多一点。这里把顶栏、间距、字号整体收一档，横屏能看两行。
+ * 平板横屏（高 ≥ 560）不匹配，仍走上面那套更大的卡片——它高度够，别缩小。
+ *
+ * 播放器控件同理：矮屏上顶栏标题、进度条、按钮全挤在一起，按钮从 38 收到 32
+ * （border-radius 是 50%，不会因为变小而退化成直角）。
+ */
+@media (orientation: landscape) and (max-height: 560px) {
+  :root { --top-h: 46px; }
+  .bar-row { padding: 0 12px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
+  .meta { padding: 6px 8px 8px; }
+  .meta .title { font-size: 12.5px; }
+  .more { margin: 12px 0 8px; padding: 9px; }
+  .v-top { padding: calc(4px + var(--safe-top)) 10px 10px; }
+  .v-controls { padding: 6px 10px calc(6px + var(--safe-bottom)); }
+  .v-controls > * + * { margin-left: 6px; }
+  .v-btn { width: 32px; height: 32px; }
+  .v-btn svg { width: 19px; height: 19px; }
+  #v-seek { height: 26px; }
+  /* 上面这几行加起来才 196px，390 高的屏只剩不到 200px 给内容，
+     再收一档：tab、筛选胶囊、小节标题都压薄 */
+  .tabs { padding: 0 10px 6px; }
+  .tabs button { height: 32px; font-size: 13px; }
+  .chips { padding-bottom: 8px; }
+  /* 胶囊高度改 28 就必须把圆角同步改成 14：圆角超过半高会退化成直角，
+     不是钳成胶囊（这个坑踩过一次了） */
+  .chip { height: 28px; border-radius: 14px; padding: 0 11px; font-size: 12.5px; }
+  .section-title { margin: 2px 2px 8px; }
+}
