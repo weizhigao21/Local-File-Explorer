@@ -442,17 +442,21 @@ class VideoSettingsDialog(QDialog):
 
         self.resume_check = QCheckBox("记住播放进度（下次打开接着看）")
         self.autoplay_check = QCheckBox("一集播完自动播下一集")
+        self.skip_op_check = QCheckBox("自动跳过片头（播放器里按 O 标一次，全剧通用）")
+        self.skip_ed_check = QCheckBox("自动跳过片尾（跳完直接进下一集）")
         self.resume_check.setChecked(bool(getattr(config, "VIDEO_RESUME", True)))
         self.autoplay_check.setChecked(bool(getattr(config, "VIDEO_AUTOPLAY_NEXT", True)))
+        self.skip_op_check.setChecked(bool(getattr(config, "VIDEO_SKIP_OP", True)))
+        self.skip_ed_check.setChecked(bool(getattr(config, "VIDEO_SKIP_ED", True)))
         checkbox_qss = (
             f"QCheckBox {{ color: {TEXT_PRIMARY}; font-size: 13px; spacing: 8px;"
             " background: transparent; border: none; }"
             "QCheckBox::indicator { width: 16px; height: 16px; }"
         )
-        self.resume_check.setStyleSheet(checkbox_qss)
-        self.autoplay_check.setStyleSheet(checkbox_qss)
-        layout.addWidget(self.resume_check)
-        layout.addWidget(self.autoplay_check)
+        for box in (self.resume_check, self.autoplay_check,
+                    self.skip_op_check, self.skip_ed_check):
+            box.setStyleSheet(checkbox_qss)
+            layout.addWidget(box)
 
         hint = QLabel(
             f"封面由 ffmpeg 抽帧生成，缓存于 data/video_thumbs。\n"
@@ -516,5 +520,7 @@ class VideoSettingsDialog(QDialog):
             config.set_user_config("VIDEO_ROOTS", roots)
         config.set_user_config("VIDEO_RESUME", self.resume_check.isChecked())
         config.set_user_config("VIDEO_AUTOPLAY_NEXT", self.autoplay_check.isChecked())
+        config.set_user_config("VIDEO_SKIP_OP", self.skip_op_check.isChecked())
+        config.set_user_config("VIDEO_SKIP_ED", self.skip_ed_check.isChecked())
         config.save_user_config()
         self.accept()

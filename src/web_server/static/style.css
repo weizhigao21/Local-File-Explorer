@@ -751,12 +751,108 @@ body.video-open #toast { display: none !important; }
 .v-top > * { pointer-events: auto; }
 
 .v-title {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 13px;
   color: #f2e8db;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+}
+
+/* 「标记」入口：标过片头/片尾后点亮，一眼能看出这部作品已配好 */
+.v-tag {
+  flex: none;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 15px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #f2e8db;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.v-tag.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+/* 标记面板：竖排三个胶囊，不用 flex gap（Chrome 84 才有，用户平板是 78 内核） */
+.v-mark {
+  position: fixed;
+  top: calc(52px + var(--safe-top));
+  right: 12px;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  max-width: 64vw;
+  padding: 10px;
+  border-radius: 14px;
+  background: rgba(28, 22, 17, 0.95);
+  border: 1px solid var(--line-hi);
+  transition: opacity 0.22s ease;
+}
+
+.v-mark > * + * { margin-top: 8px; }
+
+.v-mark-info {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+  max-width: 100%;
+  word-break: break-all;
+}
+
+.v-mark button {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 17px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #f2e8db;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.v-mark button:active { background: rgba(255, 255, 255, 0.2); }
+
+/* 片头标记已按过第一下：按钮高亮，提示「现在按的是终点」 */
+.v-mark button.on {
+  background: var(--tint);
+  border: 1px solid var(--accent);
+  color: var(--accent-2);
+}
+
+.v-mark button.ghost {
+  background: transparent;
+  border: 1px solid var(--line-hi);
+  color: var(--text-2);
+}
+
+/* 跳过提示条：视频播放时 #toast 被 body.video-open 藏掉了（它会被画面盖住），
+   所以播放器内所有反馈都走这条。点一下 = 回看刚跳过的片段（电脑端按 B）。 */
+.v-hint {
+  position: fixed;
+  top: calc(56px + var(--safe-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  max-width: 88vw;
+  padding: 8px 14px;
+  border-radius: 16px;
+  background: rgba(28, 22, 17, 0.9);
+  border: 1px solid var(--line-hi);
+  color: #f2e8db;
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity 0.22s ease;
 }
 
 .v-close {
@@ -804,7 +900,9 @@ body.video-open #toast { display: none !important; }
 
 /* 播放中一段时间没操作就把控件淡出，画面干净；点一下视频再回来 */
 #video-overlay.v-idle .v-controls,
-#video-overlay.v-idle .v-top {
+#video-overlay.v-idle .v-top,
+#video-overlay.v-idle .v-mark,
+#video-overlay.v-idle .v-hint {
   opacity: 0;
   pointer-events: none;
 }
@@ -830,6 +928,9 @@ body.video-open #toast { display: none !important; }
 }
 
 .v-btn:active { background: rgba(255, 255, 255, 0.14); }
+
+/* 最后一集：按钮还在原位（消失会让进度条左右晃），只压暗表示今天没得切 */
+.v-btn.dim { opacity: 0.36; }
 
 .v-time {
   flex: none;

@@ -97,19 +97,28 @@ def _video_args(encoder):
     """各编码器的质量参数：目标是「看着不比原片差，但别占太多码率」
 
     统一转 8bit yuv420p —— 10bit HEVC 原样转出来，老浏览器照样不认。
+
+    `-g 48`（约 2 秒一个关键帧）不是随手写的：拖动进度时是从关键帧起切的
+    （`-c:v copy` 不能从任意帧开始），x264 默认 250 帧 ≈ 10 秒，用户拖到
+    第 10 分钟会落在 9:50——差得能看出来。2 秒的代价是文件大几个百分点，
+    换来的是「点到哪儿就从哪儿附近开始」，顺带 fMP4 分片更密、起播更快。
     """
+    gop = ["-g", "48"]
     if encoder == "h264_nvenc":
         # -cq 是 NVENC 的恒质量模式，配合 -b:v 0 让它自己决定码率
         return ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0",
-                "-profile:v", "high", "-pix_fmt", "yuv420p"]
+                "-profile:v", "high", "-pix_fmt", "yuv420p"] + gop
     if encoder == "h264_qsv":
         return ["-preset", "veryfast", "-global_quality", "23",
-                "-profile:v", "high", "-pix_fmt", "nv12"]
+                "-profile:v", "high", "-pix_fmt", "nv12"] + gop
     if encoder == "h264_amf":
         return ["-quality", "balanced", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23",
-                "-profile:v", "high", "-pix_fmt", "yuv420p"]
+                "-profile:v", "high", "-pix_fmt", "yuv420p"] + gop
+    # 软件编码额外固定关键帧间隔：不加 sc_threshold=0 时场景切换会插关键帧，
+    # 间隔忽长忽短，seek 落点反而不可预期
     return ["-preset", "veryfast", "-crf", "23",
-            "-profile:v", "high", "-pix_fmt", "yuv420p"]
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-keyint_min", "48", "-sc_threshold", "0"] + gop
 
 
 def build_cmd(ffmpeg, src, mode, start=0.0, encoder=None):

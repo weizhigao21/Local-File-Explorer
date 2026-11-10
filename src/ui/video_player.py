@@ -5,12 +5,15 @@
   不再从 0 重新播，只把窗口提到前面（v1.8.18 音频侧踩过的坑，这里一次做对）。
 - 续播规则全在 `video_manager.progress`（纯函数），本窗口只负责读写数据库。
 - 编码不支持时给「用系统播放器打开」的兜底按钮，不让用户对着黑屏发呆。
+- 片头/片尾跳过的规则全在 `video_manager.skip`（纯函数），对齐在 `video_manager.align`；
+  本窗口只负责按键、读库、把算出来的毫秒数塞给播放器。
 
 播放器窗口沿用陶色卡片令牌（ui/player_theme 的 P_*），与主界面米色系分开。
 """
 import os
+import threading
 
-from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -45,7 +48,9 @@ from ui.player_theme import (
 )
 from ui.video_detail import open_with_system, reveal_in_explorer
 from ui.video_theme import BTN_QSS
+from video_manager import align as skip_align
 from video_manager import database as db
+from video_manager import skip as skip_logic
 from video_manager.progress import (
     decide_progress,
     format_duration,
@@ -59,11 +64,40 @@ from video_manager.progress import (
 SEEK_STEP_MS = 5000          # ←/→ 与按钮快进快退步长
 SAVE_INTERVAL_MS = 5000      # 播放中每 5 秒落一次续播点（崩溃最多丢 5 秒）
 AUTOHIDE_MS = 2500           # 全屏时控件自动隐藏
+HINT_CLEAR_MS = 6000         # 顶栏提示（「已跳过片头」之类）多久后自动消失
+ALIGN_DELAY_MS = 900         # 开播后多久开始后台对齐（先让画面出来，别抢 IO）
 SPEED_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+
+
+class _OpAligner(QObject):
+    """后台跑片头对齐的壳子
+
+    只做一件事：把（这一集, 基准集, 模板区间）丢给 `skip_align.align_op`，
+    再把结果用信号送回主线程。跨线程 emit 是队列投递，所以回调里动控件是安全的
+    （Qt 的信号槽不会真的在子线程里执行槽函数）。
+    """
+
+    done = pyqtSignal(str, int, int, str)   # 目标路径, start_ms, end_ms, status
+
+    def run(self, target_path, ref_path, start_ms, end_ms):
+        try:
+            result = skip_align.align_op(target_path, ref_path, start_ms, end_ms)
+        except Exception as e:  # noqa: BLE001 - 对齐失败只该「不跳」，不能把播放器带走
+            print(f"[片头对齐] 失败: {e}")
+            return
+        self.done.emit(
+            target_path,
+            int(result.get("start_ms") or 0),
+            int(result.get("end_ms") or 0),
+            str(result.get("status") or "unknown"),
+        )
 
 
 class VideoPlayerWindow(QWidget):
     closed = pyqtSignal()
+
+    # 「按 O 标记片头」的引导只在一次运行里提示一次，别每集都弹
+    _tip_shown = False
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
@@ -79,6 +113,10 @@ class VideoPlayerWindow(QWidget):
         self._index = -1
         self._current_path = ""
         self._current_key = ""  # 规范化后的路径，供「同一个视频」判重
+        self._work_id = 0       # 当前视频所属作品：片头/片尾模板按作品记
+        self._skip_plan = []    # 本集要跳的区间 [(kind, start, end)]
+        self._skipped = set()   # 本集已经处理过的 kind（跳过一次就不再跳）
+        self._mark_start = {}   # 两次按键标记片头时的中间态 {"op": ms}
         self._pending_resume = 0
         self._dragging = False
         self._fullscreen = False
@@ -102,6 +140,16 @@ class VideoPlayerWindow(QWidget):
         self._hide_timer.setSingleShot(True)
         self._hide_timer.setInterval(AUTOHIDE_MS)
         self._hide_timer.timeout.connect(self._autohide_bars)
+
+        self._hint_timer = QTimer(self)
+        self._hint_timer.setSingleShot(True)
+        self._hint_timer.setInterval(HINT_CLEAR_MS)
+        self._hint_timer.timeout.connect(self._clear_hint)
+
+        # 片头对齐在后台线程跑，结果用信号回来（见 _OpAligner 的说明）
+        self._aligner = _OpAligner(self)
+        self._aligner.done.connect(self._on_aligned)
+        self._align_thread = None
 
         self._apply_stored_settings()
 
@@ -289,6 +337,10 @@ class VideoPlayerWindow(QWidget):
         bind(["Esc"], self._on_escape)
         bind(["Up"], lambda: self.volume.setValue(self.volume.value() + 5))
         bind(["Down"], lambda: self.volume.setValue(self.volume.value() - 5))
+        # 片头/片尾标记与回看（键位避开所有播放控制）
+        bind(["O"], self._mark_op)
+        bind(["E"], self._mark_ed)
+        bind(["B"], self._replay_op)
 
     def _apply_stored_settings(self):
         volume = int(getattr(config, "VIDEO_VOLUME", 80) or 0)
@@ -340,6 +392,7 @@ class VideoPlayerWindow(QWidget):
             os.path.normcase(os.path.abspath(self._current_path))
             if self._current_path else ""
         )
+        self._hint_timer.stop()
         self.hint_label.setText("")
         self.error_label.hide()
 
@@ -353,6 +406,11 @@ class VideoPlayerWindow(QWidget):
             duration = int(video.get("duration_ms") or saved_duration or 0)
             self._pending_resume = resume_position(saved, duration)
 
+        # 换集：上一集的「已跳过」状态、标到一半的起点都作废
+        self._work_id = self._resolve_work_id(video)
+        self._skipped = set()
+        self._mark_start.clear()
+
         self.seek.setRange(0, 0)
         self.seek.setValue(0)
         # 起点显示 00:00 而不是 --:--：文件已经载入，"--:--" 只用于「时长未知」
@@ -363,8 +421,12 @@ class VideoPlayerWindow(QWidget):
         # 先停旧的再换源：否则旧文件的 positionChanged 会写进新一集的进度条
         self.player.stop()
         self.player.setSource(QUrl.fromLocalFile(self._current_path))
+        # 此刻播放器时长还是 0/旧值，用扫描时探到的时长兜底，ED 才有终点可用
+        self._load_skip_plan(video.get("duration_ms") or 0)
         if auto_play:
             self.player.play()
+        # 画面先出来再跑去重：对齐要解两次音频，别跟开播抢 IO
+        QTimer.singleShot(ALIGN_DELAY_MS, self._maybe_align_op)
 
     def show_player(self):
         self.show()
@@ -405,6 +467,10 @@ class VideoPlayerWindow(QWidget):
             if not self.seek.isSliderDown():
                 self.seek.setValue(int(position))
             self.time_label.setText(format_position(position))
+        if self._dragging:
+            # 拖拽期间不触发自动跳过：用户正在找位置，别跟他抢滑块
+            return
+        self._apply_auto_skip(position)
 
     def _on_duration_changed(self, duration):
         self.seek.setRange(0, max(0, int(duration)))
@@ -412,6 +478,8 @@ class VideoPlayerWindow(QWidget):
         if duration > 0:
             db.update_video_duration(self._current_path, duration)
         self._apply_pending_resume()
+        # 真实时长出来后重算一次：ED 的「到结尾」要靠它才能确定终点
+        self._load_skip_plan()
 
     def _apply_pending_resume(self):
         if self._pending_resume > 0:
@@ -419,7 +487,7 @@ class VideoPlayerWindow(QWidget):
             self._pending_resume = 0
             self.player.setPosition(position)
             self.time_label.setText(format_position(position))
-            self.hint_label.setText(f"从 {format_position(position)} 继续")
+            self._flash_hint(f"从 {format_position(position)} 继续")
 
     def _on_media_status(self, status):
         if status in (
@@ -460,6 +528,7 @@ class VideoPlayerWindow(QWidget):
         self.error_label.adjustSize()
         self._center_error_label()
         self.error_label.show()
+        self._hint_timer.stop()
         self.hint_label.setText("播放失败")
 
     def _center_error_label(self):
@@ -484,6 +553,187 @@ class VideoPlayerWindow(QWidget):
         elif action == "set":
             db.set_progress(path, value, duration)
 
+    # ==================== 片头 / 片尾跳过 ====================
+    #
+    # 分工：规则在 video_manager.skip（纯函数），对齐在 video_manager.align（纯 Python），
+    # 这里只负责按键、读库、把算出来的毫秒塞给播放器。
+    #
+    # 交互：O 两次按键标片头（起点 / 终点），E 一次按键标片尾（按第二次则取消），
+    # B 回看刚跳过的片头。标记落到**作品**上，同一部动画后面每一集都自动跳过。
+
+    def _resolve_work_id(self, video):
+        """取当前视频所属作品 id：dict 里有就用，没有按路径回查（续播页/搜索入口）"""
+        try:
+            work_id = int((video or {}).get("work_id") or 0)
+        except (TypeError, ValueError):
+            work_id = 0
+        if work_id:
+            return work_id
+        return int(db.get_work_id_of_video(self._current_path) or 0)
+
+    def _load_skip_plan(self, duration_ms=None):
+        """按「作品模板 + 本集对齐结果」重算这一集要跳的区间
+
+        duration_ms 传 None 表示从播放器读（时长变更时用）；载入新集时播放器时长
+        还是旧值/0，调用方必须显式传扫描时探到的时长。
+        """
+        self._skip_plan = []
+        if not self._current_path or not self._work_id:
+            return
+        segments = db.get_skip_segments(self._work_id)
+        if not segments:
+            self._show_mark_tip()
+            return
+        overrides = db.get_skip_overrides(self._current_path)
+        duration = (int(self.player.duration() or 0) if duration_ms is None
+                    else int(duration_ms or 0))
+        self._skip_plan = skip_logic.build_plan(
+            segments,
+            overrides,
+            duration,
+            skip_op=bool(getattr(config, "VIDEO_SKIP_OP", True)),
+            skip_ed=bool(getattr(config, "VIDEO_SKIP_ED", True)),
+        )
+
+    def _show_mark_tip(self):
+        """第一次遇到「还没标过片头」的作品时提示一次怎么标（一次运行只提示一次）"""
+        if VideoPlayerWindow._tip_shown or not self._current_path:
+            return
+        VideoPlayerWindow._tip_shown = True
+        self._flash_hint("按 O 标片头、E 标片尾，全剧通用")
+
+    def _apply_auto_skip(self, position):
+        """播放位置进入片头/片尾区间就往前跳；每段每集只跳一次"""
+        if not self._skip_plan:
+            return False
+        duration = int(self.player.duration() or 0)
+        hit = skip_logic.pick_skip(position, self._skip_plan, self._skipped, duration)
+        if not hit:
+            return False
+        kind, target = hit
+        self._skipped.add(kind)
+        self.player.setPosition(int(target))
+        self.seek.setValue(int(target))
+        self.time_label.setText(format_position(target))
+        self._flash_hint(
+            f"已跳过{skip_logic.label(kind)} "
+            f"{format_position(position)} → {format_position(target)} · B 回看"
+        )
+        return True
+
+    def _mark_op(self):
+        """按 O：第一次记起点，第二次记终点并写进作品模板"""
+        if not self._current_path or not self._work_id:
+            return
+        position = int(self.player.position() or 0)
+        start = self._mark_start.get(skip_logic.OP)
+        if start is None:
+            self._mark_start[skip_logic.OP] = position
+            self._flash_hint(
+                f"片头起点 {format_position(position)} 已记 —— 播到片头结束再按 O"
+            )
+            return
+        if position - start < skip_logic.MIN_SEGMENT_MS:
+            self._flash_hint("这段太短了，往后播一点再按 O")
+            return
+        self._mark_start.pop(skip_logic.OP, None)
+        if db.set_skip_segment(
+            self._work_id, skip_logic.OP, start, position, self._current_path
+        ):
+            self._skipped.discard(skip_logic.OP)
+            self._load_skip_plan()
+            self._flash_hint(
+                f"片头 {format_position(start)}–{format_position(position)} 已记，全剧通用"
+            )
+
+    def _mark_ed(self):
+        """按 E：记片尾起点（终点到文件结尾）；已有记录时再按一次则取消"""
+        if not self._current_path or not self._work_id:
+            return
+        existing = db.get_skip_segments(self._work_id).get(skip_logic.ED)
+        if existing:
+            db.clear_skip_segment(self._work_id, skip_logic.ED)
+            self._skipped.discard(skip_logic.ED)
+            self._load_skip_plan()
+            self._flash_hint("已取消本作品的片尾跳过")
+            return
+
+        position = int(self.player.position() or 0)
+        duration = int(self.player.duration() or 0)
+        if duration > 0 and duration - position < skip_logic.MIN_SEGMENT_MS:
+            self._flash_hint("离结尾太近了，往前一点再按 E")
+            return
+        # end 传真实时长；时长未知就传 0（表示「到结尾」，播放时再用真实时长兜底）
+        if db.set_skip_segment(
+            self._work_id, skip_logic.ED, position, duration, self._current_path
+        ):
+            self._skipped.discard(skip_logic.ED)
+            self._load_skip_plan()
+            self._flash_hint(
+                f"片尾从 {format_position(position)} 起跳过，全剧通用"
+            )
+
+    def _replay_op(self):
+        """按 B：回到这一集的片头起点，并把片头标成「已处理」，免得又被弹走"""
+        for kind, start, _end in self._skip_plan:
+            if kind == skip_logic.OP:
+                self._skipped.add(skip_logic.OP)
+                self.player.setPosition(int(start))
+                self.seek.setValue(int(start))
+                self.time_label.setText(format_position(start))
+                self._flash_hint(f"已回到{skip_logic.label(kind)}起点 {format_position(start)}")
+                return
+        self._flash_hint("本作品还没标记片头（按 O 标一次）")
+
+    def _maybe_align_op(self):
+        """后台把作品模板对齐到这一集：每集的片头位置常差几秒，死用模板会跳早/跳晚"""
+        if not self._current_path or not self._work_id:
+            return
+        if not skip_align.available():
+            return
+        op = db.get_skip_segments(self._work_id).get(skip_logic.OP)
+        if not op:
+            return
+        if db.get_skip_overrides(self._current_path).get(skip_logic.OP):
+            return  # 已经算过（ok 或 absent），别重复解码
+
+        ref_path = op.get("source_path") or ""
+        if ref_path and os.path.normcase(os.path.abspath(ref_path)) == self._current_key:
+            return  # 当前就是基准那一集，模板本身就准
+
+        if self._align_thread is not None and self._align_thread.is_alive():
+            return
+        target = self._current_path
+        self._align_thread = threading.Thread(
+            target=self._aligner.run,
+            args=(target, ref_path, int(op.get("start_ms") or 0), int(op.get("end_ms") or 0)),
+            daemon=True,
+            name="video-op-align",
+        )
+        self._align_thread.start()
+
+    def _on_aligned(self, target_path, start_ms, end_ms, status):
+        """对齐结果回到主线程：写库 + 就地更新本集计划"""
+        if status not in ("ok", "absent"):
+            return
+        if not target_path:
+            return
+        db.set_skip_override(target_path, skip_logic.OP, start_ms, end_ms, status)
+        if target_path != self._current_path:
+            return  # 算完时用户已经换集了，只落库，别改当前这集的计划
+        self._load_skip_plan()
+        if status == "ok":
+            self._flash_hint(
+                f"片头已对齐到 {format_position(start_ms)}–{format_position(end_ms)}"
+            )
+
+    def _flash_hint(self, text):
+        self.hint_label.setText(text)
+        self._hint_timer.start()
+
+    def _clear_hint(self):
+        self.hint_label.setText("")
+
     # ==================== 进度条 / 音量 / 倍速 ====================
 
     def _on_seek_pressed(self):
@@ -491,8 +741,15 @@ class VideoPlayerWindow(QWidget):
 
     def _on_seek_released(self):
         self._dragging = False
-        self.player.setPosition(self.seek.value())
-        self.time_label.setText(format_position(self.seek.value()))
+        value = int(self.seek.value())
+        # 用户主动拖进片头/片尾里看 → 这段本次不再自动跳，否则刚拖回去就被弹走
+        kind = skip_logic.inside_segment(
+            value, self._skip_plan, int(self.player.duration() or 0)
+        )
+        if kind:
+            self._skipped.add(kind)
+        self.player.setPosition(value)
+        self.time_label.setText(format_position(value))
 
     def _on_seek_moved(self, value):
         self.time_label.setText(format_position(value))

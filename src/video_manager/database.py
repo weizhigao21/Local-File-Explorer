@@ -104,6 +104,30 @@ def init_db():
                 updated_at INTEGER DEFAULT 0
             );
 
+            -- 片头/片尾：按作品记模板（标一次全剧通用）
+            -- kind = 'op' / 'ed'；end_ms = 0 对 ed 表示「一直到文件结尾」
+            CREATE TABLE IF NOT EXISTS skip_segments (
+                work_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL DEFAULT 0,
+                source_path TEXT DEFAULT '',
+                updated_at INTEGER DEFAULT 0,
+                PRIMARY KEY (work_id, kind)
+            );
+
+            -- 逐集音频对齐结果：覆盖作品级模板
+            -- status = 'ok'（已对齐，用这里的时间）/ 'absent'（这集没有该段，不跳）
+            CREATE TABLE IF NOT EXISTS skip_overrides (
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'ok',
+                updated_at INTEGER DEFAULT 0,
+                PRIMARY KEY (path, kind)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_works_author ON works(author_id);
             CREATE INDEX IF NOT EXISTS idx_videos_work ON videos(work_id);
             """
@@ -257,6 +281,13 @@ def add_author_with_works(author_name, works):
 
 def delete_work(work_id):
     with _active_conn() as conn:
+        # 片头模板随作品走；逐集对齐结果按路径存，得先按作品圈出路径再删
+        conn.execute(
+            "DELETE FROM skip_overrides WHERE path IN"
+            " (SELECT path FROM videos WHERE work_id = ?)",
+            (work_id,),
+        )
+        conn.execute("DELETE FROM skip_segments WHERE work_id = ?", (work_id,))
         conn.execute("DELETE FROM videos WHERE work_id = ?", (work_id,))
         conn.execute("DELETE FROM works WHERE id = ?", (work_id,))
 
@@ -268,7 +299,16 @@ def delete_author(author_id):
         ).fetchall()]
         if work_ids:
             placeholders = ",".join("?" * len(work_ids))
+            # 顺序要紧：先按 videos 圈路径删覆盖，再删 videos 本身
+            conn.execute(
+                f"DELETE FROM skip_overrides WHERE path IN"
+                f" (SELECT path FROM videos WHERE work_id IN ({placeholders}))",
+                work_ids,
+            )
             conn.execute(f"DELETE FROM videos WHERE work_id IN ({placeholders})", work_ids)
+            conn.execute(
+                f"DELETE FROM skip_segments WHERE work_id IN ({placeholders})", work_ids
+            )
         conn.execute("DELETE FROM works WHERE author_id = ?", (author_id,))
         conn.execute("DELETE FROM authors WHERE id = ?", (author_id,))
 
@@ -478,7 +518,132 @@ def clear_all():
     with get_conn() as conn:
         conn.executescript(
             "DELETE FROM progress; DELETE FROM videos; DELETE FROM works; DELETE FROM authors;"
+            " DELETE FROM skip_segments; DELETE FROM skip_overrides;"
         )
+
+
+# ==================== 片头 / 片尾 ====================
+#
+# 两级结构：
+#   skip_segments   按**作品**记模板（用户标的那一次，全剧通用）
+#   skip_overrides  按**文件**记逐集对齐结果（音频对齐后微调，或判定这集没有片头）
+#
+# 全部吞掉 sqlite 异常：跳片头是锦上添花，库没建好只该「不跳」，不该让播放器崩
+# （同续播点踩过的坑：表未建时 get_progress 抛 no such table 直接把播放器带走）。
+
+def get_skip_segments(work_id):
+    """作品级片头/片尾模板 → {kind: {"start_ms", "end_ms", "source_path"}}"""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT kind, start_ms, end_ms, source_path FROM skip_segments"
+                " WHERE work_id = ?",
+                (int(work_id or 0),),
+            ).fetchall()
+        return {row["kind"]: dict(row) for row in rows}
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        print(f"[片头跳过] 读取作品模板失败: {e}")
+        return {}
+
+
+def set_skip_segment(work_id, kind, start_ms, end_ms, source_path=""):
+    """写作品级模板；同一作品已算过的逐集对齐结果一并作废（模板变了，旧结论不可信）"""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO skip_segments (work_id, kind, start_ms, end_ms, source_path, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(work_id, kind) DO UPDATE SET start_ms = excluded.start_ms,"
+                " end_ms = excluded.end_ms, source_path = excluded.source_path,"
+                " updated_at = excluded.updated_at",
+                (int(work_id), kind, int(start_ms), int(end_ms), source_path or "",
+                 int(time.time())),
+            )
+            conn.execute(
+                "DELETE FROM skip_overrides WHERE kind = ? AND path IN"
+                " (SELECT path FROM videos WHERE work_id = ?)",
+                (kind, int(work_id)),
+            )
+        return True
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        print(f"[片头跳过] 写入作品模板失败: {e}")
+        return False
+
+
+def clear_skip_segment(work_id, kind=None):
+    """删作品模板（kind 为 None 时两种都删）"""
+    try:
+        with get_conn() as conn:
+            if kind:
+                conn.execute(
+                    "DELETE FROM skip_segments WHERE work_id = ? AND kind = ?",
+                    (int(work_id), kind),
+                )
+            else:
+                conn.execute("DELETE FROM skip_segments WHERE work_id = ?", (int(work_id),))
+            if kind:
+                conn.execute(
+                    "DELETE FROM skip_overrides WHERE kind = ? AND path IN"
+                    " (SELECT path FROM videos WHERE work_id = ?)",
+                    (kind, int(work_id)),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM skip_overrides WHERE path IN"
+                    " (SELECT path FROM videos WHERE work_id = ?)",
+                    (int(work_id),),
+                )
+        return True
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        print(f"[片头跳过] 清除模板失败: {e}")
+        return False
+
+
+def get_skip_overrides(path):
+    """某集的逐集对齐结果 → {kind: {"start_ms", "end_ms", "status"}}"""
+    if not path:
+        return {}
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT kind, start_ms, end_ms, status FROM skip_overrides WHERE path = ?",
+                (path,),
+            ).fetchall()
+        return {row["kind"]: dict(row) for row in rows}
+    except sqlite3.Error as e:
+        print(f"[片头跳过] 读取逐集对齐失败: {e}")
+        return {}
+
+
+def set_skip_override(path, kind, start_ms, end_ms, status="ok"):
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO skip_overrides (path, kind, start_ms, end_ms, status, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(path, kind) DO UPDATE SET start_ms = excluded.start_ms,"
+                " end_ms = excluded.end_ms, status = excluded.status,"
+                " updated_at = excluded.updated_at",
+                (path, kind, int(start_ms), int(end_ms), status or "ok", int(time.time())),
+            )
+        return True
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        print(f"[片头跳过] 写入逐集对齐失败: {e}")
+        return False
+
+
+def get_work_id_of_video(path):
+    """按文件路径回查作品 id（调用方传进来的条目缺 work_id 时的兜底）"""
+    if not path:
+        return None
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT work_id FROM videos WHERE path = ?", (path,)
+            ).fetchone()
+            return int(row["work_id"]) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
 
 
 def _escape_like(text):

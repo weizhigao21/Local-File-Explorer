@@ -70,7 +70,7 @@ TRANSCODE_DIR = os.path.join(_DATA_DIR, "transcode")
 TRANSCODE_MAX_BYTES = 20 * 1024 ** 3
 
 # 应用版本号
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.17.2"
 
 # ==================== 用户可变配置（config.json） ====================
 
@@ -101,6 +101,8 @@ _DEFAULT_USER_CONFIG = {
     "VIDEO_VOLUME": 80,              # 视频音量（0-100）
     "VIDEO_AUTOPLAY_NEXT": True,     # 一集播完自动播下一个
     "VIDEO_SPEED": 1.0,              # 上次使用的倍速
+    "VIDEO_SKIP_OP": True,           # 自动跳过片头（按作品记一次，全剧通用）
+    "VIDEO_SKIP_ED": True,           # 自动跳过片尾（跳完直接进下一集）
     # 手机/平板网页访问（内置 HTTP 服务）
     "WEB_PORT": WEB_DEFAULT_PORT,    # 监听端口
     "WEB_TOKEN": "",                 # 访问令牌，首次启动自动生成
@@ -205,7 +207,8 @@ def _load_user_config():
                     v = _normalize_web_port(v)
                 elif k == "WEB_TOKEN":
                     v = _normalize_web_token(v)
-                elif k in ("WEB_ALLOW_LAN", "WEB_REQUIRE_TOKEN"):
+                elif k in ("WEB_ALLOW_LAN", "WEB_REQUIRE_TOKEN",
+                           "VIDEO_SKIP_OP", "VIDEO_SKIP_ED"):
                     v = bool(v)
                 elif k == "DL_PROXY":
                     v = str(v or "").strip()
@@ -254,7 +257,8 @@ def set_user_config(key: str, value):
         value = _normalize_web_port(value)
     elif key == "WEB_TOKEN":
         value = _normalize_web_token(value)
-    elif key in ("WEB_ALLOW_LAN", "WEB_REQUIRE_TOKEN"):
+    elif key in ("WEB_ALLOW_LAN", "WEB_REQUIRE_TOKEN",
+                 "VIDEO_SKIP_OP", "VIDEO_SKIP_ED"):
         value = bool(value)
     elif key == "DL_PROXY":
         value = str(value or "").strip()
@@ -292,6 +296,8 @@ VIDEO_RESUME = _user_config["VIDEO_RESUME"]
 VIDEO_VOLUME = _user_config["VIDEO_VOLUME"]
 VIDEO_AUTOPLAY_NEXT = _user_config["VIDEO_AUTOPLAY_NEXT"]
 VIDEO_SPEED = _user_config["VIDEO_SPEED"]
+VIDEO_SKIP_OP = _user_config["VIDEO_SKIP_OP"]
+VIDEO_SKIP_ED = _user_config["VIDEO_SKIP_ED"]
 WEB_PORT = _user_config["WEB_PORT"]
 WEB_TOKEN = _user_config["WEB_TOKEN"]
 WEB_ALLOW_LAN = _user_config["WEB_ALLOW_LAN"]

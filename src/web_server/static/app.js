@@ -137,6 +137,10 @@
       // 展示与上报都要加 offset（流是从源片第 offset 秒开始转的）
       streaming: false,
       offset: 0,
+      // 片头/片尾：plan 是本集真正要跳的区间（服务端算好，单位毫秒），
+      // segments 是这部作品已标记的模板，skipped 记录本集已处理过的种类
+      plan: [], skipSegments: [], skipEnabled: { op: true, ed: true },
+      skipped: {}, replay: null, refreshTimer: 0, refreshTries: 0,
     },
     // source 可以是 pagedGrid（带 items/total/loadMore），也可以是普通数组
     lightbox: { source: null, index: 0, orig: '', swipe: null },
@@ -1669,6 +1673,299 @@
     }
   }
 
+  // ---------------- 片头 / 片尾跳过 ----------------
+  //
+  // 规则全在服务端（`video_manager.skip`，与桌面播放器读写同一套表）：
+  // 前端只回答一个问题——「当前位置落在哪一段该跳的区间里，跳到哪」。
+  //
+  // 两个必须照顾的现实（桌面端已踩过）：
+  // 1. 每集的片头位置会差几秒到两分钟（第 1 集常有导言），所以打开一集时服务端
+  //    会在后台用音频包络把它对齐一次；未对齐完成前先用作品模板，完成后
+  //    前端再拉一次计划替换（`refreshSkipPlan`）。
+  // 2. 「跳过一次就不再跳」：用户自己拖回片头里看时不能被立刻弹走。
+
+  const SKIP_LABEL = { op: '片头', ed: '片尾' };
+  const SKIP_MIN_MS = 5000;        // 与服务端 skip.MIN_SEGMENT_MS 一致
+  const SKIP_REFRESH_MS = 1600;    // 后台对齐一般 1 秒内完成
+  const SKIP_REFRESH_TRIES = 4;    // 最多再拉 4 次，别无限轮询
+
+  let markOpStartMs = 0;           // 片头标记的第一步（0 = 还没开始标）
+
+  function applySkipState(data) {
+    if (!data) return;
+    state.video.plan = data.plan || [];
+    state.video.skipSegments = data.segments || [];
+    state.video.skipEnabled = data.enabled || { op: true, ed: true };
+  }
+
+  /** 换集时清掉上一集的跳过状态（否则上一集的「已跳过」会带过来） */
+  function resetSkipState(info) {
+    clearTimeout(state.video.refreshTimer);
+    state.video.refreshTimer = 0;
+    state.video.refreshTries = 0;
+    state.video.plan = [];
+    state.video.skipSegments = [];
+    state.video.skipEnabled = { op: true, ed: true };
+    state.video.skipped = {};
+    markOpStartMs = 0;
+    hideVideoHint();
+    applySkipState(info && info.skip);
+    syncMarkUi();
+    if (info && info.aligning) scheduleSkipRefresh();
+  }
+
+  function scheduleSkipRefresh() {
+    if (state.video.refreshTries >= SKIP_REFRESH_TRIES) return;
+    state.video.refreshTries += 1;
+    clearTimeout(state.video.refreshTimer);
+    state.video.refreshTimer = setTimeout(refreshSkipPlan, SKIP_REFRESH_MS);
+  }
+
+  async function refreshSkipPlan() {
+    state.video.refreshTimer = 0;
+    const info = state.video.info;
+    if (!info || $('video-overlay').hidden) return;
+    let data;
+    try {
+      data = await api(`/api/video/videos/${info.id}/skip`);
+    } catch (error) {
+      return;  // 拉不到就继续用旧计划，不影响播放
+    }
+    if (state.video.info !== info) return;  // 期间换集了，这份结果作废
+    applySkipState(data);
+    syncMarkUi();
+    if (data.aligning) scheduleSkipRefresh();
+  }
+
+  /** 一段的实际终点（毫秒）：片尾 end=0 表示「到结尾」，用真实时长兜底 */
+  function segmentEnd(seg) {
+    if (seg.end_ms > 0) return seg.end_ms;
+    if (seg.kind !== 'ed') return 0;
+    return Math.round(videoDuration() * 1000);
+  }
+
+  function segmentAt(ms) {
+    const plan = state.video.plan || [];
+    for (let i = 0; i < plan.length; i++) {
+      const seg = plan[i];
+      if (state.video.skipEnabled && state.video.skipEnabled[seg.kind] === false) continue;
+      const end = segmentEnd(seg);
+      if (end > seg.start_ms && ms >= seg.start_ms && ms < end) return seg;
+    }
+    return null;
+  }
+
+  /** 拖动落进片头/片尾 → 这一段本集不再自动跳（用户就是想看这段） */
+  function markSkippedAt(ms) {
+    const seg = segmentAt(Number(ms) || 0);
+    if (seg) state.video.skipped[seg.kind] = true;
+  }
+
+  /** 播放位置进入片头/片尾就跳过；每段每集只跳一次 */
+  function applyAutoSkip() {
+    if (!state.video.plan || !state.video.plan.length) return false;
+    // readyState < 2 时 currentTime 还不可信，等能播了再判断
+    if (videoEl.readyState < 2) return false;
+    const posMs = Math.round(videoTime() * 1000);
+    if (posMs <= 0) return false;
+    const seg = segmentAt(posMs);
+    if (!seg || state.video.skipped[seg.kind]) return false;
+    state.video.skipped[seg.kind] = true;
+    runSkip(seg, posMs);
+    return true;
+  }
+
+  function runSkip(seg, posMs) {
+    if (seg.kind === 'ed') {
+      // 片尾跳过 = 直接进下一集（与电脑端「跳完就下一集」的语义一致）
+      finishEpisode();
+      return;
+    }
+    const end = segmentEnd(seg);
+    seekAbsolute(end);
+    showReplayHint(
+      `已跳过${SKIP_LABEL[seg.kind] || '片段'} ${fmtClock(posMs / 1000)} → ${fmtClock(end / 1000)} · 点这里回看`,
+      seg,
+    );
+  }
+
+  /** 跳到绝对时间点（毫秒）。流模式下 seek 不了，只能让服务端从那里重新起转 */
+  function seekAbsolute(ms) {
+    const seconds = Math.max(0, (Number(ms) || 0) / 1000);
+    if (state.video.streaming) {
+      startStream(seconds, true);
+    } else {
+      const duration = videoDuration();
+      const target = duration > 0 ? Math.min(seconds, Math.max(0, duration - 0.2)) : seconds;
+      videoEl.currentTime = target;
+    }
+    syncVideoTime();
+    showVideoControls();
+  }
+
+  /** 进下一集；没有下一集就返回 false，调用方自己决定怎么提示 */
+  function goNextEpisode() {
+    const next = state.video.index + 1;
+    if (next >= state.video.videos.length) return false;
+    loadVideo(next);
+    return true;
+  }
+
+  /** 片尾跳完：按「已看完」上报并进下一集
+   *
+   * 上报要传整集长度而不是当前位置——`decide_progress` 看到「距结尾 5 秒内」
+   * 才会清掉续播点，否则下次打开又从片尾开始，一进去就被再跳一次。
+   * 最后一集没有下一集可进，但这一步照样要做。
+   */
+  function finishEpisode() {
+    const info = state.video.info;
+    if (info) {
+      const durationMs = Math.round(videoDuration() * 1000) || info.duration_ms || 0;
+      if (durationMs) postProgress(info.id, durationMs, durationMs, false);
+      state.video.savedAt = Date.now();
+    }
+    if (goNextEpisode()) return;
+    // 最后一集：停在结尾，别让人以为卡住了
+    if (!state.video.streaming) {
+      const duration = videoDuration();
+      if (duration) videoEl.currentTime = Math.max(0, duration - 0.3);
+    }
+    showVideoHint('已经是最后一集了', 2600);
+  }
+
+  function showReplayHint(text, seg) {
+    state.video.replay = { kind: seg.kind, start_ms: seg.start_ms };
+    showVideoHint(text, 7000);
+  }
+
+  /** 播放器内的提示条
+   *
+   * 不能复用 toast：`body.video-open #toast` 是 display:none（会被画面盖住），
+   * 播放器里所有反馈都得走 #v-hint。
+   */
+  function showVideoHint(text, ms) {
+    const hint = $('v-hint');
+    setText(hint, text);
+    hint.hidden = false;
+    showVideoControls();
+    clearTimeout(showVideoHint._timer);
+    showVideoHint._timer = setTimeout(hideVideoHint, ms || 2600);
+  }
+
+  function hideVideoHint() {
+    $('v-hint').hidden = true;
+    state.video.replay = null;
+  }
+
+  $('v-hint').addEventListener('click', () => {
+    const replay = state.video.replay;
+    if (!replay) return;
+    // 回看期间别再被弹走
+    state.video.skipped[replay.kind] = true;
+    seekAbsolute(replay.start_ms);
+    hideVideoHint();
+  });
+
+  // ---- 标记（手机上按不到 O/E，改成面板里点两下）----
+
+  function syncMarkUi() {
+    const segments = state.video.skipSegments || [];
+    const op = segments.filter((seg) => seg.kind === 'op')[0];
+    const ed = segments.filter((seg) => seg.kind === 'ed')[0];
+    $('v-tag').classList.toggle('on', !!(op || ed));
+    $('v-mark-op').textContent = markOpStartMs ? '片头终点（再点一次）' : '从这里标片头';
+    $('v-mark-op').classList.toggle('on', !!markOpStartMs);
+    $('v-mark-clear').hidden = !(op || ed);
+    const lines = [];
+    if (op) {
+      lines.push(`片头 ${fmtDuration(op.start_ms)}–${op.end_ms ? fmtDuration(op.end_ms) : '结尾'}`);
+    }
+    if (ed) lines.push(`片尾 ${fmtDuration(ed.start_ms)} 起`);
+    $('v-mark-info').textContent = lines.length
+      ? lines.join(' · ')
+      : '这部作品还没标过，标一次全剧通用。';
+  }
+
+  $('v-tag').addEventListener('click', () => {
+    const panel = $('v-mark');
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) syncMarkUi();
+    showVideoControls();
+  });
+
+  $('v-mark-op').addEventListener('click', () => {
+    const posMs = Math.round(videoTime() * 1000);
+    if (!markOpStartMs) {
+      markOpStartMs = Math.max(1, posMs);
+      syncMarkUi();
+      showVideoHint(`片头起点 ${fmtClock(posMs / 1000)} 已记，播到片头结束再点一次`, 4200);
+      return;
+    }
+    if (posMs - markOpStartMs < SKIP_MIN_MS) {
+      showVideoHint('这段太短了，往后播一点再点', 3000);
+      return;
+    }
+    const start = markOpStartMs;
+    markOpStartMs = 0;
+    syncMarkUi();
+    saveVideoSkip('op', start, posMs);
+  });
+
+  $('v-mark-ed').addEventListener('click', () => {
+    const posMs = Math.round(videoTime() * 1000);
+    const durationMs = Math.round(videoDuration() * 1000);
+    if (durationMs && durationMs - posMs < SKIP_MIN_MS) {
+      showVideoHint('离结尾太近了，往前一点再标', 3000);
+      return;
+    }
+    saveVideoSkip('ed', posMs, durationMs);
+  });
+
+  $('v-mark-clear').addEventListener('click', () => {
+    postVideoSkip({ clear: true }).then((ok) => {
+      if (ok) showVideoHint('已清除本作品的片头片尾标记', 3200);
+    });
+  });
+
+  async function saveVideoSkip(kind, startMs, endMs) {
+    const ok = await postVideoSkip({
+      kind: kind,
+      start_ms: startMs,
+      end_ms: endMs,
+      duration_ms: Math.round(videoDuration() * 1000),
+    });
+    if (!ok) return;
+    // 新标的区间立刻生效：清掉「已跳过」记录，别让旧判断挡住
+    state.video.skipped = {};
+    showVideoHint(
+      kind === 'op'
+        ? `片头 ${fmtDuration(startMs)}–${fmtDuration(endMs)} 已记，全剧通用`
+        : `片尾从 ${fmtDuration(startMs)} 起跳过，全剧通用`,
+      4200,
+    );
+  }
+
+  async function postVideoSkip(payload) {
+    const info = state.video.info;
+    if (!info) return false;
+    let data;
+    try {
+      data = await api(`/api/video/videos/${info.id}/skip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      showVideoHint(error.message || '标记失败', 3600);
+      return false;
+    }
+    if (state.video.info !== info) return true;  // 期间换集了，别改当前这集
+    applySkipState(data);
+    syncMarkUi();
+    if (data.aligning) scheduleSkipRefresh();
+    return true;
+  }
+
   /** 把 <video> 硬拉回全屏
    *
    * Android 7 那代 WebView 用独立图层渲染 <video>，个别机型按文档流定位，
@@ -1714,6 +2011,9 @@
     const video = state.video.videos[index];
     if (!video) return;
     state.video.index = index;
+    syncNextButton();
+    // closeVideo 会把 <video> 从 display 上摘掉（拆 Android 的独立图层），这里再装回去
+    videoEl.style.display = '';
     state.video.streaming = false;
     state.video.offset = 0;
     state.video.resume = 0;
@@ -1732,21 +2032,27 @@
     state.video.info = info;
     state.video.mode = info.mode || (info.playable ? 'direct' : 'remux');
     state.video.savedAt = 0;
+    resetSkipState(info);
 
-    if (state.video.mode === 'direct' || info.cached) {
-      // 原文件就认，或者这一集已经转好落盘了：都是完整的 mp4，直接播 + 本地 seek
+    if (state.video.mode === 'direct') {
+      // 原文件就认：完整的 mp4，支持 Range，直接播 + 本地 seek
       state.video.resume = info.position_ms || 0;
       videoEl.src = info.stream_url || info.url;
       videoEl.play().catch(() => {
         /* 自动播放被拦截时用户点一下即可 */
       });
     } else {
-      // 浏览器不认这个容器/编码：直接从续播点开始转，服务端用 -ss 跳过去
+      // 换封装/重编码出来的都是 fMP4 分片：**没有可 seek 的索引**。
+      // 实测（`_shots/diag_fmp4_seek.py`）duration 只报 4.8 秒、seekable.end(0)=0，
+      // `currentTime = 60` 直接被忽略、画面回到 1.2 秒。所以「转码缓存已就绪」
+      // 也不能当普通 mp4 播——续播点和拖动全都会变成「从头开始」。
+      // 一律走流，由服务端从目标点切一段（缓存已就绪时是 `-c:v copy`，几百毫秒）。
       const resumeMs = info.position_ms || 0;
       const durMs = info.duration_ms || 0;
       const keep = resumeMs > 3000 && (!durMs || resumeMs < durMs - 5000);
-      startStream(keep ? resumeMs / 1000 : 0);
-      if (keep) toast(`已从 ${fmtDuration(resumeMs)} 继续`);
+      // 已经转好落盘的一集不用再提示「开头等几秒」——它其实秒开
+      startStream(keep ? resumeMs / 1000 : 0, Boolean(info.cached));
+      if (keep) showVideoHint(`已从 ${fmtDuration(resumeMs)} 继续`);
     }
     ensureVideoFullscreen();
   }
@@ -1765,14 +2071,20 @@
     return state.video.streaming ? (state.video.offset || 0) + value : value;
   }
 
-  /** 起 / 重起 ffmpeg 流。拖动进度条也是走这里，不是 seek */
-  function startStream(start) {
+  /** 起 / 重起 ffmpeg 流。拖动进度条也是走这里，不是 seek
+   *
+   * silent：自动跳片头触发的重连不弹提示——用户没点任何东西，
+   * 突然冒出「正在换封装」只会让人以为播放出问题了。
+   */
+  function startStream(start, silent) {
     const info = state.video.info;
     if (!info) return;
     state.video.streaming = true;
     state.video.offset = Math.max(0, start || 0);
     videoEl.src = streamUrl(state.video.offset);
-    if (state.video.mode === 'transcode') {
+    if (silent) {
+      $('v-note').hidden = true;
+    } else if (state.video.mode === 'transcode') {
       showVideoNote('正在把画面转成 H.264（显卡加速）：开头等几秒，之后再拖会重新起转。', [
         { label: '用原格式试播', onclick: playDirect },
       ]);
@@ -1813,11 +2125,18 @@
     if (!info) return;
     const position = Math.round(videoTime() * 1000);
     if (!position) return;
-    const body = JSON.stringify({
-      position_ms: position,
-      duration_ms: Math.round(videoDuration() * 1000) || info.duration_ms || 0,
-    });
-    const url = `/api/video/videos/${info.id}/progress`;
+    postProgress(
+      info.id,
+      position,
+      Math.round(videoDuration() * 1000) || info.duration_ms || 0,
+      beacon,
+    );
+  }
+
+  function postProgress(id, positionMs, durationMs, beacon) {
+    if (!id || !positionMs) return;
+    const body = JSON.stringify({ position_ms: positionMs, duration_ms: durationMs || 0 });
+    const url = `/api/video/videos/${id}/progress`;
     if (beacon && navigator.sendBeacon) {
       navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
       return;
@@ -1861,6 +2180,16 @@
     $('v-play').innerHTML = videoEl.paused ? ICON.play : ICON.pause;
   }
 
+  /** 最后一集把「下一集」压暗。仍保留可点：直接 disabled 时用户只会以为按钮坏了 */
+  function syncNextButton() {
+    const hasNext = state.video.index + 1 < state.video.videos.length;
+    const btn = $('v-next');
+    btn.classList.toggle('dim', !hasNext);
+    const label = hasNext ? '下一集' : '已经是最后一集';
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+  }
+
   function syncVideoTime() {
     const duration = videoDuration();
     setText($('v-dur'), duration ? fmtClock(duration) : '--:--');
@@ -1890,14 +2219,20 @@
   function commitVideoSeek() {
     if (!vSeek.dataset.dragging) return;
     delete vSeek.dataset.dragging;
+    // 时长未知（ffprobe 没探到）时，滑块的位置换算不出秒数，只会算出 0。
+    // 这时候提交就等于「让服务端从 0 重新起转」——也是「拖一下从头开始」的成因之一。
+    if (!videoDuration()) {
+      syncVideoTime();
+      showVideoControls();
+      return;
+    }
     const target = videoTarget();
-    if (target > 0) {
-      if (state.video.streaming) {
-        // 流没有总时长也 seek 不了：让服务端从目标点重新起转
-        startStream(target);
-      } else {
-        videoEl.currentTime = target;
-      }
+    markSkippedAt(Math.round(target * 1000));
+    if (state.video.streaming) {
+      // 流没有总时长也 seek 不了：让服务端从目标点重新起转
+      startStream(target);
+    } else {
+      videoEl.currentTime = target;
     }
     syncVideoTime();
     showVideoControls();
@@ -1953,6 +2288,13 @@
     showVideoControls();
   });
 
+  $('v-next').addEventListener('click', () => {
+    // 切集前先把当前进度落一次：timeupdate 是每 10 秒存一次，刚看的这一段别丢
+    saveVideoProgress(false);
+    if (!goNextEpisode()) showVideoHint('已经是最后一集了', 2600);
+    showVideoControls();
+  });
+
   /** 兜底：交给系统播放器全屏
    *
    * 这台平板是 Android 7 的 WebView（UA 带 `wv`），宿主 App 不实现
@@ -1963,9 +2305,9 @@
     try {
       if (videoEl.webkitEnterFullscreen) videoEl.webkitEnterFullscreen();
       else if (videoEl.webkitRequestFullscreen) videoEl.webkitRequestFullscreen();
-      else toast('这个浏览器不支持全屏，横过来看更舒服', 2600);
+      else showVideoHint('这个浏览器不支持全屏，横过来看更舒服', 2600);
     } catch (error) {
-      toast('这个浏览器不支持全屏，横过来看更舒服', 2600);
+      showVideoHint('这个浏览器不支持全屏，横过来看更舒服', 2600);
     }
   }
 
@@ -2006,16 +2348,44 @@
     showVideoControls();
   });
 
+  /** 全屏状态变化后的收尾
+   *
+   * 两条真实路径：
+   * 1. 按返回键退出元素全屏——视口尺寸变了，`<video>` 的独立图层要按新视口
+   *    重新定位，否则画面偏移、触摸位置对不上；
+   * 2. Android WebView 的原生视频全屏退出——它**不产生** fullscreenElement，
+   *    图层有时仍按全屏尺寸贴着视口，触摸被它盖住（列表滑不动）。
+   */
+  function onFullscreenSettled() {
+    if ($('video-overlay').hidden) {
+      // 播放器已经关了：确认列表的滚动锁没被落下
+      document.body.style.overflow = '';
+      document.body.classList.remove('video-open');
+      return;
+    }
+    resetVideoGeometry();
+    ensureVideoFullscreen();
+    showVideoControls();
+  }
+
+  document.addEventListener('fullscreenchange', onFullscreenSettled);
+  document.addEventListener('webkitfullscreenchange', onFullscreenSettled);
+  videoEl.addEventListener('webkitendfullscreen', onFullscreenSettled);
+
   videoEl.addEventListener('loadedmetadata', () => {
     // 流模式的起点已经在 startStream 里带上了，不需要再 seek 一次
     const resume = state.video.resume;
-    if (state.video.streaming || !resume) return;
-    const durationMs = (videoEl.duration || 0) * 1000;
-    if (resume > 3000 && (!durationMs || resume < durationMs - 5000)) {
-      videoEl.currentTime = resume / 1000;
-      toast(`已从 ${fmtDuration(resume)} 继续`);
+    if (!state.video.streaming && resume) {
+      const durationMs = (videoEl.duration || 0) * 1000;
+      if (resume > 3000 && (!durationMs || resume < durationMs - 5000)) {
+        videoEl.currentTime = resume / 1000;
+        // 不能用 toast：body.video-open 时它被藏掉了，播放器里看不到
+        showVideoHint(`已从 ${fmtDuration(resume)} 继续`);
+      }
+      state.video.resume = 0;
     }
-    state.video.resume = 0;
+    // 续播点可能正落在片头/片尾里：立刻判一次，别让人先愣在那儿
+    applyAutoSkip();
   });
 
   // 流开始出画面就把「正在转码」的提示条收掉，别一直挡着画面
@@ -2030,6 +2400,10 @@
       saveVideoProgress(false);
     }
   });
+
+  // 片头/片尾判定挂在 timeupdate 上：每秒约 4 次，只遍历最多两段，开销可忽略。
+  // 不能只靠 setInterval：暂停后手动拖动、或者流模式重连，位置都会跳着变。
+  videoEl.addEventListener('timeupdate', () => { applyAutoSkip(); });
 
   videoEl.addEventListener('pause', () => { saveVideoProgress(false); });
   videoEl.addEventListener('ended', () => {
@@ -2068,10 +2442,55 @@
     }
   });
 
+  /** 退出播放器可能残留的两种全屏
+   *
+   * - 文档级：`vOverlay.requestFullscreen()`，退出看 `document.exitFullscreen`；
+   * - 原生视频全屏：Android WebView 上 `videoEl.webkitEnterFullscreen()`，
+   *   它**不进** document.fullscreenElement，得单独喊 `webkitExitFullscreen`。
+   *
+   * 不退出会怎样：overlay 藏了、列表回来了，但页面仍是全屏态——系统把上下滑
+   * 当成「全屏媒体手势」（右侧调音量、左侧调亮度），列表就滑不动了。
+   */
+  function exitPlayerFullscreen() {
+    const doc = document;
+    if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+      try {
+        const pending = (doc.exitFullscreen || doc.webkitExitFullscreen).call(doc);
+        if (pending && pending.catch) pending.catch(() => {});
+      } catch (error) {
+        /* 有的 WebView 会抛 "Document not active"，退出失败也得继续收尾 */
+      }
+    }
+    if (videoEl.webkitDisplayingFullscreen && videoEl.webkitExitFullscreen) {
+      try {
+        videoEl.webkitExitFullscreen();
+      } catch (error) {
+        /* 同上 */
+      }
+    }
+  }
+
+  /** 清掉 ensureVideoFullscreen() 写下的内联几何，逼 WebView 按当前视口重建图层 */
+  function resetVideoGeometry() {
+    for (const key of ['position', 'top', 'left', 'right', 'bottom', 'width', 'height']) {
+      videoEl.style[key] = '';
+    }
+  }
+
   function closeVideo() {
     saveVideoProgress(false);
+    // 先退全屏再藏：反过来（先 hidden）会让 exitFullscreen 找不到还活着的全屏元素
+    exitPlayerFullscreen();
+    clearTimeout(state.video.refreshTimer);
+    state.video.refreshTimer = 0;
+    markOpStartMs = 0;
+    $('v-mark').hidden = true;
+    hideVideoHint();
     videoEl.pause();
     videoEl.removeAttribute('src');
+    // Android 7 WebView 的 <video> 是独立 SurfaceView：只靠父级 display:none
+    // 不一定拆得干净，自己在 display 上也断一次，下次 loadVideo 再打开
+    videoEl.style.display = 'none';
     videoEl.load();
     vOverlay.classList.remove('v-idle');
     if (vIdleTimer) { clearTimeout(vIdleTimer); vIdleTimer = 0; }
@@ -2081,14 +2500,7 @@
     state.video.info = null;
     document.body.style.overflow = '';
     document.body.classList.remove('video-open');
-    // 清掉 ensureVideoFullscreen() 写下的内联样式，别影响下一次
-    videoEl.style.position = '';
-    videoEl.style.top = '';
-    videoEl.style.left = '';
-    videoEl.style.right = '';
-    videoEl.style.bottom = '';
-    videoEl.style.width = '';
-    videoEl.style.height = '';
+    resetVideoGeometry();
   }
 
   $('v-close').addEventListener('click', closeVideo);
@@ -2111,6 +2523,7 @@
   $('p-prev').innerHTML = ICON.prev;
   $('p-next').innerHTML = ICON.next;
   $('v-play').innerHTML = ICON.play;
+  $('v-next').innerHTML = ICON.next;
   $('v-full').innerHTML = ICON.full;
 
   if (!location.hash) location.hash = '#/';

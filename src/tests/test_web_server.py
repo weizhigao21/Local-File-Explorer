@@ -27,6 +27,8 @@ from web_server.app import WebServer, build_url, ensure_token
 
 TOKEN = "testtoken9x"
 
+SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 # ==================== 夹具 ====================
 
@@ -1538,3 +1540,301 @@ def test_lightbox_supports_keyboard_paging():
     assert "event.key === 'ArrowLeft'" in js
     assert "event.key === 'ArrowRight'" in js
     assert "event.key === 'Escape'" in js
+
+
+# ==================== 片头 / 片尾跳过（网页端） ====================
+#
+# 网页端不另存一份数据：标记写的是 video_manager.db 的 skip_segments（作品级），
+# 逐集对齐结果写 skip_overrides。所以这里的重点不是「接口能通」，而是
+# **同一作品下每一集都拿到同一份计划**，以及坏输入不能把计划弄坏。
+
+def _first_work_videos():
+    work_id = library.video_works()[0]["id"]
+    return library.video_work_videos(work_id)["videos"]
+
+
+def _post_skip(port, video_id, payload):
+    return _get(
+        port,
+        f"/api/video/videos/{video_id}/skip",
+        cookie=TOKEN,
+        method="POST",
+        body=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def test_video_play_info_starts_without_skip(seeded):
+    video = _first_work_videos()[0]
+    info = library.video_play_info(video["id"])
+    assert info["skip"]["plan"] == []
+    assert info["skip"]["segments"] == []
+    assert info["skip"]["work_id"] == library.video_works()[0]["id"]
+
+
+def test_post_skip_op_applies_to_whole_work(server):
+    _instance, port = server
+    videos = _first_work_videos()
+    status, _headers, payload = _post_skip(
+        port, videos[0]["id"], {"kind": "op", "start_ms": 12000, "end_ms": 102000}
+    )
+    assert status == 200
+    assert json.loads(payload)["plan"] == [
+        {"kind": "op", "start_ms": 12000, "end_ms": 102000}
+    ]
+
+    # 同一作品的**另一集**也必须拿到同一段（这就是「标一次全剧通用」）
+    other = library.video_play_info(videos[1]["id"])
+    assert other["skip"]["plan"] == [{"kind": "op", "start_ms": 12000, "end_ms": 102000}]
+
+
+def test_post_skip_ed_open_ended_uses_duration(server):
+    """片尾只标起点（end=0）：终点由这一集的时长兜底"""
+    _instance, port = server
+    video = _first_work_videos()[0]
+    status, _headers, payload = _post_skip(
+        port, video["id"], {"kind": "ed", "start_ms": 540000, "end_ms": 0}
+    )
+    assert status == 200
+    plan = json.loads(payload)["plan"]
+    assert plan == [{"kind": "ed", "start_ms": 540000, "end_ms": 600000}]
+
+
+def test_post_skip_rejects_short_segment(server):
+    _instance, port = server
+    video = _first_work_videos()[0]
+    status, _headers, payload = _post_skip(
+        port, video["id"], {"kind": "op", "start_ms": 12000, "end_ms": 14000}
+    )
+    assert status == 400
+    assert "太短" in json.loads(payload)["error"]
+    assert library.video_play_info(video["id"])["skip"]["segments"] == []
+
+
+def test_post_skip_rejects_unknown_kind(server):
+    _instance, port = server
+    video = _first_work_videos()[0]
+    status, _headers, _payload = _post_skip(
+        port, video["id"], {"kind": "preview", "start_ms": 0, "end_ms": 90000}
+    )
+    assert status == 400
+
+
+def test_post_skip_clear_removes_both(server):
+    _instance, port = server
+    video = _first_work_videos()[0]
+    _post_skip(port, video["id"], {"kind": "op", "start_ms": 12000, "end_ms": 102000})
+    _post_skip(port, video["id"], {"kind": "ed", "start_ms": 540000, "end_ms": 0})
+    status, _headers, payload = _post_skip(port, video["id"], {"clear": True})
+    assert status == 200
+    assert json.loads(payload)["segments"] == []
+    assert library.video_play_info(video["id"])["skip"]["plan"] == []
+
+
+def test_aligned_absent_drops_segment_for_that_episode(seeded):
+    """对齐判定「这集没有片头」时，只影响这一集，别的集照跳"""
+    work_id = library.video_works()[0]["id"]
+    videos = _first_work_videos()
+    paths = [row["path"] for row in video_db.get_work_videos(work_id)]
+    video_db.set_skip_segment(work_id, "op", 12000, 102000, "")
+    video_db.set_skip_override(paths[0], "op", 0, 0, "absent")
+
+    assert library.video_play_info(videos[0]["id"])["skip"]["plan"] == []
+    assert library.video_play_info(videos[1]["id"])["skip"]["plan"] == [
+        {"kind": "op", "start_ms": 12000, "end_ms": 102000}
+    ]
+
+
+def test_skip_endpoint_requires_token(server):
+    _instance, port = server
+    video = _first_work_videos()[0]
+    assert _get(port, f"/api/video/videos/{video['id']}/skip")[0] == 401
+
+
+def test_video_players_share_one_skip_table():
+    """网页端与桌面播放器必须用同一套规则/同一张表，不能各记一份"""
+    for name in ("ui/video_player.py", "web_server/library.py"):
+        with open(os.path.join(SRC_DIR, name), encoding="utf-8") as handle:
+            source = handle.read()
+        assert "video_manager" in source
+        assert "skip_logic" in source or "skip as" in source
+        assert "build_plan" in source or "set_skip_segment" in source
+
+
+def test_overlay_has_skip_controls():
+    """播放器里的标记/提示元素必须真的存在——少一个 id，JS 当场 TypeError"""
+    html = _static_text("index.html")
+    js = _static_text("app.js")
+    for name in ("v-mark", "v-mark-op", "v-mark-ed", "v-mark-clear", "v-mark-info",
+                 "v-tag", "v-hint"):
+        assert f'id="{name}"' in html, f"index.html 缺 #{name}"
+        assert f"$('{name}')" in js, f"app.js 没有用到 #{name}"
+
+
+def test_video_toast_is_never_used_inside_player():
+    """播放时 #toast 是 display:none，播放器里的反馈必须走 #v-hint"""
+    js = _strip_comments_and_strings(_static_text("app.js"))
+    player_start = js.index("function openVideo(")
+    head, player = js[:player_start], js[player_start:]
+    # 播放器段里允许出现 toast( 吗？不允许：那是「用户看不见的提示」
+    assert "toast(" not in player.replace("showVideoHint(", ""), \
+        "播放器里用了 toast()，body.video-open 时它被隐藏，提示看不到"
+    assert "showVideoHint(" in player
+    assert head  # 只是为了让断言失败时能看出比较的是什么
+
+
+def test_auto_skip_does_not_repeat_after_manual_seek_back():
+    """用户手动拖回片头里看，这一集不能再被弹走（跳过一次就记下来）"""
+    js = _static_text("app.js")
+    assert "function markSkippedAt(" in js
+    assert "markSkippedAt(Math.round(target * 1000))" in js
+    assert "state.video.skipped[seg.kind] = true" in js
+
+
+# ==================== 下一集 ====================
+#
+# 网页端原本只有「片尾跳过 → 进下一集」和「播完 → 进下一集」两条隐式路径，
+# 没有「我现在就想看下一集」的按钮。加按钮的风险全在边界上：最后一集越界、
+# 切集前丢进度。所以这里断言的是**顺序**，不是「字符串存在」。
+
+def _js_function(name):
+    js = _static_text("app.js")
+    start = js.index(f"function {name}(")
+    return js[start:js.index("\n  }", start)]
+
+
+def test_player_has_next_episode_button():
+    html = _static_text("index.html")
+    js = _static_text("app.js")
+    assert 'id="v-next"' in html, "index.html 里没有下一集按钮"
+    assert "$('v-next')" in js, "app.js 没有绑定 #v-next"
+    # 按钮是空的 <button>，图标靠 JS 注入；漏了这行按钮在界面上是个透明圆圈
+    assert "$('v-next').innerHTML = ICON.next" in js
+
+
+def test_next_episode_stops_at_last_one():
+    body = _js_function("goNextEpisode")
+    assert "state.video.videos.length" in body
+    # 越界判断必须在 loadVideo 之前：反过来会拿 undefined 去读 .name
+    assert "return false" in body
+    assert body.index("return false") < body.index("loadVideo")
+
+
+def test_next_button_saves_progress_before_switching():
+    """timeupdate 是每 10 秒存一次，切集不先落盘会丢掉刚看的那一段"""
+    js = _static_text("app.js")
+    handler = js[js.index("$('v-next').addEventListener"):]
+    handler = handler[:handler.index("});")]
+    assert "saveVideoProgress(false)" in handler
+    assert handler.index("saveVideoProgress") < handler.index("goNextEpisode")
+
+
+def test_ed_skip_marks_watched_even_on_last_episode():
+    """最后一集的片尾跳也要上报「已看完」，否则续播点留在片尾，下次一打开又被跳"""
+    body = _js_function("finishEpisode")
+    assert "postProgress" in body
+    assert body.index("postProgress") < body.index("goNextEpisode")
+
+
+def test_next_button_is_dimmed_not_removed_on_last_episode():
+    """最后一集压暗而不是 display:none——按钮消失会让进度条左右跳一下"""
+    css = _static_text("style.css")
+    js = _static_text("app.js")
+    assert ".v-btn.dim" in css
+    assert "classList.toggle('dim'" in js
+
+
+# ==================== 全屏退出后的收尾 ====================
+#
+# 真机踩到的：全屏看视频 → 点关闭回列表 → 页面其实还在全屏态（overlay 藏了，
+# document.fullscreenElement 还是它）。Android 把这当成「全屏媒体」，上下滑
+# 被系统吃掉去调音量，列表就滑不动。所以关闭必须先退全屏，再隐藏。
+
+def test_close_video_exits_fullscreen_before_hiding():
+    body = _js_function("closeVideo")
+    assert "exitPlayerFullscreen()" in body
+    # 顺序不能反：先 hidden 的话，exitFullscreen 面对的是已经不可见的全屏元素
+    assert body.index("exitPlayerFullscreen") < body.index("$('video-overlay').hidden = true")
+
+
+def test_exit_fullscreen_handles_native_video_fullscreen():
+    """Android WebView 的原生视频全屏不进 document.fullscreenElement，得单独退出"""
+    body = _js_function("exitPlayerFullscreen")
+    assert "fullscreenElement" in body
+    assert "webkitDisplayingFullscreen" in body
+    assert "webkitExitFullscreen" in body
+
+
+def test_fullscreen_end_is_cleaned_up_whatever_ends_it():
+    """系统返回键退出全屏（不经过我们的按钮）也要收尾，否则几何/滚动锁留在旧视口"""
+    js = _static_text("app.js")
+    assert "videoEl.addEventListener('webkitendfullscreen'" in js
+    assert "document.addEventListener('fullscreenchange'" in js
+    body = _js_function("onFullscreenSettled")
+    assert "body.style.overflow = ''" in body
+    assert "classList.remove('video-open')" in body
+
+
+def test_video_element_is_detached_on_close_and_reattached_on_load():
+    """Android 7 的 <video> 是独立 SurfaceView：只靠父级 display:none 不一定拆干净"""
+    assert "videoEl.style.display = 'none'" in _js_function("closeVideo")
+    assert "videoEl.style.display = ''" in _js_function("loadVideo")
+
+
+# ==================== 转码视频拖动不能从头播 ====================
+#
+# 真机：需要转码的片子点/拖进度条，有几率回到 00:00。两处成因：
+# 1. 整集转码缓存刚好在播放中转完 → 服务端把整文件从头端过来（fMP4 没时长，
+#    浏览器只能从 0 播），而前端还按「流从 start 开始」算 offset；
+# 2. 时长没探到时滑块换算恒为 0，提交一次就等于让服务端从 0 重新起转。
+
+def test_cached_transcode_honours_start():
+    path = os.path.join(SRC_DIR, "web_server", "app.py")
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    body = text[text.index("def _play_cached"):]
+    body = body[:body.index("def _stream_pipe")]
+    assert "start > 0" in body, "缓存命中时要区分有没有 start"
+    # 带 start 必须先切片；整文件只能发给 start <= 0 那支
+    assert body.index("_stream_pipe") < body.index("_serve_file")
+
+
+def test_stream_pipe_can_read_from_cache_file():
+    path = os.path.join(SRC_DIR, "web_server", "app.py")
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "def _stream_pipe(self, video, mode, start, encoder, source=None)" in text
+    assert "source or video[\"path\"]" in text
+
+
+def test_transcode_uses_short_gop():
+    """`-c:v copy` 切段只能从关键帧起：GOP 太大，拖动会落到十秒之前"""
+    from web_server import transcode
+
+    for encoder in ("h264_nvenc", "h264_qsv", "h264_amf", None):
+        args = transcode._video_args(encoder)
+        assert "-g" in args, encoder
+        gop = int(args[args.index("-g") + 1])
+        assert 8 <= gop <= 120, f"{encoder}: GOP {gop} 帧太大，seek 落点会飘"
+
+
+def test_seek_does_not_restart_when_duration_unknown():
+    body = _js_function("commitVideoSeek")
+    assert "if (!videoDuration())" in body
+    # 这个拦截必须在 startStream 之前：否则 target 恒为 0，一拖就重连到 0
+    assert body.index("if (!videoDuration())") < body.index("startStream(")
+
+
+def test_cached_transcode_is_streamed_not_played_as_file():
+    """缓存好了也不能当普通 mp4 播
+
+    转码输出是 fMP4 分片，没有可 seek 的索引（实测 duration 只报 4.8s、
+    seekable.end(0)=0，`currentTime = 60` 被忽略、画面退回 1.2s）。把它直接
+    塞给 `<video>`，续播点和拖动都会变成「从头开始」——正是用户报的现象。
+    """
+    body = _js_function("loadVideo")
+    assert "startStream(" in body, "非 direct 的集要走流"
+    assert "mode === 'direct' || info.cached" not in body, \
+        "缓存命中不能走直连分支（fMP4 seek 不了）"
+    # info.cached 只留着决定要不要弹「开头等几秒」
+    assert "Boolean(info.cached)" in body

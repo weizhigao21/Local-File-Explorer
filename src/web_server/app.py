@@ -53,6 +53,11 @@ REMUX_WAIT_SECONDS = 20
 # 否则「一边转码一边翻看另一集」会互相卡死
 _TRANSCODE_SLOTS = threading.Semaphore(1)
 
+# 逐集片头对齐：每集只跑一次（结果落库），正在跑的记在这里防重复起线程。
+# 解码两段音频约 1 秒，放后台跑；前端拿到 plan 后过一会儿再拉一次就精确了。
+_ALIGN_LOCK = threading.Lock()
+_ALIGNING = set()
+
 # 列表接口默认分页：切换模块只拉一页，几万条也不会把手机端拖死
 DEFAULT_PAGE_SIZE = library.PAGE_DEFAULT
 MAX_PAGE_SIZE = library.PAGE_MAX
@@ -99,6 +104,8 @@ _ROUTE_DEFS = [
     ("GET", r"^/api/video/works$", "api_video_works"),
     ("GET", r"^/api/video/works/(\d+)/videos$", "api_video_work_videos"),
     ("GET", r"^/api/video/videos/(\d+)$", "api_video_info"),
+    ("GET", r"^/api/video/videos/(\d+)/skip$", "api_video_skip"),
+    ("POST", r"^/api/video/videos/(\d+)/skip$", "api_video_skip_mark"),
     ("POST", r"^/api/video/videos/(\d+)/progress$", "api_video_save_progress"),
     # 媒体
     ("GET", r"^/media/photo/(\d+)$", "media_photo"),
@@ -137,6 +144,18 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch("POST")
 
+    def handle_one_request(self):
+        """长连接被客户端掐断时别让 socketserver 刷栈
+
+        手机/浏览器关页面会直接断开 keep-alive 连接，此时服务端正卡在
+        `rfile.readline()` 等下一个请求，抛的是 ConnectionReset/Aborted。
+        这属于正常现象，不是错误——不接住就会在控制台刷一整段 Traceback。
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            self.close_connection = True
+
     # ---------- 分发 ----------
 
     def _dispatch(self, method):
@@ -164,8 +183,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return getattr(self, handler_name)(match, query)
 
             return self._json({"error": "没有这个接口"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
-            # 手机上快速滑走/拖动进度条会主动断连，不是错误
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 手机上快速滑走/拖动进度条会主动断连，不是错误。
+            # Windows 下这条还常常是 ConnectionAborted（10053），一并吞掉，
+            # 否则控制台会刷一整屏「服务器内部错误」的栈。
             return None
         except Exception as e:  # noqa: BLE001 - 单个请求出错不能拖垮服务线程
             traceback.print_exc()
@@ -441,22 +462,62 @@ class RequestHandler(BaseHTTPRequestHandler):
         return self._json(data)
 
     def api_video_info(self, match, query):
-        data = library.video_play_info(int(match.group(1)))
+        video_id = int(match.group(1))
+        data = library.video_play_info(video_id)
         if data is None:
             return self._json({"error": "视频不存在"}, 404)
+        # 打开一集就顺手在后台把它对齐一次（约 1 秒，不挡播放）：
+        # 前端的片头计划先用作品模板，对齐完再拉一次就精确到这一集
+        started = _start_align(video_id)
+        data["aligning"] = bool(started) or _align_in_flight(video_id)
+        return self._json(data)
+
+    def api_video_skip(self, match, query):
+        """只取跳过计划（前端在后台对齐完成后用它刷新，不必重取整份播放信息）"""
+        video_id = int(match.group(1))
+        data = library.video_skip_state_by_id(video_id)
+        if data is None:
+            return self._json({"error": "视频不存在"}, 404)
+        # 上一轮没对齐成（状态 unknown）时，这次请求再给一次机会
+        started = _start_align(video_id)
+        data["aligning"] = bool(started) or _align_in_flight(video_id)
+        return self._json(data)
+
+    def api_video_skip_mark(self, match, query):
+        """手机端标记片头/片尾（写作品级模板）或清除标记
+
+        请求体：{"kind": "op"/"ed", "start_ms": int, "end_ms": int}
+                {"clear": true}            → 清掉本作品两种标记
+                {"kind": "ed", "clear": true} → 只清片尾
+        """
+        video_id = int(match.group(1))
+        payload, error, status = self._read_json_body()
+        if error:
+            return self._json({"error": error}, status)
+
+        if payload.get("clear"):
+            kind = _text_value(payload.get("kind"))
+            data = library.clear_video_skip(video_id, kind or None)
+            if data is None:
+                return self._json({"error": "视频不存在"}, 404)
+            return self._json(data)
+
+        kind = _text_value(payload.get("kind"))
+        duration = _int_value(payload.get("duration_ms"))
+        data, message = library.save_video_skip(
+            video_id, kind,
+            _int_value(payload.get("start_ms")),
+            _int_value(payload.get("end_ms")),
+            duration or None,
+        )
+        if data is None:
+            return self._json({"error": message or "标记失败"}, 400)
         return self._json(data)
 
     def api_video_save_progress(self, match, query):
-        length = http_util.parse_byte_size(self.headers.get("Content-Length"))
-        if length > MAX_JSON_BODY:
-            return self._json({"error": "请求体过大"}, 413)
-        raw = self.rfile.read(length) if length else b""
-        try:
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
-        except (ValueError, UnicodeDecodeError):
-            return self._json({"error": "请求体不是合法 JSON"}, 400)
-        if not isinstance(payload, dict):
-            return self._json({"error": "请求体必须是对象"}, 400)
+        payload, error, status = self._read_json_body()
+        if error:
+            return self._json({"error": error}, status)
 
         ok = library.save_video_progress(
             int(match.group(1)),
@@ -466,6 +527,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not ok:
             return self._json({"error": "视频不存在"}, 404)
         return self._json({"ok": True})
+
+    def _read_json_body(self):
+        """读一个小 JSON 对象 → (dict, 错误文案, 该回的状态码)"""
+        length = http_util.parse_byte_size(self.headers.get("Content-Length"))
+        if length > MAX_JSON_BODY:
+            return {}, "请求体过大", 413
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            return {}, "请求体不是合法 JSON", 400
+        if not isinstance(payload, dict):
+            return {}, "请求体必须是对象", 400
+        return payload, "", 200
 
     # ---------- 媒体 ----------
 
@@ -540,7 +615,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         # ---- 重编码 ----
         cached = transcode.cache_path(video)
         if cached and os.path.isfile(cached):
-            return self._serve_file(cached, content_type="video/mp4", max_age=600)
+            return self._play_cached(video, cached, start)
 
         ffmpeg = probe.find_tool("ffmpeg")
         if not ffmpeg:
@@ -552,11 +627,31 @@ class RequestHandler(BaseHTTPRequestHandler):
         # 整集转码放后台：用户从续播点看、或者中途退出，都不影响它转完落盘
         job, has_cache = transcode.ensure_job(video, ffmpeg, encoder)
         if has_cache and cached:
-            return self._serve_file(cached, content_type="video/mp4", max_age=600)
+            return self._play_cached(video, cached, start)
         if job and start <= 0:
             return self._tail_job(job)
         # 拖动 / 续播：即时从目标点转，后台那个 job 继续把整集备好
         return self._stream_pipe(video, mode, start, encoder)
+
+    def _play_cached(self, video, cached, start):
+        """整集转码缓存已经落盘时怎么发
+
+        `start <= 0` 时直接发文件：支持 Range，秒开。
+
+        `start > 0` 时**绝不能**直接发整个文件——缓存是 fMP4，没有全局时长，
+        而前端按「这条流从 start 开始」来算展示时间与 offset。把整文件从头
+        端过去，浏览器就从 00:00 开始播，用户明明拖到了第 10 分钟却回到开头
+        （「点了进度条有几率从头播」的根因，缓存刚好在播放中转完时必现）。
+
+        缓存本身已是 h264+aac，从目标点切一段只要 `-c:v copy`，几百毫秒。
+        不能改用「Range 请求 + 前端 seek」：fMP4 没有 mvhd 时长，浏览器拿不到
+        可 seek 的索引，`currentTime = 300` 往往直接被忽略。
+        """
+        if start > 0:
+            return self._stream_pipe(
+                video, http_util.MODE_REMUX, start, None, source=cached
+            )
+        return self._serve_file(cached, content_type="video/mp4", max_age=600)
 
     def _tail_job(self, job):
         """跟着后台转码任务的输出文件读：写多少发多少，读完即整集结束"""
@@ -590,12 +685,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                     print(f"[网页转码] 任务超时放弃: {job.key}")
                     break
                 time.sleep(0.05)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         return
 
-    def _stream_pipe(self, video, mode, start, encoder):
-        """起 ffmpeg 把 fMP4 边转边吐给前端（用于换封装与拖动重连）"""
+    def _stream_pipe(self, video, mode, start, encoder, source=None):
+        """起 ffmpeg 把 fMP4 边转边吐给前端（用于换封装与拖动重连）
+
+        `source`：实际喂给 ffmpeg 的文件。默认源片；传转码缓存时就是
+        「从已转好的整集里切一段」（`-c:v copy`，秒开）。
+        """
         ffmpeg = probe.find_tool("ffmpeg")
         if not ffmpeg:
             return self._json({"error": "服务器未安装 ffmpeg，无法处理这个视频"}, 503)
@@ -606,7 +705,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             busy = "正在转码另一集，请稍后再试" if transcoding else "正在转封装另一集，请稍后再试"
             return self._json({"error": busy}, 503)
 
-        cmd = transcode.build_cmd(ffmpeg, video["path"], mode, start, encoder)
+        cmd = transcode.build_cmd(ffmpeg, source or video["path"], mode, start, encoder)
         try:
             proc = subprocess.Popen(  # noqa: S603 - 参数为内部路径，无 shell
                 cmd,
@@ -635,7 +734,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             # 手机上拖进度条会主动断开，不是错误
             pass
         finally:
@@ -865,6 +964,62 @@ def _int_param(query, name, default=0):
         return int(values[0])
     except (TypeError, ValueError):
         return default
+
+
+def _int_value(value, default=0):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _text_value(value):
+    return value.strip() if isinstance(value, str) else ""
+
+
+# ==================== 逐集片头对齐（后台） ====================
+
+def _align_in_flight(video_id):
+    with _ALIGN_LOCK:
+        return int(video_id) in _ALIGNING
+
+
+def _start_align(video_id):
+    """没对齐过就起一个后台线程；已经在跑 / 不需要对齐返回 False
+
+    不值得对齐的情况（没标过片头、已经算过、这集就是基准集、没装 ffmpeg）
+    全交给 `library.skip_needs_align` 判断，这里只管线程。
+    """
+    video_id = int(video_id)
+    with _ALIGN_LOCK:
+        if video_id in _ALIGNING:
+            return False
+        _ALIGNING.add(video_id)
+
+    try:
+        needed = library.skip_needs_align(video_id)
+    except Exception as e:  # noqa: BLE001 - 判断失败就当不需要，别起线程
+        print(f"[网页片头对齐] 判断失败: {e}")
+        needed = False
+
+    if not needed:
+        with _ALIGN_LOCK:
+            _ALIGNING.discard(video_id)
+        return False
+
+    def run():
+        try:
+            status = library.align_video_skip(video_id)
+            if status not in ("cached", "skip"):
+                print(f"[网页片头对齐] 视频 {video_id}: {status}")
+        except Exception as e:  # noqa: BLE001 - 对齐失败只该「不跳」，不能带走服务线程
+            print(f"[网页片头对齐] 失败 {video_id}: {e}")
+        finally:
+            with _ALIGN_LOCK:
+                _ALIGNING.discard(video_id)
+
+    threading.Thread(target=run, daemon=True, name=f"web-op-align-{video_id}").start()
+    return True
 
 
 def _float_param(query, name, default=0.0):

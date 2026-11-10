@@ -22,9 +22,11 @@ from audio_manager import subtitles as audio_subtitles
 from resource_manager import config
 from resource_manager import database as photo_db
 from resource_manager.utils import natural_key as photo_natural_key
+from video_manager import align as skip_align
 from video_manager import database as video_db
 from video_manager import probe
 from video_manager import scanner as video_scanner
+from video_manager import skip as skip_logic
 from video_manager.progress import decide_progress
 from web_server import http_util, transcode
 
@@ -840,10 +842,12 @@ def video_play_info(video_id):
     # 不用再走「?start= 重连」那套，进度条也就不需要凭数据库时长偏算
     converted = transcode.cache_path(video)
     cached = bool(converted and os.path.isfile(converted))
+    duration_ms = int(video.get("duration_ms") or duration or 0)
     return {
         "id": video["id"],
         "name": video["name"],
-        "duration_ms": int(video.get("duration_ms") or duration or 0),
+        "work_id": int(video.get("work_id") or 0),
+        "duration_ms": duration_ms,
         "position_ms": int(position),
         "codec": codec,
         "ext": ext,
@@ -853,7 +857,177 @@ def video_play_info(video_id):
         "url": f"/media/video/{video['id']}",
         "stream_url": f"/media/video-stream/{video['id']}",
         "remux_url": f"/media/video-remux/{video['id']}",
+        # 片头/片尾跳过：和桌面播放器读同一份数据，谁标的一次都全剧通用
+        "skip": video_skip_state(video, duration_ms),
     }
+
+
+# ==================== 片头 / 片尾跳过 ====================
+#
+# 规则复用 `video_manager.skip`（纯函数），逐集微调复用 `video_manager.align`
+# （音频包络对齐）。网页端只做三件事：算出「这一集该跳哪几段」给前端、
+# 把手机上按下的标记写回同一张表、在第一次打开某集时跑一次后台对齐。
+#
+# 关键点：数据按**作品**记（`skip_segments`），逐集结果按**文件**记
+# （`skip_overrides`）。所以手机上标一次，电脑端打开同一部动画也会自动跳。
+
+def skip_flags():
+    """两个开关（桌面端设置面板里改，这里只读）→ (跳片头, 跳片尾)"""
+    return (
+        bool(getattr(config, "VIDEO_SKIP_OP", True)),
+        bool(getattr(config, "VIDEO_SKIP_ED", True)),
+    )
+
+
+def video_skip_state(video, duration_ms=None):
+    """当前这一集真正要跳的区间
+
+    前端拿到的是**毫秒**，直接跟 `currentTime * 1000` 比，不用再算一遍规则。
+    `plan` 为空是常态：作品还没标记过 / 两段都被对齐判定为「这集没有」。
+    """
+    if not video:
+        return {"work_id": 0, "segments": [], "plan": [], "enabled": {"op": True, "ed": True}}
+    work_id = int(video.get("work_id") or 0)
+    if duration_ms is None:
+        duration_ms = video.get("duration_ms") or 0
+    duration_ms = int(duration_ms or 0)
+    segments = video_db.get_skip_segments(work_id) if work_id else {}
+    overrides = video_db.get_skip_overrides(video.get("path") or "")
+    skip_op, skip_ed = skip_flags()
+    plan = skip_logic.build_plan(
+        segments, overrides, duration_ms, skip_op=skip_op, skip_ed=skip_ed
+    )
+    return {
+        "work_id": work_id,
+        "duration_ms": duration_ms,
+        "enabled": {"op": skip_op, "ed": skip_ed},
+        "segments": [
+            {
+                "kind": kind,
+                "start_ms": int(seg.get("start_ms") or 0),
+                "end_ms": int(seg.get("end_ms") or 0),
+            }
+            for kind, seg in sorted(segments.items())
+        ],
+        "plan": [
+            {"kind": kind, "start_ms": int(start), "end_ms": int(end)}
+            for kind, start, end in plan
+        ],
+    }
+
+
+def video_skip_state_by_id(video_id, duration_ms=None):
+    video = video_by_id(video_id)
+    if not video:
+        return None
+    return video_skip_state(video, duration_ms)
+
+
+def save_video_skip(video_id, kind, start_ms, end_ms, duration_ms=None):
+    """写作品级模板（手机上的「标片头 / 标片尾」）
+
+    返回 (状态或 None, 错误文案)。写库失败与参数不合法都只回错误，不抛异常——
+    跳片头是锦上添花，不能因为它把播放页搞崩。
+    """
+    video = video_by_id(video_id)
+    if not video:
+        return None, "视频不存在"
+    if kind not in skip_logic.KINDS:
+        return None, "只能标记片头或片尾"
+    work_id = int(video.get("work_id") or 0)
+    if not work_id:
+        return None, "这个视频没有归属作品，无法全剧通用"
+
+    try:
+        start = max(0, int(start_ms or 0))
+        end = max(0, int(end_ms or 0))
+    except (TypeError, ValueError):
+        return None, "时间点不是数字"
+
+    # 片尾允许 end=0（「一直到文件结尾」）；片头必须有终点
+    if end and end - start < skip_logic.MIN_SEGMENT_MS:
+        return None, "这段太短了，多半是标偏了"
+    if not end and kind == skip_logic.OP:
+        return None, "片头需要起点和终点两个时间点"
+
+    if not video_db.set_skip_segment(work_id, kind, start, end, video["path"]):
+        return None, "写入失败，数据库可能被占用"
+    return video_skip_state(video, duration_ms), ""
+
+
+def clear_video_skip(video_id, kind=None):
+    """清除本作品的标记（kind 为空时两种都清）"""
+    video = video_by_id(video_id)
+    if not video:
+        return None
+    work_id = int(video.get("work_id") or 0)
+    if not work_id:
+        return None
+    video_db.clear_skip_segment(work_id, kind if kind in skip_logic.KINDS else None)
+    return video_skip_state(video)
+
+
+def skip_needs_align(video_id):
+    """这一集还缺逐集对齐吗（缺则值得起一次后台对齐）"""
+    video = video_by_id(video_id)
+    if not video:
+        return False
+    work_id = int(video.get("work_id") or 0)
+    if not work_id:
+        return False
+    op = video_db.get_skip_segments(work_id).get(skip_logic.OP)
+    if not op:
+        return False
+    if video_db.get_skip_overrides(video.get("path") or "").get(skip_logic.OP):
+        return False
+    ref = op.get("source_path") or ""
+    if ref and _same_file(ref, video.get("path") or ""):
+        return False  # 当前就是基准那一集，模板本身最准
+    return skip_align.available()
+
+
+def align_video_skip(video_id):
+    """把作品模板对齐到这一集（**阻塞**，约 1 秒；调用方放后台线程里跑）
+
+    结果写进 `skip_overrides`，之后这集不再重复解码。返回 status
+    （ok / absent / unknown / cached / skip），只用于日志。
+    """
+    video = video_by_id(video_id)
+    if not video:
+        return "skip"
+    work_id = int(video.get("work_id") or 0)
+    op = video_db.get_skip_segments(work_id).get(skip_logic.OP) if work_id else None
+    if not op:
+        return "skip"
+    path = video.get("path") or ""
+    if video_db.get_skip_overrides(path).get(skip_logic.OP):
+        return "cached"
+
+    ref = op.get("source_path") or ""
+    start = int(op.get("start_ms") or 0)
+    end = int(op.get("end_ms") or 0)
+    if end - start < skip_logic.MIN_SEGMENT_MS:
+        return "skip"
+
+    result = skip_align.align_op(path, ref, start, end)
+    status = str(result.get("status") or "unknown")
+    if status in ("ok", "absent"):
+        video_db.set_skip_override(
+            path, skip_logic.OP,
+            int(result.get("start_ms") or 0), int(result.get("end_ms") or 0), status,
+        )
+    return status
+
+
+def _same_file(left, right):
+    if not left or not right:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+            os.path.abspath(right)
+        )
+    except OSError:
+        return False
 
 
 def save_video_progress(video_id, position_ms, duration_ms):
