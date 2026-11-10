@@ -193,12 +193,29 @@ def list_all_authors():
         return [(row["id"], row["name"]) for row in rows]
 
 
-def list_works(author_id=None):
-    """作品卡片数据：作者名、视频数、总时长"""
+# 排序白名单：网页端 `?sort=` 的值只映射到这几条固定 SQL，不做字符串拼接。
+# 名称序与桌面端作品墙一致（`a.name, w.name`，SQLite 的 BINARY 序），
+# 免得同一个库在电脑和手机上顺序不一样。
+_WORKS_ORDER = {
+    "name_asc": "a.name, w.name",
+    "name_desc": "a.name DESC, w.name DESC",
+    "time_desc": "mtime DESC, a.name, w.name",
+    "time_asc": "mtime ASC, a.name, w.name",
+}
+
+
+def list_works(author_id=None, order="name_asc"):
+    """作品卡片数据：作者名、视频数、总时长
+
+    mtime 取作品内最新一集的文件时间：作品目录本身不在库里，
+    「这部片子什么时候进的库」最能被它代表的就这个。
+    """
+    order_sql = _WORKS_ORDER.get(order, _WORKS_ORDER["name_asc"])
     sql = """
         SELECT w.id, w.name, w.path, w.thumbnail, a.name AS author,
                COUNT(v.id) AS video_count,
-               COALESCE(SUM(v.duration_ms), 0) AS total_duration_ms
+               COALESCE(SUM(v.duration_ms), 0) AS total_duration_ms,
+               COALESCE(MAX(v.mtime), 0) AS mtime
         FROM works w
         JOIN authors a ON a.id = w.author_id
         LEFT JOIN videos v ON v.work_id = w.id
@@ -207,7 +224,7 @@ def list_works(author_id=None):
     if author_id is not None:
         sql += " WHERE w.author_id = ?"
         params = (author_id,)
-    sql += " GROUP BY w.id ORDER BY a.name, w.name"
+    sql += f" GROUP BY w.id ORDER BY {order_sql}"
 
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()

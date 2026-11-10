@@ -279,3 +279,25 @@ def parse_byte_size(text):
     except (TypeError, ValueError):
         return 0
     return value if value > 0 else 0
+
+
+# ==================== 列表排序 ====================
+# 写真 / 视频 / 音频三个模块共用一套排序值，与桌面端音频模块的四个选项一一对应。
+# 值本身只在这四个里挑，真正的 ORDER BY 由各数据层按这个值查表拼出——
+# 绝不把 query 里的字符串直接拼进 SQL。
+
+SORT_NAME_ASC = "name_asc"
+SORT_NAME_DESC = "name_desc"
+SORT_TIME_DESC = "time_desc"
+SORT_TIME_ASC = "time_asc"
+SORT_ORDERS = (SORT_NAME_ASC, SORT_NAME_DESC, SORT_TIME_DESC, SORT_TIME_ASC)
+DEFAULT_SORT = SORT_NAME_ASC
+
+
+def resolve_sort(value, allowed=SORT_ORDERS):
+    """把 `?sort=` 收敛到白名单内的值，非法/缺失一律回默认
+
+    `allowed` 让个别列表只提供部分排序（比如「继续观看」只有时间一种）。
+    """
+    value = (value or "").strip().lower()
+    return value if value in allowed else (allowed[0] if allowed else DEFAULT_SORT)

@@ -220,6 +220,47 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
 
 .section-title strong { color: var(--text-2); font-size: 15px; font-weight: 600; }
 
+/* 排序下拉：贴在标题行右侧
+ *
+ * 外层 div 只负责画箭头——<select> 是替换元素，匿名内容盒子不吃 ::after，
+ * 直接把三角画在 select 上是画不出来的。select 自己去掉系统外观与边框，
+ * 由外层提供胶囊底。圆角写 15px = 半高（高度 30），超过半高会退化成直角。
+ */
+.section-title .sort-wrap {
+  position: relative;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+}
+
+.sort-wrap::after {
+  content: '';
+  position: absolute;
+  right: 11px;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--text-3);
+  pointer-events: none;
+}
+
+.sort-select {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 30px;
+  padding: 0 24px 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--card);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+}
+
+.sort-select:focus { outline: none; border-color: var(--line-hi); }
+
 /* 首页三张入口卡 */
 
 .home-cards { display: grid; gap: 12px; }

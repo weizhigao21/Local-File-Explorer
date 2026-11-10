@@ -258,14 +258,18 @@ def photo_works(author_id=None, keyword=""):
     ]
 
 
-def photo_works_page(author_id=None, keyword="", page=1, page_size=0):
+def photo_works_page(author_id=None, keyword="", page=1, page_size=0, sort=""):
     """分页版写真作品列表（网页端用）：切到写真页只拉一页，不再一次全量
 
     总数与当页都在 SQL 里算（LIMIT/OFFSET），命中多少条由关键词决定，
     不再「读全表 → Python 过滤 → 内存切片」。
+
+    sort 走 `http_util.resolve_sort` 收敛成白名单值，再交给 `photo_db` 查表拼 ORDER BY。
     """
     page, page_size = _page_args(page, page_size)
-    total, rows = photo_db.list_works_page(author_id, keyword, page, page_size)
+    total, rows = photo_db.list_works_page(
+        author_id, keyword, page, page_size, http_util.resolve_sort(sort)
+    )
     items = [
         {
             "id": w["id"],
@@ -563,18 +567,42 @@ def audio_playlists(parent=""):
     return _playlist_briefs(rows)
 
 
-def audio_playlists_page(parent="", page=1, page_size=0):
-    """分页版歌单列表（网页端用）：SQL 里就切好页，不再把整库读进内存"""
+# 歌单排序白名单：与 `http_util.SORT_ORDERS` 的键一一对应，值只可能是这四条 SQL 之一
+_PLAYLIST_ORDER = {
+    "name_asc": "LOWER(name), path",
+    "name_desc": "LOWER(name) DESC, path",
+    "time_desc": "mtime DESC, LOWER(name)",
+    "time_asc": "mtime ASC, LOWER(name)",
+}
+
+
+def _escape_like(text):
+    """转义 LIKE 通配符，让用户输入的 % 和 _ 按字面匹配"""
+    return str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def audio_playlists_page(parent="", keyword="", page=1, page_size=0, sort=""):
+    """分页版歌单列表（网页端用）：SQL 里就切好页，不再把整库读进内存
+
+    搜索范围与桌面端一致：只在**当前这一层**的歌单名里找，不跨层级递归——
+    否则搜出来的结果连自己在哪一层都说不清，点进去还得先找路。
+    """
     parent = parent or ""
     page, page_size = _page_args(page, page_size)
-    total = _scalar(
-        audio_db, "SELECT COUNT(*) AS c FROM playlists WHERE parent_path = ?", (parent,)
-    )
+    keyword = (keyword or "").strip()
+    where = "parent_path = ?"
+    params = [parent]
+    if keyword:
+        where += " AND name LIKE ? ESCAPE '\\'"
+        params.append(f"%{_escape_like(keyword)}%")
+    order_sql = _PLAYLIST_ORDER.get(http_util.resolve_sort(sort), _PLAYLIST_ORDER["name_asc"])
+
+    total = _scalar(audio_db, f"SELECT COUNT(*) AS c FROM playlists WHERE {where}", tuple(params))
     rows = _rows(
         audio_db,
-        f"SELECT {_PLAYLIST_COLS} FROM playlists WHERE parent_path = ? "
-        f"ORDER BY name LIMIT ? OFFSET ?",
-        (parent, page_size, (page - 1) * page_size),
+        f"SELECT {_PLAYLIST_COLS} FROM playlists WHERE {where} "
+        f"ORDER BY {order_sql} LIMIT ? OFFSET ?",
+        tuple(params) + (page_size, (page - 1) * page_size),
     )
     return _page_result(_playlist_briefs(rows), total, page, page_size)
 
@@ -692,8 +720,8 @@ def video_authors():
     ]
 
 
-def video_works(author_id=None, keyword=""):
-    works = video_db.list_works(author_id)
+def video_works(author_id=None, keyword="", sort=""):
+    works = video_db.list_works(author_id, http_util.resolve_sort(sort))
     keyword = (keyword or "").strip().lower()
     if keyword:
         works = [
@@ -714,9 +742,14 @@ def video_works(author_id=None, keyword=""):
     ]
 
 
-def video_works_page(author_id=None, keyword="", page=1, page_size=0):
-    """分页版视频作品列表（网页端用）"""
-    return _paged(video_works(author_id, keyword), page, page_size)
+def video_works_page(author_id=None, keyword="", page=1, page_size=0, sort=""):
+    """分页版视频作品列表（网页端用）
+
+    排序下推到 SQL（`video_db.list_works` 的 order 参数）；关键词仍在内存里过滤——
+    视频作品总数是几百量级，全量取出来筛一次比给 `list_works` 再开一条带
+    `JOIN videos` 的 LIKE 查询更省，也不会把「一集都没有的作品」漏掉。
+    """
+    return _paged(video_works(author_id, keyword, sort), page, page_size)
 
 
 def video_resume(keyword="", page=1, page_size=0):

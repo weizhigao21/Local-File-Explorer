@@ -183,6 +183,9 @@
   // ---------------- 状态 ----------------
   const state = {
     search: '',
+    // 当前列表的排序（空 = 默认「名称 A-Z」）。放 URL 里，
+    // 从详情页退回来、下拉刷新都还是同一份顺序
+    sort: '',
     summary: null,
     token: 0,
     // 当前列表页的「重绘」（搜索用）与「滚到底续页」
@@ -242,10 +245,67 @@
     return el('div', { class: 'section-title' }, el('strong', { text }), extra ? el('span', { text: extra }) : null);
   }
 
+  /* 排序选项与桌面端音频模块的四个下拉项一一对应（名称 A-Z / Z-A / 时间新→旧 / 旧→新）。
+   * 用原生 <select>：老 WebView（Chrome 51~59）上自绘下拉要做到底部弹层，还要自己处理
+   * 点外部关闭、滚动定位；原生控件点一下就是系统选择器，这些一律免费。
+   */
+  const SORT_OPTIONS = [
+    { value: '', label: '名称 A-Z' },
+    { value: 'name_desc', label: '名称 Z-A' },
+    { value: 'time_desc', label: '时间 新→旧' },
+    { value: 'time_asc', label: '时间 旧→新' },
+  ];
+
+  function buildSortSelect() {
+    const select = el('select', {
+      class: 'sort-select',
+      'aria-label': '排序方式',
+      onchange: (event) => applySort(event.target.value),
+    });
+    SORT_OPTIONS.forEach((option) => {
+      select.append(el('option', { value: option.value, text: option.label }));
+    });
+    select.value = state.sort || '';
+    // 外面套一层只为了画那个小箭头：<select> 是替换元素，::after 在它身上不生效；
+    // 不套的话只能留着系统默认的箭头，各平台长得都不一样
+    return el('div', { class: 'sort-wrap' }, select);
+  }
+
+  /** 切换排序：先刷新列表，再改地址栏
+   *
+   * 用 history.replaceState 而不是改 location.hash——后者会触发 hashchange →
+   * render() 整页重建（连作者列表都要重拉一遍），切个排序闪一下不值当。
+   */
+  function applySort(value) {
+    state.sort = value || '';
+    replaceHashQuery('sort', state.sort);
+    // 详情页的「返回」用的是进列表时记下的地址：不同步的话，
+    // 从作品里退回来顺序又变回默认，看着像排序没生效
+    const { parts } = parseHash();
+    if (parts.length === 1 && lastListHash[parts[0]] !== undefined) {
+      lastListHash[parts[0]] = location.hash || `#/${parts[0]}`;
+    }
+    if (state.repaint) state.repaint();
+  }
+
+  /** 只改 hash 里的某个查询参数，不触发路由重跑 */
+  function replaceHashQuery(key, value) {
+    const { parts, query } = parseHash();
+    if (value) query.set(key, value);
+    else query.delete(key);
+    const qs = query.toString();
+    const base = `#/${parts.join('/')}`;
+    try {
+      history.replaceState(null, '', qs ? `${base}?${qs}` : base);
+    } catch (error) {
+      /* 极老的 WebView 在 file:// 下会拒绝，排序功能本身不受影响 */
+    }
+  }
+
   // ---------------- 顶栏 / 标签 ----------------
   const TAB_LABEL = { photo: '写真', audio: '音频', video: '视频' };
 
-  function setHeader({ tab, crumb, searchable, back }) {
+  function setHeader({ tab, crumb, searchable, back, searchPlaceholder }) {
     document.querySelectorAll('#tabs button').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.tab === tab);
     });
@@ -263,6 +323,9 @@
     const wrap = $('search-wrap');
     const toggle = $('search-toggle');
     toggle.hidden = !searchable;
+    // 各模块搜的东西不一样（作品 / 歌单），占位文案跟着变，
+    // 免得在音频页看到「搜索作品或作者」以为自己走错了
+    $('search-input').placeholder = searchPlaceholder || '搜索作品或作者';
     if (!searchable) {
       wrap.hidden = true;
       state.search = '';
@@ -350,6 +413,8 @@
     const { parts, query } = parseHash();
     state.repaint = null;
     state.autoLoad = null;
+    // 排序跟着地址走：从作品详情退回来、下拉刷新，顺序都还是用户挑的那个
+    state.sort = query.get('sort') || '';
 
     try {
       if (parts.length === 0) {
@@ -360,21 +425,21 @@
         await viewPhotoWork(Number(parts[2]), token);
       } else if (parts[0] === 'photo') {
         lastListHash.photo = location.hash || '#/photo';
-        setHeader({ tab: 'photo', crumb: '', searchable: true });
+        setHeader({ tab: 'photo', crumb: '', searchable: true, searchPlaceholder: '搜索作品或作者' });
         await viewPhotoWorks(query, token);
       } else if (parts[0] === 'audio' && parts[1] === 'p') {
         setHeader({ tab: 'audio', crumb: '歌单', searchable: false, back: lastListHash.audio });
         await viewAudioPlaylist(Number(parts[2]), token);
       } else if (parts[0] === 'audio') {
-        lastListHash.audio = '#/audio';
-        setHeader({ tab: 'audio', crumb: '', searchable: false });
+        lastListHash.audio = location.hash || '#/audio';
+        setHeader({ tab: 'audio', crumb: '', searchable: true, searchPlaceholder: '搜索歌单' });
         await viewAudioRoot(token);
       } else if (parts[0] === 'video' && parts[1] === 'w') {
         setHeader({ tab: 'video', crumb: '作品', searchable: false, back: lastListHash.video });
         await viewVideoWork(Number(parts[2]), token, Number(parts[3]) || 0);
       } else if (parts[0] === 'video') {
         lastListHash.video = location.hash || '#/video';
-        setHeader({ tab: 'video', crumb: '', searchable: true });
+        setHeader({ tab: 'video', crumb: '', searchable: true, searchPlaceholder: '搜索作品或作者' });
         await viewVideoWorks(query, token);
       } else {
         location.hash = '#/';
@@ -455,7 +520,11 @@
    * 手机上切个标签要卡好几秒，这就是「切类型很卡」的根因。
    */
   function pagedGrid(options) {
-    const titleEl = sectionTitle('加载中…');
+    // 标题单独拎出来：applyTitle 只改这一段的文字，
+    // 直接 replaceChildren 会把同一行右边的排序下拉一起清掉
+    const titleText = el('strong', { text: '加载中…' });
+    const titleEl = el('div', { class: 'section-title' }, titleText);
+    if (options.sortable) titleEl.append(buildSortSelect());
     const grid = el('div', { class: 'grid' });
     const more = el('button', { class: 'more', type: 'button', text: '加载更多', hidden: true });
     const node = el('div', null, titleEl, grid, more);
@@ -474,6 +543,7 @@
         if (options.params[key]) params.set(key, String(options.params[key]));
       });
       if (state.search) params.set('q', state.search);
+      if (state.sort) params.set('sort', state.sort);
       params.set('page', String(next));
       if (options.pageSize) params.set('page_size', String(options.pageSize));
       return api(`${options.endpoint}?${params.toString()}`);
@@ -489,9 +559,7 @@
     }
 
     function applyTitle() {
-      titleEl.replaceChildren(
-        el('strong', { text: total ? `${options.unit(total)}，已显示 ${items.length}` : '' }),
-      );
+      titleText.textContent = total ? `${options.unit(total)}，已显示 ${items.length}` : '';
     }
 
     function updateMore() {
@@ -525,7 +593,7 @@
         if (!data[options.listKey].length) {
           grid.replaceChildren();
           showEmpty();
-          titleEl.replaceChildren(el('strong', { text: '' }));
+          titleText.textContent = '';
           return;
         }
         items = data[options.listKey];
@@ -599,6 +667,7 @@
       listKey: 'works',
       unit: (n) => `${n} 个作品`,
       params: authorId ? { author_id: authorId } : {},
+      sortable: true,
       emptyTitle: '写真库还是空的',
       emptySearchTitle: '没有匹配的作品',
       emptyHints: ['在电脑上打开「写真」模块并扫描一次'],
@@ -1231,7 +1300,9 @@
       listKey: 'playlists',
       unit: (n) => `${n} 个歌单`,
       params: {},
+      sortable: true,
       emptyTitle: '音频库还是空的',
+      emptySearchTitle: '没有匹配的歌单',
       emptyHints: ['在电脑上打开「音频」模块并扫描一次', '歌单按目录层级自动生成'],
       renderCard: (playlist) =>
         el(
@@ -1559,6 +1630,7 @@
       listKey: 'works',
       unit: (n) => `${n} 个作品`,
       params: authorId ? { author_id: authorId } : {},
+      sortable: true,
       emptyTitle: '视频库还是空的',
       emptySearchTitle: '没有匹配的作品',
       emptyHints: ['在电脑上打开「视频」模块并扫描一次'],

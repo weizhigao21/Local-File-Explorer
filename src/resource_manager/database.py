@@ -176,12 +176,28 @@ def _works_filter(author_id=None, keyword=""):
     return where_sql, tuple(params)
 
 
-_WORKS_SELECT = """
-    SELECT w.id, w.name, w.path, w.thumbnail, a.name AS author,
-           (SELECT COUNT(*) FROM images WHERE work_id = w.id) AS image_count
+_WORKS_FIELDS = """
+    w.id, w.name, w.path, w.thumbnail, a.name AS author,
+           (SELECT COUNT(*) FROM images WHERE work_id = w.id) AS image_count"""
+
+_WORKS_FROM = """
     FROM works w
     JOIN authors a ON a.id = w.author_id
 """
+
+_WORKS_SELECT = f"\n    SELECT {_WORKS_FIELDS}{_WORKS_FROM}"
+
+# 排序白名单：query 里的 `sort` 只能在这几个键里挑，值→SQL 的映射写死在这里。
+# 名称排序与桌面端作品墙完全一致（`a.name, w.name`，SQLite 的 BINARY 序），
+# 网页和电脑上看到的顺序才不会对不上。
+# 「时间」用作品内最新一张图的 mtime——作品目录本身没入库，取图的时间最接近
+# 用户心里那个「这个作品是什么时候加进来的」。
+_WORKS_ORDER = {
+    "name_asc": "a.name, w.name",
+    "name_desc": "a.name DESC, w.name DESC",
+    "time_desc": "mtime DESC, a.name, w.name",
+    "time_asc": "mtime ASC, a.name, w.name",
+}
 
 
 def list_works(author_id=None, keyword="", limit=None, offset=0):
@@ -200,15 +216,22 @@ def list_works(author_id=None, keyword="", limit=None, offset=0):
         return [dict(row) for row in rows]
 
 
-def list_works_page(author_id=None, keyword="", page=1, page_size=60):
+def list_works_page(author_id=None, keyword="", page=1, page_size=60, order="name_asc"):
     """分页作品列表：返回 (总数, 当前页作品)
 
     总数与当前页走同一个连接：作品墙每次翻页/搜索要发两条 SQL，
     而 connect+close 本身就比查询贵（实测 4.6ms 里大半是建连接）。
+
+    order 只认 `_WORKS_ORDER` 里的键（网页端 `?sort=` 传进来，见
+    `web_server.http_util.resolve_sort`）；不认的值按名称升序。
     """
     page = max(1, int(page or 1))
     page_size = max(1, int(page_size or 60))
     where_sql, params = _works_filter(author_id, keyword)
+    order_sql = _WORKS_ORDER.get(order, _WORKS_ORDER["name_asc"])
+    # 「时间」这一档要一次 MAX(mtime)：写真库几千个作品，无条件加这个子查询
+    # 等于每次翻页都白跑几千次聚合，所以按需拼
+    extra = ", (SELECT MAX(mtime) FROM images WHERE work_id = w.id) AS mtime" if "mtime" in order_sql else ""
 
     with get_conn() as conn:
         total = conn.execute(
@@ -216,7 +239,7 @@ def list_works_page(author_id=None, keyword="", page=1, page_size=60):
             params,
         ).fetchone()["c"]
         rows = conn.execute(
-            f"{_WORKS_SELECT} {where_sql} ORDER BY a.name, w.name LIMIT ? OFFSET ?",
+            f"SELECT {_WORKS_FIELDS}{extra}{_WORKS_FROM} {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
             params + (page_size, (page - 1) * page_size),
         ).fetchall()
     return int(total or 0), [dict(row) for row in rows]

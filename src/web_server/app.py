@@ -368,6 +368,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             _text_param(query, "q"),
             _int_param(query, "page", 1),
             _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
+            _text_param(query, "sort"),
         )
         return self._json(
             {
@@ -393,8 +394,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         parent = _text_param(query, "parent")
         data = library.audio_playlists_page(
             parent,
+            _text_param(query, "q"),
             _int_param(query, "page", 1),
             _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
+            _text_param(query, "sort"),
         )
         return self._json(
             {
@@ -444,6 +447,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             _text_param(query, "q"),
             _int_param(query, "page", 1),
             _int_param(query, "page_size", DEFAULT_PAGE_SIZE),
+            _text_param(query, "sort"),
         )
         return self._json(
             {

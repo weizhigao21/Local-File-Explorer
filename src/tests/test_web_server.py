@@ -1489,7 +1489,7 @@ def test_audio_cover_inherits_through_multiple_levels(seeded):
     mid = audio_db.add_playlist("中层", str(root / "mid"), parent_path=str(root))
     leaf = audio_db.add_playlist("底层", str(root / "mid" / "leaf"), parent_path=str(root / "mid"))
 
-    page = library.audio_playlists_page("", 1, 60)
+    page = library.audio_playlists_page("", page=1, page_size=60)
     by_id = {item["id"]: item for item in page["items"]}
     assert by_id[top]["has_cover"] is True
 
@@ -1976,3 +1976,124 @@ def test_api_video_info_uses_caps_query(server):
         _get(port, f"/api/video/videos/{mkv['id']}?caps=h264,hevc", cookie=TOKEN)[2]
     )
     assert smart["mode"] == http_util.MODE_REMUX
+
+
+# ==================== 列表搜索 / 排序（v1.18.1） ====================
+#
+# 排序值来自 query，会被拼进 ORDER BY —— 只能查表映射，绝不能原样拼 SQL。
+# 这三个模块的四个选项与桌面端音频模块的下拉一致：
+# 名称 A-Z / 名称 Z-A / 时间 新→旧 / 时间 旧→新。
+
+def test_resolve_sort_only_accepts_whitelist():
+    assert http_util.resolve_sort("time_desc") == "time_desc"
+    assert http_util.resolve_sort(" NAME_DESC ") == "name_desc"
+    assert http_util.resolve_sort("") == "name_asc"
+    assert http_util.resolve_sort(None) == "name_asc"
+    # 重点：任何不在白名单里的串（包括想混进 ORDER BY 的 SQL）都得被吃掉
+    for hostile in ("name; DROP TABLE works", "mtime DESC", "1", "name_asc, (select 1)"):
+        assert http_util.resolve_sort(hostile) == "name_asc"
+
+
+def test_photo_works_orders(seeded):
+    tmp = seeded["root"]
+    for author, work, stamp in (("作者B", "作品B", 5000), ("作者C", "作品C", 1000)):
+        image = _make_image(str(tmp / "写真" / author / work / "01.jpg"))
+        photo_db.add_author_with_works(
+            author, [(work, str(tmp / "写真" / author / work), "", [(image, stamp)])]
+        )
+
+    names = lambda page: [w["name"] for w in page["items"]]  # noqa: E731
+
+    asc = names(library.photo_works_page(None, "", 1, 60, "name_asc"))
+    assert asc == sorted(asc), "名称升序和桌面端作品墙不一致"
+
+    desc = names(library.photo_works_page(None, "", 1, 60, "name_desc"))
+    assert desc == list(reversed(asc)), "Z-A 不是 A-Z 的倒序"
+
+    newest = names(library.photo_works_page(None, "", 1, 60, "time_desc"))
+    assert newest[:2] == ["作品B", "作品C"], f"按时间新→旧排错：{newest}"
+    oldest = names(library.photo_works_page(None, "", 1, 60, "time_asc"))
+    assert oldest[:2] == ["作品1", "作品C"], f"按时间旧→新排错：{oldest}"
+
+
+def test_video_works_orders(seeded):
+    tmp = seeded["root"]
+    for author, work, stamp in (("作者W", "作品W", 9000), ("作者X", "作品X", 100)):
+        folder = tmp / "视频" / author / work
+        folder.mkdir(parents=True)
+        clip = folder / "01.mp4"
+        clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 200)
+        video_db.add_author_with_works(
+            author, [(work, str(folder), "", [(str(clip), "01.mp4", stamp, clip.stat().st_size)])]
+        )
+
+    newest = [w["name"] for w in library.video_works_page(None, "", 1, 60, "time_desc")["items"]]
+    assert newest[0] == "作品W", f"视频按时间新→旧排错：{newest}"
+    name_desc = [w["name"] for w in library.video_works_page(None, "", 1, 60, "name_desc")["items"]]
+    assert name_desc == sorted(name_desc, reverse=True)
+
+
+def test_audio_playlists_search_and_sort(seeded):
+    tmp = seeded["root"]
+    audio_db.add_playlist("白噪音", str(tmp / "白噪音"))
+    audio_db.add_playlist("抒情合集", str(tmp / "抒情合集"))
+    audio_db.add_playlist("嵌套白噪音", str(tmp / "白噪音" / "嵌套"), parent_path=str(tmp / "白噪音"))
+
+    hit = library.audio_playlists_page("", "白噪音", 1, 60)
+    assert [p["name"] for p in hit["items"]] == ["白噪音"], "搜索应该只命中名字含关键词的"
+    assert hit["total"] == 1
+
+    # 子歌单不在顶层，搜顶层时不该冒出来；进到那一层才搜得到
+    assert "嵌套白噪音" not in [p["name"] for p in library.audio_playlists_page("", "白噪音", 1, 60)["items"]]
+    child = library.audio_playlists_page(str(tmp / "白噪音"), "白噪音", 1, 60)
+    assert [p["name"] for p in child["items"]] == ["嵌套白噪音"]
+
+    # LIKE 通配符要按字面匹配：搜 % 不能把全库捞出来
+    assert library.audio_playlists_page("", "%", 1, 60)["total"] == 0
+
+    desc = [p["name"] for p in library.audio_playlists_page("", "", 1, 60, "name_desc")["items"]]
+    assert desc == sorted(desc, key=str.lower, reverse=True)
+
+
+def test_list_endpoints_accept_sort_query(server):
+    """接口层：sort 得真的透传到 SQL，而不是被路由丢掉"""
+    port = server[1]
+    for path in ("/api/photos/works", "/api/video/works", "/api/audio/playlists"):
+        status, _, body = _get(port, f"{path}?sort=name_desc", cookie=TOKEN)
+        assert status == 200, path
+        data = json.loads(body)
+        items = data.get("works") or data.get("playlists")
+        assert items, f"{path} 没返回数据"
+        names = [item["name"] for item in items]
+        assert names == sorted(names, reverse=True), f"{path} 没按 Z-A 排"
+
+    status, _, body = _get(port, "/api/audio/playlists?sort=%E4%B9%B1%E5%86%99", cookie=TOKEN)
+    assert status == 200, "非法排序值应该被吃掉而不是 500"
+
+
+def test_paged_grid_sends_sort_and_keeps_select():
+    js = _static_text("app.js")
+    fetch = _js_block(js, "function fetchPage(")
+    assert "state.sort" in fetch and "params.set('sort'" in fetch, "列表请求没带排序"
+
+    grid = _js_block(js, "function pagedGrid(")
+    # 标题文字和排序下拉在同一行：applyTitle 直接 replaceChildren 会把下拉一起清掉
+    assert "titleText.textContent" in grid
+    assert "titleEl.replaceChildren" not in grid, "replaceChildren 会把排序下拉清掉"
+    assert "options.sortable" in grid and "buildSortSelect()" in grid
+
+    # 切排序不能整页重建（会重拉作者列表、闪一下）
+    apply = _js_block(js, "function applySort(")
+    assert "replaceHashQuery" in apply
+    assert "replaceState" in _js_block(js, "function replaceHashQuery(")
+    assert "location.hash =" not in apply, "改 hash 会触发 hashchange → render 整页重建"
+
+
+def test_all_three_lists_are_searchable():
+    js = _static_text("app.js")
+    render_block = js[js.index("async function render()"):js.index("// ---------------- 首页")]
+    for tab in ("photo", "audio", "video"):
+        marker = f"tab: '{tab}', crumb: '', searchable: true"
+        assert marker in render_block, f"{tab} 列表没开搜索"
+    assert "searchPlaceholder" in render_block
+    assert "搜索歌单" in render_block
