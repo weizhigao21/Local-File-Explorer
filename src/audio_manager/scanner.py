@@ -8,6 +8,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from audio_manager import database as db
+from audio_manager.duration import get_duration
 from resource_manager import fingerprint_cache as fp
 from resource_manager.config import AUDIO_ROOT, AUDIO_ROOTS
 from resource_manager.utils import natural_key
@@ -77,11 +78,12 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
             if os.path.isfile(fpath) and _is_audio(fpath):
                 audio_files.append((fname, fpath))
 
-    # 构建 tracks 列表
+    # 构建 tracks 列表（duration 先占位 None，按需计算：
+    # 新文件必算；已在库里但缺时长的走回填——避免每次全量扫描重读所有文件头）
     tracks = []
     for fname, fpath in audio_files:
         title = os.path.splitext(fname)[0]
-        tracks.append((title, fpath, 0, len(tracks) + 1))
+        tracks.append((title, fpath, None, len(tracks) + 1))
 
     # 无音频文件且不允许空歌单则跳过（容器歌单 allow_empty=True 时会创建）
     if not tracks and not allow_empty:
@@ -96,12 +98,21 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
                            mtime=os.path.getmtime(norm_folder))
         # 增量同步曲目
         current_paths = {t[1] for t in tracks}
-        existing_tracks = {t["path"] for t in db.list_tracks(pid)}
-        to_add = [t for t in tracks if t[1] not in existing_tracks]
+        existing_tracks = {t["path"]: t for t in db.list_tracks(pid)}
+        to_add = []
+        backfill = []
+        for title, fpath, _, num in tracks:
+            old = existing_tracks.get(fpath)
+            if old is None:
+                to_add.append((title, fpath, get_duration(fpath), num))
+            elif not old.get("duration") or old["duration"] <= 0:
+                backfill.append((old["id"], get_duration(fpath)))
         if to_add:
             db.add_tracks(pid, to_add)
             stats["added_tracks"] += len(to_add)
-        removed = len(existing_tracks - current_paths)
+        if backfill:
+            stats["backfilled_tracks"] = db.update_track_durations(backfill)
+        removed = len(set(existing_tracks) - current_paths)
         if removed:
             db.delete_tracks_not_in(pid, list(current_paths))
             stats["removed_tracks"] += removed
@@ -121,7 +132,10 @@ def _sync_playlist(folder_path, name, parent_path, existing, stats,
                               parent_path=parent_path,
                               mtime=os.path.getmtime(norm_folder))
         if pid and tracks:
-            db.add_tracks(pid, tracks)
+            db.add_tracks(
+                pid,
+                [(t[0], t[1], get_duration(t[1]), t[3]) for t in tracks],
+            )
             db.update_playlist(pid, track_count=len(tracks))
             stats["added_tracks"] += len(tracks)
         stats["added_playlists"] += 1

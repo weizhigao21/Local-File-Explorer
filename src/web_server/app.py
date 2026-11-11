@@ -86,6 +86,36 @@ class WebServerError(RuntimeError):
     """开服失败（端口占用/权限不足），消息可直接展示给用户"""
 
 
+def _download_name(title, ext):
+    """下载文件名：标题 + 原扩展名，清掉文件系统非法字符"""
+    cleaned = "".join(
+        c for c in str(title or "") if c not in '\\/:*?"<>|' and ord(c) >= 32
+    ).strip(" .") or "download"
+    return f"{cleaned[:120]}{ext or ''}"
+
+
+def _build_zip(files, stem):
+    """把 [(条目名, 绝对路径), ...] 打包成临时 zip，返回临时文件路径
+
+    音频已是压缩格式，ZIP_STORED 只打包不压缩（快一个数量级）；
+    打包到临时文件而不是内存——一个歌单几百 MB，塞内存会拖垮手机端服务。
+    """
+    import tempfile
+    import zipfile
+
+    fd, tmp = tempfile.mkstemp(prefix=f"{stem}-", suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for arcname, src in files:
+                zf.write(src, arcname)
+        return tmp
+    except OSError:
+        with suppress(OSError):
+            os.remove(tmp)
+        return ""
+
+
 # ==================== 路由表 ====================
 
 _ROUTE_DEFS = [
@@ -99,6 +129,8 @@ _ROUTE_DEFS = [
     ("GET", r"^/api/audio/playlists$", "api_audio_playlists"),
     ("GET", r"^/api/audio/playlists/(\d+)$", "api_audio_playlist"),
     ("GET", r"^/api/audio/tracks/(\d+)/subtitles$", "api_audio_subtitles"),
+    ("GET", r"^/api/audio/tracks/(\d+)/download$", "api_audio_track_download"),
+    ("GET", r"^/api/audio/playlists/(\d+)/download$", "api_audio_playlist_download"),
     # 视频
     ("GET", r"^/api/video/authors$", "api_video_authors"),
     ("GET", r"^/api/video/resume$", "api_video_resume"),
@@ -106,6 +138,7 @@ _ROUTE_DEFS = [
     ("GET", r"^/api/video/works/(\d+)/videos$", "api_video_work_videos"),
     ("GET", r"^/api/video/videos/(\d+)$", "api_video_info"),
     ("GET", r"^/api/video/videos/(\d+)/skip$", "api_video_skip"),
+    ("GET", r"^/api/video/videos/(\d+)/download$", "api_video_download"),
     ("POST", r"^/api/video/videos/(\d+)/skip$", "api_video_skip_mark"),
     ("POST", r"^/api/video/videos/(\d+)/progress$", "api_video_save_progress"),
     # 媒体
@@ -284,8 +317,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._extra_headers.append(("Content-Security-Policy", CSP_CONTENT))
         return self._serve_file(full, content_type=content_type, max_age=max_age)
 
-    def _serve_file(self, path, content_type=None, max_age=3600):
-        """带 Range 的文件响应：视频拖动、大图分段下载都靠它"""
+    def _serve_file(self, path, content_type=None, max_age=3600, download_name=None):
+        """带 Range 的文件响应：视频拖动、大图分段下载都靠它
+
+        download_name 非空时强制「另存为」：Content-Disposition 用 RFC 5987
+        编码中文文件名（filename*），老浏览器回退 filename= 用 ASCII 兜底。
+        """
         try:
             stat = os.stat(path)
         except OSError:
@@ -295,8 +332,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         cache = "no-store" if not max_age else f"private, max-age={max_age}"
 
-        # 图片墙/封面重复请求多，命中 ETag 直接 304，省流量也省解码
-        if etag and self.headers.get("If-None-Match") == etag:
+        # 下载请求不缓存也不走 304（浏览器要拿完整响应体）
+        if etag and not download_name and self.headers.get("If-None-Match") == etag:
             return self._send_headers(304, [("ETag", etag), ("Cache-Control", cache)])
 
         headers = [
@@ -306,6 +343,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             ("ETag", etag),
             ("Last-Modified", self.date_time_string(stat.st_mtime)),
         ]
+        if download_name:
+            quoted = urllib.parse.quote(str(download_name).replace('"', ""), safe="")
+            ascii_fallback = quoted if len(quoted) <= 80 else "download"
+            headers.append(
+                (
+                    "Content-Disposition",
+                    f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}",
+                )
+            )
 
         if self.headers.get("Range"):
             try:
@@ -429,6 +475,43 @@ class RequestHandler(BaseHTTPRequestHandler):
         if data is None:
             return self._json({"cues": []}, 200)
         return self._json(data, max_age=60)
+
+    def api_audio_track_download(self, match, query):
+        track = library.audio_track(int(match.group(1)))
+        if not track or not os.path.isfile(track["path"]):
+            return self._json({"error": "音频不存在"}, 404)
+        ext = os.path.splitext(track["path"])[1].lower()
+        name = _download_name(track["title"], ext)
+        return self._serve_file(track["path"], download_name=name)
+
+    def api_audio_playlist_download(self, match, query):
+        files = library.audio_playlist_track_files(int(match.group(1)))
+        if files is None:
+            return self._json({"error": "歌单不存在"}, 404)
+        if not files:
+            return self._json({"error": "歌单里没有可下载的曲目"}, 404)
+        playlist = library._playlist_row(int(match.group(1)))
+        zip_path = _build_zip(files, f"audio-{match.group(1)}")
+        if not zip_path:
+            return self._json({"error": "打包失败"}, 500)
+        try:
+            name = f"{library._safe_zip_name(playlist['name']) or 'playlist'}.zip"
+            # Windows 的 mimetypes 会把 .zip 认成 x-zip-compressed，显式钉住
+            return self._serve_file(
+                zip_path, content_type="application/zip", download_name=name
+            )
+        finally:
+            # 发送完成后删临时包（_serve_file 同步写完响应才返回）
+            with suppress(OSError):
+                os.remove(zip_path)
+
+    def api_video_download(self, match, query):
+        video = library.video_by_id(int(match.group(1)))
+        if not video or not os.path.isfile(video["path"]):
+            return self._json({"error": "视频不存在"}, 404)
+        name = _download_name(video["name"], os.path.splitext(video["path"])[1].lower())
+        return self._serve_file(video["path"], download_name=name)
+
 
     def api_video_authors(self, match, query):
         return self._json({"authors": library.video_authors()}, max_age=30)

@@ -374,6 +374,19 @@ def add_tracks(playlist_id, tracks):
         )
 
 
+def update_track_durations(items):
+    """批量回填曲目时长（秒）；items: [(track_id, duration), ...]，跳过非正值"""
+    items = [(i, d) for i, d in items if d and d > 0]
+    if not items:
+        return 0
+    with _active_conn() as conn:
+        cur = conn.executemany(
+            "UPDATE tracks SET duration = ? WHERE id = ? AND duration <= 0",
+            [(d, i) for i, d in items],
+        )
+        return cur.rowcount
+
+
 def delete_tracks_not_in(playlist_id, valid_paths):
     """删除歌单中不在 valid_paths 中的曲目（临时表方案，突破SQLite 999参数上限）"""
     if not valid_paths:

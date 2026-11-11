@@ -1669,17 +1669,29 @@
     }
 
     if (data.tracks.length) {
-      nodes.push(sectionTitle(`${data.tracks.length} 首`, '点任意一首开始播放'));
+      nodes.push(
+        el(
+          'div',
+          { class: 'section-title' },
+          el('strong', { text: `${data.tracks.length} 首` }),
+          el('span', { text: '点任意一首开始播放' }),
+          el('span', { style: { flex: '1' } }),
+          el('a', {
+            class: 'dl-btn',
+            href: `/api/audio/playlists/${playlistId}/download`,
+            text: '下载全部',
+          }),
+        ),
+      );
       nodes.push(
         el(
           'div',
           { class: 'list' },
           ...data.tracks.map((track) =>
             el(
-              'button',
+              'div',
               {
                 class: 'row',
-                type: 'button',
                 dataset: { trackId: String(track.id) },
                 onclick: () => playTrack(data.tracks, track.index, data.playlist),
               },
@@ -1689,6 +1701,13 @@
                 el('span', { class: 'name', text: track.title }),
               ),
               el('span', { class: 'dur', text: fmtDuration(track.duration_ms) }),
+              el('a', {
+                class: 'row-dl',
+                href: `/api/audio/tracks/${track.id}/download`,
+                text: '⬇',
+                // 行本身是点击播放，别让下载触发播放
+                onclick: (ev) => ev.stopPropagation(),
+              }),
             ),
           ),
         ),
@@ -2055,10 +2074,9 @@
       if (video.size) tags.push(el('span', { text: fmtSize(video.size) }));
 
       return el(
-        'button',
+        'div',
         {
           class: 'row',
-          type: 'button',
           onclick: () => openVideo(workId, data.videos, video.index),
         },
         el('span', { class: 'idx', text: String(video.index + 1).padStart(2, '0') }),
@@ -2072,6 +2090,14 @@
           ),
         ),
         el('span', { class: 'dur', text: fmtDuration(video.duration_ms) }),
+        // 传的是原文件（Content-Disposition 另存为），不是转码流——
+        // 大文件走 direct 原地址下载，服务端不参与转码
+        el('a', {
+          class: 'row-dl',
+          href: `/api/video/videos/${video.id}/download`,
+          text: '⬇',
+          onclick: (ev) => ev.stopPropagation(),
+        }),
       );
     });
 

@@ -466,3 +466,56 @@ def test_old_fingerprint_is_reconciled_after_scan_rule_upgrade(temp_audio_env):
     assert adb.get_playlist(old_id) is None
     assert old_id not in adb.count_tracks_by_playlist()
     assert build_audio_catalog(adb.list_playlists(), adb.count_tracks_by_playlist(), [root]) == []
+
+
+# ==================== 曲目时长（v1.10.3） ====================
+
+def _make_wav(path, seconds=3, rate=8000):
+    """合成可解析的 WAV（RIFF/WAVE 16bit mono），get_duration 能读出真实时长"""
+    import struct
+
+    byte_rate = rate * 2  # 16bit mono
+    data_size = byte_rate * seconds
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(
+            b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, byte_rate, 2, 16)
+            + b"data" + struct.pack("<I", data_size)
+        )
+        f.write(b"\x00" * data_size)
+
+
+def test_scan_writes_track_duration(temp_audio_env):
+    """扫描时新曲目必须写入时长（此前硬编码 0，网页端列表全是 --:--）"""
+    root = temp_audio_env
+    _make_wav(os.path.join(root, "歌单1", "01.wav"), seconds=3)
+    ascanner.scan(audio_root=root)
+    tracks = adb.list_tracks(1)
+    assert tracks[0]["duration"] == 3
+
+
+def test_scan_backfills_missing_duration(temp_audio_env):
+    """已在库里但时长为 0 的旧数据：重扫时回填（一次成本，之后不再重算）"""
+    root = temp_audio_env
+    _make_audio_file(root, "歌单1/01.wav", content=b"fake")
+    ascanner.scan(audio_root=root)
+    assert adb.list_tracks(1)[0]["duration"] == 0
+
+    _make_wav(os.path.join(root, "歌单1", "01.wav"), seconds=2)
+    _bump_dir_mtime(os.path.join(root, "歌单1"))
+    stats = ascanner.scan(audio_root=root)
+    assert stats.get("backfilled_tracks") == 1
+    assert adb.list_tracks(1)[0]["duration"] == 2
+
+
+def test_scan_backfill_skips_tracks_with_duration(temp_audio_env):
+    """已有时长的曲目不重算——增量扫描不读已入库文件的头部"""
+    root = temp_audio_env
+    _make_wav(os.path.join(root, "歌单1", "01.wav"), seconds=3)
+    ascanner.scan(audio_root=root)
+    # 第二次扫描（指纹变化：新增另一首歌单）不应清掉/重算时长
+    _make_wav(os.path.join(root, "歌单2", "02.wav"), seconds=1)
+    _bump_dir_mtime(root)
+    ascanner.scan(audio_root=root)
+    assert adb.list_tracks(1)[0]["duration"] == 3

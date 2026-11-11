@@ -665,6 +665,60 @@ def _playlist_row(playlist_id):
     )
 
 
+def audio_playlist_track_files(playlist_id):
+    """歌单（含全部子孙歌单）的曲目文件 → [(相对路径, 绝对路径), ...]
+
+    相对路径以根歌单名为顶层目录，同名曲目按所属歌单分目录放，
+    供 ZIP 打包下载使用；歌单不存在返回 None。
+    """
+    root = _playlist_row(playlist_id)
+    if not root:
+        return None
+
+    playlists = audio_db.list_playlists()
+    children = {}
+    for p in playlists:
+        children.setdefault(p.get("parent_path") or "", []).append(p)
+
+    # 根歌单名做 zip 顶层目录；跨歌单同名曲目前缀歌单名防覆盖
+    root_name = _safe_zip_name(root["name"]) or "playlist"
+    used = set()
+
+    def _collect(pid, prefix, out):
+        for t in audio_db.list_tracks(pid):
+            title = t.get("title") or _basename(t["path"])
+            base = _safe_zip_name(title) or str(t["id"])
+            candidate = f"{prefix}/{base}"
+            n = 2
+            while candidate in used:
+                candidate = f"{prefix}/{base} ({n})"
+                n += 1
+            used.add(candidate)
+            if os.path.isfile(t["path"]):
+                out.append((candidate + os.path.splitext(t["path"])[1].lower(), t["path"]))
+
+    out = []
+    _collect(root["id"], root_name, out)
+
+    def _walk(parent_path, prefix):
+        for child in children.get(parent_path, []):
+            name = _safe_zip_name(child["name"]) or str(child["id"])
+            sub = f"{prefix}/{name}"
+            _collect(child["id"], sub, out)
+            _walk(child["path"], sub)
+
+    _walk(root["path"], root_name)
+    return out
+
+
+def _safe_zip_name(name):
+    """ZIP 条目名清理：去路径分隔符与非法字符，防打包时逃出目录"""
+    cleaned = "".join(
+        c for c in str(name or "") if c not in '\\/:*?"<>|' and ord(c) >= 32
+    ).strip(" .")
+    return cleaned[:120]
+
+
 def audio_playlist(playlist_id):
     playlist = _playlist_row(playlist_id)
     if not playlist:

@@ -2243,3 +2243,67 @@ def test_audio_list_wires_tags_into_request_and_hash():
     assert "function tagLinkChip(" in js
     assert "tagLinkChip" in _js_function("viewAudioPlaylist")
     assert "[,，\\n\\r\\s]+" in _js_function("splitTagText")
+
+
+# ==================== 音视频下载（v1.10.3） ====================
+
+def test_audio_track_download(server, seeded):
+    """单曲下载：原文件直传 + attachment 头 + RFC 5987 中文文件名"""
+    _instance, port = server
+    status, headers, body = _get(port, "/api/audio/tracks/1/download", cookie=TOKEN)
+    assert status == 200
+    disp = headers.get("Content-Disposition", "")
+    assert disp.startswith("attachment")
+    assert "filename*=UTF-8''" in disp
+    assert body.startswith(b"RIFF")
+
+
+def test_audio_playlist_download_zip(server, seeded):
+    """歌单打包下载：ZIP 内按「歌单名/曲目名」组织，内容是原文件"""
+    import io
+    import zipfile
+
+    _instance, port = server
+    status, headers, body = _get(port, "/api/audio/playlists/1/download", cookie=TOKEN)
+    assert status == 200
+    assert headers.get("Content-Type") == "application/zip"
+    assert "attachment" in headers.get("Content-Disposition", "")
+    zf = zipfile.ZipFile(io.BytesIO(body))
+    names = zf.namelist()
+    assert len(names) == 1
+    assert names[0].startswith("歌单A/")
+    assert zf.read(names[0]).startswith(b"RIFF")
+
+
+def test_audio_playlist_download_missing(server, seeded):
+    _instance, port = server
+    status, _, _body = _get(port, "/api/audio/playlists/999/download", cookie=TOKEN)
+    assert status == 404
+
+
+def test_video_download_streams_original(server, seeded):
+    """视频下载：原文件（非转码流）+ attachment，Content-Length 与响应体一致"""
+    _instance, port = server
+    status, headers, body = _get(port, "/api/video/videos/1/download", cookie=TOKEN)
+    assert status == 200
+    assert "attachment" in headers.get("Content-Disposition", "")
+    assert body.startswith(b"\x00\x00\x00\x18ftypmp42")
+    assert int(headers.get("Content-Length")) == len(body)
+
+
+def test_media_audio_playback_not_attachment(server, seeded):
+    """播放接口不带 attachment：不能因为加了下载就把 <audio> 播放变成另存为"""
+    _instance, port = server
+    _status, headers, _body = _get(port, "/media/audio/1", cookie=TOKEN)
+    assert "Content-Disposition" not in headers
+
+
+def test_web_download_ui_guard():
+    """前端必须有单曲/歌单/视频三个下载入口"""
+    js = _static_text("app.js")
+    assert "/api/audio/tracks/${track.id}/download" in js
+    assert "/api/audio/playlists/${playlistId}/download" in js
+    assert "/api/video/videos/${video.id}/download" in js
+    assert "row-dl" in js and "dl-btn" in js
+    css = _static_text("style.css")
+    assert ".dl-btn" in css and ".row-dl" in css

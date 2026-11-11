@@ -558,6 +558,36 @@ main.with-player { padding-bottom: calc(var(--player-h) + 28px + var(--safe-bott
   color: var(--accent-2);
 }
 
+/* ---------------- 下载 ----------------
+ * 全是 <a> 链接：服务端响应带 Content-Disposition: attachment，
+ * 就算老 WebView 不认 download 属性、直接当链接点开，也会走「另存为」。
+ */
+.dl-btn {
+  display: inline-block;
+  flex: none;
+  margin-left: 10px;
+  padding: 6px 14px;
+  border-radius: 15px;
+  background: var(--tint);
+  border: 1px solid var(--line-hi);
+  color: var(--accent-2);
+  font-size: 12.5px;
+  text-decoration: none;
+}
+
+.row-dl {
+  flex: none;
+  margin-left: 8px;
+  padding: 6px 9px;
+  border-radius: 9px;
+  background: var(--tint);
+  color: var(--accent-2);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.row-dl:active { background: var(--card-hi); }
+
 .pill.warn { background: rgba(200, 152, 90, 0.14); color: #d8b078; }
 
 /* ---------------- 状态 / 空态 ---------------- */
