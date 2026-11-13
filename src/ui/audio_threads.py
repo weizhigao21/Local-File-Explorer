@@ -257,8 +257,10 @@ class DlsiteWorker(QThread):
                     # 限流会把队列里所有作品都毒化成 24h 不重试
                     self.log.emit(f"{rj} 抓取失败：{reason}（站点级故障，不计入 24h 冷却）")
                 else:
-                    dlsite_db.set_error(rj, f"网络请求失败：{reason}")
-                    self.log.emit(f"{rj} 抓取失败：{reason}")
+                    # 下架（販売停止）是作品级永久状态，不加"网络请求失败"前缀
+                    err = reason if reason.startswith("作品已停止販売") else f"网络请求失败：{reason}"
+                    dlsite_db.set_error(rj, err)
+                    self.log.emit(f"{rj} 抓取失败：{err}")
             else:
                 d = dlsite.parse(html, rj)
                 if d.get("cover"):

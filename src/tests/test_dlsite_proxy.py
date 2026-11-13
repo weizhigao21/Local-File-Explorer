@@ -4,10 +4,17 @@ from resource_manager import config
 
 
 class FakeResponse:
-    def __init__(self, status=200, size=2000):
+    def __init__(self, status=200, size=2000, text=None):
         self.status_code = status
         self.content = b"x" * size
-        self.text = "<html>" + ("x" * size) + "</html>"
+        self.text = text if text is not None else "<html>" + ("x" * size) + "</html>"
+
+
+SUSPENDED_404_TEXT = (
+    '<html><head><title>エラー: この作品は現在販売されていません</title></head>'
+    "<body>この作品は現在販売されていません 販売停止中の作品はキャンペーンや"
+    "クーポンの対象外となります</body></html>"
+)
 
 
 class FakeRequests:
@@ -175,4 +182,61 @@ def test_site_level_cleared_on_success(monkeypatch):
 
     holder["status"] = 200
     assert dlsite.fetch("RJ00000004", retries=1)
+    assert not dlsite.is_site_level_failure()
+
+
+# ── 已下架作品（販売停止）的 404 是作品级永久状态，不是限流 ──
+
+
+def test_suspended_404_is_work_level_and_not_counted(monkeypatch):
+    """販売停止页的 404：多次出现也不得判定为站点级，且不重试直接放弃"""
+    _reset()
+    fake = FakeRequests(lambda proxy: FakeResponse(status=404, text=SUSPENDED_404_TEXT))
+    monkeypatch.setattr(dlsite, "requests", fake, raising=False)
+    monkeypatch.setattr(dlsite, "_resolve_proxy", lambda url: ("", None))
+
+    assert dlsite.fetch("RJ00000001") is None          # 默认 retries=2
+    assert "停止販売" in dlsite.last_error()
+    assert not dlsite.is_site_level_failure()
+    assert len(fake.calls) == 1                        # 下架是终局状态，重试无意义
+
+    for rj in ("RJ00000002", "RJ00000003", "RJ00000004"):
+        assert dlsite.fetch(rj) is None
+    assert not dlsite.is_site_level_failure()          # 连续下架 404 不升级为站点级
+
+
+def test_plain_404_still_counts_toward_site_level(monkeypatch):
+    """非下架页的 404（真限流）仍照常累计站点级判定"""
+    _reset()
+    fake = FakeRequests(lambda proxy: FakeResponse(status=404, text="<html>proxy error</html>"))
+    monkeypatch.setattr(dlsite, "requests", fake, raising=False)
+    monkeypatch.setattr(dlsite, "_resolve_proxy", lambda url: ("", None))
+
+    for rj in ("RJ00000001", "RJ00000002", "RJ00000003"):
+        assert dlsite.fetch(rj, retries=1) is None
+    assert dlsite.is_site_level_failure()
+    assert "HTTP 404" in dlsite.last_error()
+
+
+def test_probe_suspended_404_does_not_poison_site_status(monkeypatch):
+    """探测撞上下架作品：通道可达、不留站点级计数，后续单个限流 404 不误判"""
+    _reset()
+    responses = {"suspended": True}
+
+    def behavior(proxy):
+        if responses["suspended"]:
+            return FakeResponse(status=404, text=SUSPENDED_404_TEXT)
+        return FakeResponse(status=404, text="<html>blocked</html>")
+
+    fake = FakeRequests(behavior)
+    monkeypatch.setattr(dlsite, "requests", fake, raising=False)
+    monkeypatch.setattr(dlsite, "proxy_candidates", lambda: ([("", "直连")], "auto"))
+
+    proxy, html = dlsite._resolve_proxy("https://example.test/work")
+    assert proxy == "" and html is None
+    assert not dlsite.is_site_level_failure()
+
+    # 探测之后一个普通 404：仍是作品级，不触发站点级
+    responses["suspended"] = False
+    assert dlsite.fetch("RJ00000001", retries=1) is None
     assert not dlsite.is_site_level_failure()

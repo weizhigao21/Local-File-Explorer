@@ -52,6 +52,20 @@ RETRY_COOLDOWN = 60  # 全部代理都失败后，60 秒内不再重复探测
 SITE_FAIL_WINDOW = 120.0  # 判定窗口（秒）
 SITE_FAIL_THRESHOLD = 3   # 窗口内同一状态的出现次数阈值
 
+# DLsite 对已下架（販売停止）作品的 404 错误页特征串。
+# 实测页面标题「エラー: この作品は現在販売されていません」——这是作品级的
+# 永久状态，不是限流，绝不能计入站点级判定。
+SUSPENDED_MARKER = "販売されていません"
+
+
+def _is_suspended_page(response):
+    """是否为"作品已停止販売"的 404 错误页"""
+    return (
+        getattr(response, "status_code", None) == 404
+        and SUSPENDED_MARKER in (response.text or "")
+    )
+
+
 _status_lock = threading.Lock()
 _status_events = []  # [(time.time(), status_code)]
 _site_level = False
@@ -272,15 +286,19 @@ def _probe(url):
                     return proxy, None
                 return proxy, html
             if response.status_code == 404:
-                # 404 也是 DLsite 的应答：通道本身可达，只是这一页拿不到
-                # （可能被限流，也可能恰好是失效作品）。不能据此判整个网络
-                # 死刑——标记通道可用、不返回 HTML，交给 fetch 逐作品判断。
+                # 404 也是 DLsite 的应答：通道本身可达，只是这一页拿不到。
+                # 不能据此判整个网络死刑——标记通道可用、不返回 HTML，
+                # 交给 fetch 逐作品判断。
                 _proxy_resolved = proxy
                 _proxy_probed_at = time.time()
                 _proxy_error = ""
-                _note_http_status(404)
                 where = proxy or "直连"
-                _log(f"{where}可连通但站点返回 HTTP 404（可能被限流），交由抓取流程逐作品判断")
+                if _is_suspended_page(response):
+                    # 探测的恰好是已下架作品：作品级状态，不计入站点级判定
+                    _log(f"{where}可连通，探测目标为已下架作品（HTTP 404 販売停止页）")
+                else:
+                    _note_http_status(404)
+                    _log(f"{where}可连通但站点返回 HTTP 404（可能被限流），交由抓取流程逐作品判断")
                 return proxy, None
             errors.append(f"{label}: HTTP {response.status_code}")
         except Exception as e:
@@ -346,6 +364,11 @@ def fetch(rj: str, delay: float = RETRY_DELAY, retries: int = MAX_RETRIES) -> st
                     _clear_site_status()  # 拿到正常页面，站点级故障视为已解除
                     _last_error = ""
                     return response.text
+            elif _is_suspended_page(response):
+                # 已下架作品（販売停止）：作品级永久状态，不计入站点级判定，
+                # 重试也不会变，直接放弃本轮
+                failure = "作品已停止販売（DLsite 已下架）"
+                break
             else:
                 _note_http_status(response.status_code)
                 failure = f"HTTP {response.status_code}"
