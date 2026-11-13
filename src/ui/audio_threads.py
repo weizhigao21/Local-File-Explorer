@@ -242,9 +242,14 @@ class DlsiteWorker(QThread):
             now = time.time()
             info = dlsite_db.get_work(rj)
             if info:
-                if info.get("title") and not info.get("error"):
+                has_cover = bool(info.get("cover_path") or info.get("cover_url"))
+                if info.get("title") and not info.get("error") and has_cover:
                     self.log.emit(f"{rj} 缓存命中，跳过")
                     return
+                if info.get("title") and not info.get("error") and not has_cover:
+                    # 2026-11 DLsite 移除 GA 数据块导致一批作品只抓到标题没抓到
+                    # 封面：这类行不算缓存命中，重抓一次把封面补上
+                    self.log.emit(f"{rj} 缺封面，重抓补齐")
                 if info.get("error") and now - (info.get("fetched_at") or 0) < self.ERROR_RETRY_SECONDS:
                     self.log.emit(f"{rj} 近期已失败（{info.get('error')}），24h 内不重试")
                     return
@@ -268,6 +273,7 @@ class DlsiteWorker(QThread):
                     if dlsite.download_cover(d["cover"], cover_path):
                         d["cover_path"] = cover_path
                 d["fetched_at"] = now
+                d["cover_url"] = d.get("cover")  # upsert 的 cover_url 列取这个键
                 dlsite_db.upsert_work(d)
                 title = d.get("title")
                 self.log.emit(f"{rj} 抓取成功：{title}" if title else f"{rj} 抓取成功（页面无标题）")

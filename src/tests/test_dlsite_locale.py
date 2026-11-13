@@ -141,7 +141,7 @@ def test_fetch_reports_http_error_not_locale(patched):
 def test_delete_work_removes_record(tmp_path, monkeypatch):
     monkeypatch.setattr(dlsite_db.config, "DLSITE_DB_PATH", str(tmp_path / "dlsite.db"))
     dlsite_db.init_db()
-    dlsite_db.upsert_work({"rj_code": "RJ00000005", "title": "旧记录"})
+    dlsite_db.upsert_work({"rj_code": "RJ00000005", "title": "旧记录", "cover_path": "/tmp/x.jpg"})
     assert dlsite_db.has_work("RJ00000005")
     assert "RJ00000005" in dlsite_db.get_cached_rjs()
 

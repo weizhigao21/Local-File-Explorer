@@ -446,6 +446,13 @@ def parse(html: str, rj: str) -> dict:
         except json.JSONDecodeError:
             pass
 
+    # 封面兜底：2026-11 起 DLsite 页面移除了 GA 数据块，主封面改由
+    # <meta property="og:image"> 提供（与 image_main 同为 _img_main.jpg）
+    if not d.get("cover"):
+        og = soup.select_one('meta[property="og:image"]')
+        if og and (og.get("content") or "").startswith("http"):
+            d["cover"] = og["content"]
+
     # 简介：itemprop="description" 下的 work_parts 分段
     desc = soup.select_one('[itemprop="description"]')
     if desc:

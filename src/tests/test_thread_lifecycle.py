@@ -299,3 +299,32 @@ def test_dlsite_worker_site_level_failure_skips_error_cache(qapp, monkeypatch, t
     worker2._process("RJ01720557")
     info = dlsite_db.get_work("RJ01720557")
     assert info and "HTTP 404" in (info.get("error") or ""), "作品级失败未写入缓存"
+
+
+# ─────────────────────── 缺封面的缓存行要重抓补齐 ───────────────────────
+
+def test_dlsite_worker_refetches_row_missing_cover(qapp, monkeypatch, tmp_path):
+    """有标题但没封面（DLsite 移除 GA 数据块期间的产物）不算缓存命中"""
+    from audio_manager import dlsite as dlsite_mod
+    from resource_manager import config
+    from ui.audio_threads import DlsiteWorker
+
+    monkeypatch.setattr(config, "DLSITE_DB_PATH", str(tmp_path / "dlsite.db"))
+    dlsite_db.init_db()
+    calls = []
+    monkeypatch.setattr(dlsite_mod, "fetch", lambda rj, **kw: calls.append(rj) or None)
+    monkeypatch.setattr(dlsite_mod, "last_error", lambda: "直连: HTTP 404")
+    monkeypatch.setattr(dlsite_mod, "is_site_level_failure", lambda: False)
+
+    # 有标题有封面 → 缓存命中，不发起请求
+    dlsite_db.upsert_work({"rj_code": "RJ00000001", "title": "完整记录",
+                           "cover_path": "covers/RJ00000001.jpg", "fetched_at": 1.0})
+    worker = DlsiteWorker()
+    worker._process("RJ00000001")
+    assert calls == [], "完整缓存不应重抓"
+
+    # 有标题没封面 → 重抓补齐
+    dlsite_db.upsert_work({"rj_code": "RJ00000002", "title": "缺封面记录", "fetched_at": 1.0})
+    worker2 = DlsiteWorker()
+    worker2._process("RJ00000002")
+    assert calls == ["RJ00000002"], "缺封面的行必须重抓"

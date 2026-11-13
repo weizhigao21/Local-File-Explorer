@@ -88,6 +88,30 @@ class TestParse(unittest.TestCase):
             "https://img.dlsite.jp/modpub/images2/work/doujin/RJ01200000/RJ01196889_img_main.jpg",
         )
 
+    def test_cover_from_og_image_when_ga_removed(self):
+        """2026-11 DLsite 移除 GA 数据块后，封面兜底取 og:image meta"""
+        html = (
+            "<html><head>"
+            '<meta property="og:image" content="https://img.dlsite.jp/modpub/images2/work/doujin/RJ01720000/RJ01719475_img_main.jpg">'
+            "</head><body><h1 id='work_name'>标题</h1></body></html>"
+        )
+        info = dlsite.parse(html, "RJ01719475")
+        self.assertEqual(
+            info["cover"],
+            "https://img.dlsite.jp/modpub/images2/work/doujin/RJ01720000/RJ01719475_img_main.jpg",
+        )
+
+    def test_ga_cover_wins_over_og_image(self):
+        """GA 数据块还在时优先用 image_main，og:image 只是兜底"""
+        html = (
+            "<html><head>"
+            '<meta property="og:image" content="https://img.dlsite.jp/og.jpg">'
+            "</head><body><script>var contents = {\"detail\": "
+            "[{\"image_main\": \"//img.dlsite.jp/main.jpg\", \"price\": 880}]};</script></body></html>"
+        )
+        info = dlsite.parse(html, "RJ00000001")
+        self.assertEqual(info["cover"], "https://img.dlsite.jp/main.jpg")
+
     def test_description_parts(self):
         parts = self.info["description"]
         self.assertEqual(len(parts), 1)
