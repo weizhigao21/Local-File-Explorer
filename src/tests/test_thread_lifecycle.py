@@ -316,9 +316,10 @@ def test_dlsite_worker_refetches_row_missing_cover(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(dlsite_mod, "last_error", lambda: "直连: HTTP 404")
     monkeypatch.setattr(dlsite_mod, "is_site_level_failure", lambda: False)
 
-    # 有标题有封面 → 缓存命中，不发起请求
+    # 有标题有封面有分类 → 缓存命中，不发起请求
     dlsite_db.upsert_work({"rj_code": "RJ00000001", "title": "完整记录",
-                           "cover_path": "covers/RJ00000001.jpg", "fetched_at": 1.0})
+                           "cover_path": "covers/RJ00000001.jpg", "genres": ["ASMR"],
+                           "fetched_at": 1.0})
     worker = DlsiteWorker()
     worker._process("RJ00000001")
     assert calls == [], "完整缓存不应重抓"
@@ -328,3 +329,10 @@ def test_dlsite_worker_refetches_row_missing_cover(qapp, monkeypatch, tmp_path):
     worker2 = DlsiteWorker()
     worker2._process("RJ00000002")
     assert calls == ["RJ00000002"], "缺封面的行必须重抓"
+
+    # 有标题有封面没分类（DLsite 改版期间抓的行）→ 重抓补齐
+    dlsite_db.upsert_work({"rj_code": "RJ00000003", "title": "缺分类记录",
+                           "cover_path": "covers/RJ00000003.jpg", "fetched_at": 1.0})
+    worker3 = DlsiteWorker()
+    worker3._process("RJ00000003")
+    assert calls == ["RJ00000002", "RJ00000003"], "缺分类的行必须重抓"

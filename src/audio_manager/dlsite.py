@@ -390,45 +390,93 @@ def parse(html: str, rj: str) -> dict:
     h1 = soup.select_one("#work_name")
     d["title"] = h1.get_text(strip=True) if h1 else None
 
-    # 信息表 #work_outline（中/日文表头均兼容）
-    table = soup.select_one("#work_outline")
-    if table:
-        for tr in table.find_all("tr"):
-            th = tr.find("th")
-            td = tr.find("td")
-            if not th or not td:
+    # 信息表：2026-11 改版后为 c-productInfo__item（dt=字段名 dd=值）；
+    # 旧版 #work_outline 表格兜底（中/日文表头均兼容）
+    new_items = soup.select(".c-productInfo__item")
+    if new_items:
+        for item in new_items:
+            key_el = item.select_one(".c-productInfo__key")
+            val_el = item.select_one(".c-productInfo__value")
+            if not key_el or not val_el:
                 continue
-            key = th.get_text(strip=True)
-            val = td.get_text(" ", strip=True)
-            if key in ("发售日", "販売日"):
+            key = key_el.get_text(strip=True)
+            val = val_el.get_text(" ", strip=True)
+            links = [a.get_text(strip=True) for a in val_el.select("a") if a.get_text(strip=True)]
+            if key == "社团名":
+                d["circle"] = val
+            elif key == "发售日":
                 d["release_date"] = val
-            elif key in ("声优", "声優"):
+            elif key == "声优":
                 d["cv"] = val
-            elif key in ("插画", "イラスト"):
+            elif key == "插画":
                 d["illustrator"] = val
-            elif key in ("年龄指定", "年齢指定"):
+            elif key == "年龄指定":
                 d["age_rating"] = val
-            elif key in ("作品形式",):
+            elif key == "作品形式":
                 d["work_type"] = val
-            elif key in ("文件形式", "ファイル形式"):
+            elif key == "文件形式":
                 d["file_type"] = val
-            elif key in ("文件容量", "ファイル容量"):
+            elif key == "文件容量":
                 d["file_size"] = val
-            elif key in ("分类", "ジャンル"):
-                d["genres"] = [a.get_text(strip=True) for a in td.select("a") if a.get_text(strip=True)]
+            elif key == "分类" and links:
+                d["genres"] = links
+    else:
+        table = soup.select_one("#work_outline")
+        if table:
+            for tr in table.find_all("tr"):
+                th = tr.find("th")
+                td = tr.find("td")
+                if not th or not td:
+                    continue
+                key = th.get_text(strip=True)
+                val = td.get_text(" ", strip=True)
+                if key in ("发售日", "販売日"):
+                    d["release_date"] = val
+                elif key in ("声优", "声優"):
+                    d["cv"] = val
+                elif key in ("插画", "イラスト"):
+                    d["illustrator"] = val
+                elif key in ("年龄指定", "年齢指定"):
+                    d["age_rating"] = val
+                elif key in ("作品形式",):
+                    d["work_type"] = val
+                elif key in ("文件形式", "ファイル形式"):
+                    d["file_type"] = val
+                elif key in ("文件容量", "ファイル容量"):
+                    d["file_size"] = val
+                elif key in ("分类", "ジャンル"):
+                    d["genres"] = [a.get_text(strip=True) for a in td.select("a") if a.get_text(strip=True)]
 
-    # 圈子名：面包屑 JSON-LD 第 3 项（中文版 breadcrumb）
-    crumb = soup.select_one("script[type='application/ld+json']")
-    if crumb:
+    # 页面上有多个 JSON-LD（WebSite / BreadcrumbList / Product），全量遍历：
+    # 面包屑第 3 项是社团（URL 里带 maker_id）；Product 块带简介/价格/品牌
+    for script in soup.select("script[type='application/ld+json']"):
         try:
-            ld = json.loads(crumb.string or "{}")
-            if isinstance(ld, dict) and ld.get("@type") == "BreadcrumbList":
-                items = ld.get("itemListElement", [])
-                for it in items:
-                    if it.get("position") == 3:
-                        d["circle"] = it.get("name")
+            ld = json.loads(script.string or "{}")
         except json.JSONDecodeError:
-            pass
+            continue
+        if not isinstance(ld, dict):
+            continue
+        if ld.get("@type") == "BreadcrumbList":
+            for it in ld.get("itemListElement", []):
+                if it.get("position") == 3:
+                    if not d.get("circle"):
+                        d["circle"] = it.get("name")
+                    m_maker = re.search(r"maker_id/([A-Za-z0-9]+)", it.get("item") or "")
+                    if m_maker:
+                        d.setdefault("brand", m_maker.group(1))
+        elif ld.get("@type") == "Product":
+            if not d.get("description") and ld.get("description"):
+                d["description"] = [{"heading": "", "text": str(ld["description"]).strip()}]
+            brand = ld.get("brand")
+            if not d.get("brand") and isinstance(brand, dict):
+                m_maker = re.search(r"maker_id/([A-Za-z0-9]+)", brand.get("url") or "")
+                if m_maker:
+                    d["brand"] = m_maker.group(1)
+                elif brand.get("name") and not d.get("circle"):
+                    d["circle"] = brand["name"]
+            offers = ld.get("offers")
+            if not d.get("price") and isinstance(offers, dict) and offers.get("price"):
+                d["price"] = offers.get("price")
 
     # 封面 + 价格 + maker_id：页面底部 GA 埋点 var contents = {...}
     m = re.search(r"var contents = (\{.*?\});\s*</script>", html, re.S)

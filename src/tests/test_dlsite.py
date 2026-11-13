@@ -112,6 +112,68 @@ class TestParse(unittest.TestCase):
         info = dlsite.parse(html, "RJ00000001")
         self.assertEqual(info["cover"], "https://img.dlsite.jp/main.jpg")
 
+    def test_new_productinfo_structure(self):
+        """2026-11 改版：c-productInfo__item 信息表 + 多个 JSON-LD（面包屑/Product）"""
+        crumb = (
+            '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":['
+            '{"@type":"ListItem","position":1,"name":"同人"},'
+            '{"@type":"ListItem","position":2,"name":"社团一览"},'
+            '{"@type":"ListItem","position":3,"name":"被支配中毒",'
+            '"item":"https://www.dlsite.com/maniax/circle/profile/=/maker_id/RG51035.html"}]}'
+        )
+        product = (
+            '{"@context":"https://schema.org","@type":"Product","name":"标题",'
+            '"description":"简介正文第一段。",'
+            '"brand":{"@type":"Brand","name":"被支配中毒",'
+            '"url":"https://www.dlsite.com/maniax/circle/profile/=/maker_id/RG51035.html"},'
+            '"offers":{"@type":"Offer","priceCurrency":"JPY","price":"1650"},'
+            '"sku":"RJ01719475"}'
+        )
+        html = (
+            "<html><head>"
+            "<script type=\"application/ld+json\">{\"@type\":\"WebSite\",\"name\":\"DLsite\"}</script>"
+            "<script type=\"application/ld+json\">" + crumb + "</script>"
+            "<script type=\"application/ld+json\">" + product + "</script>"
+            "</head><body><h1 id='work_name'>标题</h1>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>发售日</dt>"
+            "<dd class='c-productInfo__value'>2026年9月18日</dd></div>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>声优</dt>"
+            "<dd class='c-productInfo__value'><a>とおのおと</a></dd></div>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>社团名</dt>"
+            "<dd class='c-productInfo__value'><a>被支配中毒</a></dd></div>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>年龄指定</dt>"
+            "<dd class='c-productInfo__value'>R18</dd></div>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>作品形式</dt>"
+            "<dd class='c-productInfo__value'><a>音声・ASMR</a></dd></div>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>文件形式</dt>"
+            "<dd class='c-productInfo__value'>WAV / mp3同梱</dd></div>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>文件容量</dt>"
+            "<dd class='c-productInfo__value'>6.21GB</dd></div>"
+            "<div class='c-productInfo__item'>"
+            "<dt class='c-productInfo__key'>分类</dt>"
+            "<dd class='c-productInfo__value'><a>暗示音声</a><a>女性主导</a></dd></div>"
+            "</body></html>"
+        )
+        info = dlsite.parse(html, "RJ01719475")
+        self.assertEqual(info["release_date"], "2026年9月18日")
+        self.assertEqual(info["cv"], "とおのおと")
+        self.assertEqual(info["circle"], "被支配中毒")
+        self.assertEqual(info["age_rating"], "R18")
+        self.assertEqual(info["work_type"], "音声・ASMR")
+        self.assertEqual(info["file_type"], "WAV / mp3同梱")
+        self.assertEqual(info["file_size"], "6.21GB")
+        self.assertEqual(info["genres"], ["暗示音声", "女性主导"])
+        self.assertEqual(info["brand"], "RG51035")
+        self.assertEqual(info["price"], "1650")
+        self.assertEqual(info["description"], [{"heading": "", "text": "简介正文第一段。"}])
+
     def test_description_parts(self):
         parts = self.info["description"]
         self.assertEqual(len(parts), 1)

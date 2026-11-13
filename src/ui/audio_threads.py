@@ -243,13 +243,14 @@ class DlsiteWorker(QThread):
             info = dlsite_db.get_work(rj)
             if info:
                 has_cover = bool(info.get("cover_path") or info.get("cover_url"))
-                if info.get("title") and not info.get("error") and has_cover:
+                has_genres = bool(info.get("genres"))
+                if info.get("title") and not info.get("error") and has_cover and has_genres:
                     self.log.emit(f"{rj} 缓存命中，跳过")
                     return
-                if info.get("title") and not info.get("error") and not has_cover:
-                    # 2026-11 DLsite 移除 GA 数据块导致一批作品只抓到标题没抓到
-                    # 封面：这类行不算缓存命中，重抓一次把封面补上
-                    self.log.emit(f"{rj} 缺封面，重抓补齐")
+                if info.get("title") and not info.get("error"):
+                    # DLsite 改版期间抓到的行可能缺封面或缺分类：不算缓存命中，
+                    # 重抓一次把缺的信息补上
+                    self.log.emit(f"{rj} 信息不完整（缺封面/分类），重抓补齐")
                 if info.get("error") and now - (info.get("fetched_at") or 0) < self.ERROR_RETRY_SECONDS:
                     self.log.emit(f"{rj} 近期已失败（{info.get('error')}），24h 内不重试")
                     return

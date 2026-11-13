@@ -159,13 +159,14 @@ def has_work(rj: str) -> bool:
 def get_cached_rjs() -> set:
     """已成功获取信息的 RJ 码集合（启动批量校验用，一次全量查询代替逐条 SELECT）
 
-    必须有本地封面才算缓存完整：DLsite 移除页面 GA 数据块期间抓到的行
-    只有标题没封面，不能当"已缓存"跳过，否则封面永远补不回来。
+    必须封面+分类齐全才算缓存完整：DLsite 改版期间抓到的行可能只有标题，
+    不能当"已缓存"跳过，否则缺的信息永远补不回来。
     """
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT rj_code FROM works WHERE title IS NOT NULL AND title != '' "
-            "AND error IS NULL AND cover_path IS NOT NULL AND cover_path != ''"
+            "AND error IS NULL AND cover_path IS NOT NULL AND cover_path != '' "
+            "AND genres IS NOT NULL AND genres != ''"
         ).fetchall()
     return {r["rj_code"] for r in rows}
 
