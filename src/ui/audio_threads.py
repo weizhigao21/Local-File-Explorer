@@ -252,8 +252,13 @@ class DlsiteWorker(QThread):
             did_network = True
             if not html:
                 reason = dlsite.last_error() or "网络请求失败"
-                dlsite_db.set_error(rj, f"网络请求失败：{reason}")
-                self.log.emit(f"{rj} 抓取失败：{reason}")
+                if dlsite.is_site_level_failure():
+                    # 站点级拒绝（限流/临时封锁）：不写失败缓存，否则一次
+                    # 限流会把队列里所有作品都毒化成 24h 不重试
+                    self.log.emit(f"{rj} 抓取失败：{reason}（站点级故障，不计入 24h 冷却）")
+                else:
+                    dlsite_db.set_error(rj, f"网络请求失败：{reason}")
+                    self.log.emit(f"{rj} 抓取失败：{reason}")
             else:
                 d = dlsite.parse(html, rj)
                 if d.get("cover"):

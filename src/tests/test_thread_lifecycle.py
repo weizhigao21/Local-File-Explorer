@@ -269,3 +269,33 @@ def test_audio_close_cancels_and_waits_scan_thread(qapp, monkeypatch):
     assert fake.cancelled is True, "关闭音频窗口未取消扫描线程"
     assert fake.waits == [3000]
     assert thread_guard.detached_threads == set()
+
+
+# ─────────────────────── DLsite 站点级失败不毒化缓存 ───────────────────────
+
+def test_dlsite_worker_site_level_failure_skips_error_cache(qapp, monkeypatch, tmp_path):
+    """站点级 404（限流）不得写进 dlsite_db 的 24h 失败缓存
+
+    背景：DLsite 限流时所有作品页一律 404。旧逻辑按作品级失败逐个 set_error，
+    一次限流就把整个队列毒化成 24h 不重试（日志里表现为"近期已失败"刷屏）。
+    """
+    from audio_manager import dlsite as dlsite_mod
+    from resource_manager import config
+    from ui.audio_threads import DlsiteWorker
+
+    monkeypatch.setattr(config, "DLSITE_DB_PATH", str(tmp_path / "dlsite.db"))
+    dlsite_db.init_db()
+    monkeypatch.setattr(dlsite_mod, "fetch", lambda rj, **kw: None)
+    monkeypatch.setattr(dlsite_mod, "last_error", lambda: "直连: HTTP 404")
+    monkeypatch.setattr(dlsite_mod, "is_site_level_failure", lambda: True)
+
+    worker = DlsiteWorker()
+    worker._process("RJ01719475")
+    assert dlsite_db.get_work("RJ01719475") is None, "站点级失败写入了 24h 失败缓存"
+
+    # 对照：作品级失败仍照常写入缓存
+    monkeypatch.setattr(dlsite_mod, "is_site_level_failure", lambda: False)
+    worker2 = DlsiteWorker()
+    worker2._process("RJ01720557")
+    info = dlsite_db.get_work("RJ01720557")
+    assert info and "HTTP 404" in (info.get("error") or ""), "作品级失败未写入缓存"

@@ -45,6 +45,43 @@ MAX_RETRIES = 2
 RETRY_DELAY = 1.5
 RETRY_COOLDOWN = 60  # 全部代理都失败后，60 秒内不再重复探测
 
+# ── 站点级故障判定 ──
+# DLsite 对高频抓取的限流不返回 429，而是让所有作品页一律 404。这种失败与
+# "作品本身不存在"必须区分开：一次限流若按作品级失败逐个入库，整个队列都会
+# 被写进 24h 冷却。窗口内同一非 200 状态累计达到阈值即判定为站点级。
+SITE_FAIL_WINDOW = 120.0  # 判定窗口（秒）
+SITE_FAIL_THRESHOLD = 3   # 窗口内同一状态的出现次数阈值
+
+_status_lock = threading.Lock()
+_status_events = []  # [(time.time(), status_code)]
+_site_level = False
+
+
+def _note_http_status(status):
+    """记录一次非 200 的 HTTP 状态，滚动窗口内同一状态达标则判定站点级故障"""
+    global _site_level
+    with _status_lock:
+        now = time.time()
+        _status_events.append((now, status))
+        while _status_events and now - _status_events[0][0] > SITE_FAIL_WINDOW:
+            _status_events.pop(0)
+        _site_level = sum(1 for _, s in _status_events if s == status) >= SITE_FAIL_THRESHOLD
+        if _site_level:
+            _log(f"短时间内多个请求返回 HTTP {status}，判定为站点级拒绝（疑似限流），本轮失败不计入 24h 冷却")
+
+
+def is_site_level_failure():
+    """最近一轮失败是否为站点级（限流/封锁）；调用方据此决定是否写失败缓存"""
+    with _status_lock:
+        return _site_level
+
+
+def _clear_site_status():
+    global _site_level
+    with _status_lock:
+        _status_events.clear()
+        _site_level = False
+
 # 代理探测状态。None 表示尚未探测；"" 表示直连可用；其他为代理 URL。
 # 多线程共享，用锁保护，避免 4 个抓取线程同时探测。
 _proxy_lock = threading.Lock()
@@ -225,6 +262,7 @@ def _probe(url):
                 _proxy_resolved = proxy
                 _proxy_probed_at = time.time()
                 _proxy_error = ""
+                _clear_site_status()
                 where = proxy or "直连"
                 _log(f"网络通道就绪（{label}: {where}）")
                 html = response.text
@@ -233,6 +271,17 @@ def _probe(url):
                     _log("探测响应为日文页，交由抓取流程重试")
                     return proxy, None
                 return proxy, html
+            if response.status_code == 404:
+                # 404 也是 DLsite 的应答：通道本身可达，只是这一页拿不到
+                # （可能被限流，也可能恰好是失效作品）。不能据此判整个网络
+                # 死刑——标记通道可用、不返回 HTML，交给 fetch 逐作品判断。
+                _proxy_resolved = proxy
+                _proxy_probed_at = time.time()
+                _proxy_error = ""
+                _note_http_status(404)
+                where = proxy or "直连"
+                _log(f"{where}可连通但站点返回 HTTP 404（可能被限流），交由抓取流程逐作品判断")
+                return proxy, None
             errors.append(f"{label}: HTTP {response.status_code}")
         except Exception as e:
             errors.append(f"{label}: {_short_error(e)}")
@@ -262,6 +311,7 @@ def reset_network_state():
     global _last_error
     _last_error = ""
     _reset_proxy_cache()
+    _clear_site_status()
 
 
 def fetch(rj: str, delay: float = RETRY_DELAY, retries: int = MAX_RETRIES) -> str | None:
@@ -293,9 +343,11 @@ def fetch(rj: str, delay: float = RETRY_DELAY, retries: int = MAX_RETRIES) -> st
                 if page_locale(response.text) == "ja":
                     failure = "DLsite 返回日文页面（简体中文语言设置未生效）"
                 else:
+                    _clear_site_status()  # 拿到正常页面，站点级故障视为已解除
                     _last_error = ""
                     return response.text
             else:
+                _note_http_status(response.status_code)
                 failure = f"HTTP {response.status_code}"
         except Exception as e:
             failure = _short_error(e)
